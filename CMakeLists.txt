@@ -15,6 +15,8 @@ add_library(oursql_core
   src/planner/planner.cpp
   src/execution/executor.cpp
   src/parser/lexer.cpp
+  src/storage/row_codec.cpp
+  src/storage/heap_table.cpp
   src/storage/storage.cpp
 )
 
@@ -39,8 +41,12 @@ target_link_libraries(oursql_slotted_page_tests PRIVATE oursql_core)
 add_executable(oursql_frontend_tests tests/frontend_tests.cpp)
 target_link_libraries(oursql_frontend_tests PRIVATE oursql_core)
 
+add_executable(oursql_catalog_heap_tests tests/catalog_heap_tests.cpp)
+target_link_libraries(oursql_catalog_heap_tests PRIVATE oursql_core)
+
 enable_testing()
 add_test(NAME oursql_tests COMMAND oursql_tests)
 add_test(NAME oursql_storage_tests COMMAND oursql_storage_tests)
 add_test(NAME oursql_slotted_page_tests COMMAND oursql_slotted_page_tests)
 add_test(NAME oursql_frontend_tests COMMAND oursql_frontend_tests)
+add_test(NAME oursql_catalog_heap_tests COMMAND oursql_catalog_heap_tests)

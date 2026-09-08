@@ -18,6 +18,8 @@
 
 namespace oursql {
 
+class Catalog;
+
 class Page {
  public:
   static constexpr std::size_t kSize = 4096;
@@ -80,6 +82,8 @@ class DiskManager {
   [[nodiscard]] Status SetCatalogHead(page_id_t page_id);
 
  private:
+  friend class Catalog;
+
   static constexpr std::uint32_t kFormatVersion = 1;
 
   Status CloseUnlocked();
@@ -204,6 +208,8 @@ class WritePageGuard {
 
   // 调用者：写入查询或上层存储；作用：访问 guard 持有页面的可写字节；返回：页面数据指针，生命周期受 guard 保护。
   [[nodiscard]] std::byte *Data() noexcept;
+  // 调用者：页面元数据读取；作用：通过写 guard 只读访问页面字节；返回：只读页面数据指针。
+  [[nodiscard]] const std::byte *Data() const noexcept;
   // 调用者：写入查询；作用：查询当前页面编号；返回：页面编号或 INVALID_PAGE_ID。
   [[nodiscard]] page_id_t PageId() const noexcept;
   // 调用者：修改页面的调用者；作用：显式标记页面已修改；返回：标脏状态。
@@ -257,6 +263,10 @@ class SlottedPage {
   [[nodiscard]] static Result<std::uint32_t> SlotCount(const ReadPageGuard &page);
   // 调用者：页面链表读取流程；作用：读取下一页编号；返回：编号或格式错误。
   [[nodiscard]] static Result<page_id_t> NextPageId(const ReadPageGuard &page);
+  // 调用者：页面链表修改流程；作用：从写 guard 读取下一页编号；返回：编号或格式错误。
+  [[nodiscard]] static Result<page_id_t> NextPageId(const WritePageGuard &page);
+  // 调用者：页面链表修改流程；作用：设置下一页编号；返回：操作状态。
+  [[nodiscard]] static Status SetNextPageId(WritePageGuard &page, page_id_t next_page_id);
 
  private:
   [[nodiscard]] static Status ValidateBytes(const std::byte *data);
@@ -281,6 +291,8 @@ class BufferPoolManager {
   [[nodiscard]] Result<WritePageGuard> FetchPageWrite(page_id_t page_id);
   // 调用者：插入或页面创建流程；作用：申请并获取新的空白页面；返回：写 guard 或错误状态。
   [[nodiscard]] Result<WritePageGuard> NewPage();
+  // 调用者：HeapTable 或页面创建流程；作用：申请并获取新的写 guard 页面；返回：guard 或错误状态。
+  [[nodiscard]] Result<WritePageGuard> NewPageGuarded() { return NewPage(); }
   // 调用者：不使用 guard 的存储代码；作用：释放一次页面 pin 并更新 dirty；返回：操作状态。
   [[nodiscard]] Status UnpinPage(page_id_t page_id, bool is_dirty);
   // 调用者：刷盘或测试；作用：写回一个脏页；返回：操作状态。

@@ -675,6 +675,13 @@ std::byte *WritePageGuard::Data() noexcept {
   return buffer_pool_->frames_[frame_id_].page.Data();
 }
 
+const std::byte *WritePageGuard::Data() const noexcept {
+  if (!IsValid()) {
+    return nullptr;
+  }
+  return buffer_pool_->frames_[frame_id_].page.Data();
+}
+
 page_id_t WritePageGuard::PageId() const noexcept {
   return IsValid() ? page_id_ : INVALID_PAGE_ID;
 }
@@ -993,6 +1000,28 @@ Result<page_id_t> SlottedPage::NextPageId(const ReadPageGuard &page) {
     return Result<page_id_t>(valid);
   }
   return Result<page_id_t>(LoadU32LittleEndian(page.Data(), kNextPageIdOffset));
+}
+
+Result<page_id_t> SlottedPage::NextPageId(const WritePageGuard &page) {
+  if (!page.IsValid()) {
+    return Result<page_id_t>(Status::InvalidArgument("读取 next_page_id 需要有效的 WritePageGuard"));
+  }
+  auto valid = ValidateBytes(page.Data());
+  if (!valid.ok()) return Result<page_id_t>(valid);
+  return Result<page_id_t>(LoadU32LittleEndian(page.Data(), kNextPageIdOffset));
+}
+
+Status SlottedPage::SetNextPageId(WritePageGuard &page, page_id_t next_page_id) {
+  if (!page.IsValid()) {
+    return Status::InvalidArgument("设置 next_page_id 需要有效的 WritePageGuard");
+  }
+  if (next_page_id == 0) {
+    return Status::InvalidArgument("next_page_id 不能指向 Page 0");
+  }
+  auto valid = ValidateBytes(page.Data());
+  if (!valid.ok()) return valid;
+  StoreU32LittleEndian(page.Data(), kNextPageIdOffset, next_page_id);
+  return page.MarkDirty();
 }
 
 BufferPoolManager::BufferPoolManager(std::size_t pool_size, DiskManager *disk_manager,

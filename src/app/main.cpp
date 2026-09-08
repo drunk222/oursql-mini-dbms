@@ -161,15 +161,21 @@ int main(int argc, char **argv) {
       sql_buffer += line;
       sql_buffer.push_back('\n');
       if (!HasStatementTerminator(sql_buffer)) continue;
-      auto result = engine.ExecuteSql(sql_buffer);
-      if (!result.ok()) std::cerr << result.status().ToString() << '\n';
-      else PrintResult(result.value());
+      auto results = engine.ExecuteSqlBatch(sql_buffer);
+      if (!results.ok()) {
+        std::cerr << results.status().ToString() << '\n';
+      } else {
+        for (const auto &result : results.value()) PrintResult(result);
+      }
       sql_buffer.clear();
     }
     if (!sql_buffer.empty() && !should_quit) {
-      auto result = engine.ExecuteSql(sql_buffer);
-      if (!result.ok()) std::cerr << result.status().ToString() << '\n';
-      else PrintResult(result.value());
+      auto results = engine.ExecuteSqlBatch(sql_buffer);
+      if (!results.ok()) {
+        std::cerr << results.status().ToString() << '\n';
+      } else {
+        for (const auto &result : results.value()) PrintResult(result);
+      }
     }
     const auto status = engine.Close();
     if (!status.ok()) {

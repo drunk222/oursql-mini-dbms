@@ -9,6 +9,7 @@ namespace oursql {
 using page_id_t = std::uint32_t;
 using slot_id_t = std::uint32_t;
 inline constexpr page_id_t INVALID_PAGE_ID = std::numeric_limits<page_id_t>::max();
+inline constexpr slot_id_t INVALID_SLOT_ID = std::numeric_limits<slot_id_t>::max();
 
 enum class DataType {
   Int,

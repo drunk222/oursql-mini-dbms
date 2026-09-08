@@ -34,6 +34,10 @@ Status Status::OutOfSpace(std::string message) {
   return Status(ErrorCode::OutOfSpace, std::move(message));
 }
 
+Status Status::RecordTooLarge(std::string message) {
+  return Status(ErrorCode::RecordTooLarge, std::move(message));
+}
+
 Status Status::IOError(std::string message) {
   return Status(ErrorCode::IOError, std::move(message));
 }
@@ -70,6 +74,8 @@ std::string Status::ToString() const {
       return message_.empty() ? "TypeMismatch" : "TypeMismatch: " + message_;
     case ErrorCode::OutOfSpace:
       return message_.empty() ? "OutOfSpace" : "OutOfSpace: " + message_;
+    case ErrorCode::RecordTooLarge:
+      return message_.empty() ? "RecordTooLarge" : "RecordTooLarge: " + message_;
     case ErrorCode::IOError:
       return message_.empty() ? "IOError" : "IOError: " + message_;
     case ErrorCode::InternalError:

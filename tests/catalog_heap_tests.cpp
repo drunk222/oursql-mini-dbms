@@ -167,6 +167,95 @@ bool TestHeapTableAcrossPagesDeleteAndRestart() {
   return reopened_pool.Close().ok() && reopened_disk.Close().ok() && ok;
 }
 
+bool TestRidOwnership() {
+  TempDb temp;
+  oursql::DiskManager disk_manager;
+  if (!Check(disk_manager.Open(temp.path).ok(), "RID 归属测试数据库打开应成功")) return false;
+  oursql::BufferPoolManager buffer_pool(3, &disk_manager);
+  oursql::Catalog catalog(&buffer_pool, &disk_manager);
+  if (!Check(catalog.Open().ok(), "RID 归属测试 Catalog 打开应成功")) return false;
+  const auto schema = UserSchema();
+  if (!Check(catalog.CreateTable(oursql::TableMetadata{"left_table", schema, oursql::INVALID_PAGE_ID}).ok() &&
+                 catalog.CreateTable(oursql::TableMetadata{"right_table", schema, oursql::INVALID_PAGE_ID}).ok(),
+             "RID 归属测试建表应成功")) {
+    return false;
+  }
+  auto left_metadata = catalog.GetTableMetadata("left_table");
+  auto right_metadata = catalog.GetTableMetadata("right_table");
+  if (!Check(left_metadata.ok() && right_metadata.ok(), "RID 归属测试应取得两张表元数据")) return false;
+  oursql::HeapTable left(&buffer_pool, *left_metadata.value());
+  oursql::HeapTable right(&buffer_pool, *right_metadata.value());
+  auto right_rid = right.InsertRow({oursql::Value(static_cast<std::int64_t>(7)), oursql::Value("right")});
+  if (!Check(right_rid.ok(), "RID 归属测试插入应成功")) return false;
+  auto foreign_row = left.GetRow(right_rid.value());
+  if (!Check(!foreign_row.ok() && foreign_row.status().code() == oursql::ErrorCode::NotFound,
+             "其他表 RID 不应被当前表读取")) {
+    return false;
+  }
+  if (!Check(left.DeleteRow(right_rid.value()).code() == oursql::ErrorCode::NotFound,
+             "其他表 RID 不应被当前表删除")) {
+    return false;
+  }
+  auto preserved = right.GetRow(right_rid.value());
+  return Check(preserved.ok(), "拒绝跨表 RID 后原表数据仍应存在") &&
+         buffer_pool.Close().ok() && disk_manager.Close().ok();
+}
+
+bool TestOversizedRecordsDoNotAllocatePages() {
+  TempDb temp;
+  oursql::DiskManager disk_manager;
+  if (!Check(disk_manager.Open(temp.path).ok(), "超大记录测试数据库打开应成功")) return false;
+  oursql::BufferPoolManager buffer_pool(3, &disk_manager);
+  oursql::Catalog catalog(&buffer_pool, &disk_manager);
+  if (!Check(catalog.Open().ok(), "超大记录测试 Catalog 打开应成功")) return false;
+
+  const auto schema = oursql::Schema{{"id", oursql::DataType::Int}, {"payload", oursql::DataType::Varchar}};
+  const auto catalog_size_before = std::filesystem::file_size(temp.path);
+  const auto huge_name = std::string(5000, 't');
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    auto status = catalog.CreateTable(oursql::TableMetadata{huge_name, schema, oursql::INVALID_PAGE_ID});
+    if (!Check(status.code() == oursql::ErrorCode::RecordTooLarge,
+               "超大 Catalog 元数据应返回 RecordTooLarge")) return false;
+    if (!Check(std::filesystem::file_size(temp.path) == catalog_size_before,
+               "超大 Catalog 元数据失败不得增加页面")) return false;
+  }
+
+  if (!Check(catalog.CreateTable(oursql::TableMetadata{"ordinary", schema, oursql::INVALID_PAGE_ID}).ok(),
+             "超大元数据失败后小表仍应可创建")) return false;
+  auto metadata = catalog.GetTableMetadata("ordinary");
+  if (!Check(metadata.ok(), "超大元数据失败后应能取得普通表元数据")) return false;
+  oursql::HeapTable table(&buffer_pool, *metadata.value());
+  const auto row_size_before = std::filesystem::file_size(temp.path);
+  const oursql::Row huge_row{oursql::Value(static_cast<std::int64_t>(1)),
+                             oursql::Value(std::string(4040, 'x'))};
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    auto rid = table.InsertRow(huge_row);
+    if (!Check(!rid.ok() && rid.status().code() == oursql::ErrorCode::RecordTooLarge,
+               "超大 Row 应返回 RecordTooLarge")) return false;
+    if (!Check(std::filesystem::file_size(temp.path) == row_size_before,
+               "超大 Row 失败不得申请新页面")) return false;
+  }
+  auto ordinary_row = table.InsertRow({oursql::Value(static_cast<std::int64_t>(7)), oursql::Value("ok")});
+  if (!Check(ordinary_row.ok(), "超大 Row 失败后普通 Row 仍应插入")) return false;
+  if (!Check(buffer_pool.Close().ok() && disk_manager.Close().ok(), "超大记录测试关闭应成功")) return false;
+
+  oursql::DiskManager reopened_disk;
+  if (!Check(reopened_disk.Open(temp.path).ok(), "超大记录测试重启打开应成功")) return false;
+  oursql::BufferPoolManager reopened_pool(3, &reopened_disk);
+  oursql::Catalog reopened_catalog(&reopened_pool, &reopened_disk);
+  if (!Check(reopened_catalog.Open().ok(), "超大记录测试重启 Catalog 应成功")) return false;
+  auto reopened_metadata = reopened_catalog.GetTableMetadata("ordinary");
+  if (!Check(reopened_metadata.ok(), "超大记录测试重启表元数据应存在")) return false;
+  oursql::HeapTable reopened_table(&reopened_pool, *reopened_metadata.value());
+  auto scanned = reopened_table.Scan();
+  const bool ok = Check(scanned.ok() && scanned.value().size() == 1,
+                        "超大记录失败后重启扫描应只有普通 Row") &&
+                  Check(scanned.value()[0].second[0].AsInt() == 7 &&
+                            scanned.value()[0].second[1].AsVarchar() == "ok",
+                        "超大记录失败后普通 Row 内容应恢复");
+  return reopened_pool.Close().ok() && reopened_disk.Close().ok() && ok;
+}
+
 }  // namespace
 
 int main() {
@@ -178,6 +267,8 @@ int main() {
   run("Row codec", &TestRowCodec);
   run("Catalog persistence and chain", &TestCatalogPersistenceAndChain);
   run("HeapTable pages delete and restart", &TestHeapTableAcrossPagesDeleteAndRestart);
+  run("RID ownership", &TestRidOwnership);
+  run("Oversized records do not allocate pages", &TestOversizedRecordsDoNotAllocatePages);
   if (failures == 0) {
     std::cout << "All catalog and heap tests passed\n";
     return 0;

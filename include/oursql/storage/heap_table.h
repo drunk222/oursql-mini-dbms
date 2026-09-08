@@ -59,6 +59,9 @@ class HeapTable {
   [[nodiscard]] Result<std::vector<RowEntry>> Scan();
 
  private:
+  // 调用者：GetRow/DeleteRow；作用：确认 RID 页面属于当前表；返回：归属状态或链损坏错误。
+  [[nodiscard]] Status ValidateRidPage(page_id_t page_id);
+
   BufferPoolManager *buffer_pool_{nullptr};
   TableMetadata metadata_;
 };

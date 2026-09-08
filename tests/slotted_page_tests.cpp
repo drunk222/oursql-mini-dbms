@@ -151,8 +151,8 @@ bool TestOutOfSpaceAndAutomaticCompaction() {
       return false;
     }
     auto too_large = oursql::SlottedPage::InsertRecord(page, Filled(4060, 0x11));
-    if (!Check(!too_large.ok() && too_large.status().code() == oursql::ErrorCode::OutOfSpace,
-               "超大记录应返回 OutOfSpace")) {
+    if (!Check(!too_large.ok() && too_large.status().code() == oursql::ErrorCode::RecordTooLarge,
+               "超过单条记录上限应返回 RecordTooLarge")) {
       CloseDb(disk_manager);
       return false;
     }
@@ -171,7 +171,7 @@ bool TestOutOfSpaceAndAutomaticCompaction() {
       return false;
     }
     auto slot3 = oursql::SlottedPage::InsertRecord(page, Filled(1400, 0x44));
-    if (!Check(slot3.ok() && slot3.value() == 3, "连续空间不足但碎片足够时应自动整理后插入")) {
+    if (!Check(slot3.ok() && slot3.value() == 1, "连续空间不足但碎片足够时应自动整理并复用 slot 1")) {
       CloseDb(disk_manager);
       return false;
     }
@@ -185,11 +185,60 @@ bool TestOutOfSpaceAndAutomaticCompaction() {
   auto slot0 = oursql::SlottedPage::GetRecord(read_page, 0);
   auto slot1 = oursql::SlottedPage::GetRecord(read_page, 1);
   auto slot2 = oursql::SlottedPage::GetRecord(read_page, 2);
-  auto slot3 = oursql::SlottedPage::GetRecord(read_page, 3);
+  auto slot3 = oursql::SlottedPage::GetRecord(read_page, 1);
   const bool ok = Check(slot0.ok() && slot0.value() == Filled(900, 0x01), "整理不得改变 slot 0") &&
-                  Check(!slot1.ok(), "删除的 slot 1 仍应无效") &&
                   Check(slot2.ok() && slot2.value() == Filled(900, 0x03), "整理不得改变 slot 2") &&
-                  Check(slot3.ok() && slot3.value() == Filled(1400, 0x44), "新 slot 内容应正确");
+                  Check(slot3.ok() && slot3.value() == Filled(1400, 0x44), "复用 slot 1 后内容应正确");
+  return CloseDb(disk_manager) && ok;
+}
+
+bool TestRecordSizeBoundaries() {
+  TempDb temp;
+  oursql::DiskManager disk_manager;
+  if (!OpenDb(disk_manager, temp.path)) return false;
+  oursql::BufferPoolManager buffer_pool(1, &disk_manager);
+
+  auto max_page_result = buffer_pool.NewPage();
+  if (!Check(max_page_result.ok(), "最大记录测试申请页面应成功")) return false;
+  const auto max_page_id = max_page_result.value().PageId();
+  {
+    auto page = std::move(max_page_result.value());
+    if (!Check(oursql::SlottedPage::Initialize(page).ok(), "最大记录测试页面初始化应成功")) return false;
+    auto inserted = oursql::SlottedPage::InsertRecord(
+        page, Filled(oursql::SlottedPage::kMaxRecordSize, 0x7A));
+    if (!Check(inserted.ok() && inserted.value() == 0, "4052 字节记录应可插入空白页")) return false;
+  }
+
+  auto oversized_page_result = buffer_pool.NewPage();
+  if (!Check(oversized_page_result.ok(), "超大记录测试申请第二页应成功")) return false;
+  {
+    auto page = std::move(oversized_page_result.value());
+    if (!Check(oursql::SlottedPage::Initialize(page).ok(), "超大记录测试页面初始化应成功")) return false;
+    auto oversized = oursql::SlottedPage::InsertRecord(
+        page, Filled(oursql::SlottedPage::kMaxRecordSize + 1, 0x7B));
+    if (!Check(!oversized.ok() && oversized.status().code() == oursql::ErrorCode::RecordTooLarge,
+               "4053 字节记录应返回 RecordTooLarge")) return false;
+  }
+
+  auto crowded_page_result = buffer_pool.NewPage();
+  if (!Check(crowded_page_result.ok(), "空间不足测试申请第三页应成功")) return false;
+  const auto crowded_page_id = crowded_page_result.value().PageId();
+  {
+    auto page = std::move(crowded_page_result.value());
+    if (!Check(oursql::SlottedPage::Initialize(page).ok(), "空间不足测试页面初始化应成功")) return false;
+    auto first = oursql::SlottedPage::InsertRecord(page, Filled(3200, 0x01));
+    auto second = oursql::SlottedPage::InsertRecord(page, Filled(1000, 0x02));
+    if (!Check(first.ok() && !second.ok() && second.status().code() == oursql::ErrorCode::OutOfSpace,
+               "当前页空间不足应区别于单条记录过大")) return false;
+  }
+  auto read_result = buffer_pool.FetchPage(crowded_page_id);
+  if (!Check(read_result.ok(), "错误后页面应仍可读取")) return false;
+  auto read_page = std::move(read_result.value());
+  auto count = oursql::SlottedPage::SlotCount(read_page);
+  auto first = oursql::SlottedPage::GetRecord(read_page, 0);
+  const bool ok = Check(count.ok() && count.value() == 1, "错误插入不得改变 slot_count") &&
+                  Check(first.ok() && first.value() == Filled(3200, 0x01), "错误插入不得破坏已有记录") &&
+                  Check(max_page_id != crowded_page_id, "边界测试页面编号应独立");
   return CloseDb(disk_manager) && ok;
 }
 
@@ -310,6 +359,7 @@ int main() {
 
   run("Variable length records and delete", &TestVariableLengthRecordsAndDelete);
   run("Out of space and automatic compaction", &TestOutOfSpaceAndAutomaticCompaction);
+  run("Record size boundaries", &TestRecordSizeBoundaries);
   run("Explicit compact and restart", &TestExplicitCompactAndRestart);
   run("Corrupt metadata rejection", &TestCorruptMetadataIsRejected);
 

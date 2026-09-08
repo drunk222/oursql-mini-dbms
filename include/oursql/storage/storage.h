@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -129,6 +130,10 @@ class Replacer {
   [[nodiscard]] virtual Status Pin(frame_id_t frame_id) = 0;
   // 调用者：缓冲池；作用：将未 pin frame 加入候选集合；返回：操作状态。
   [[nodiscard]] virtual Status Unpin(frame_id_t frame_id) = 0;
+  // 调用者：缓冲池；作用：记录页面成功访问或新页面进入缓冲池；返回：操作状态。
+  [[nodiscard]] virtual Status RecordAccess(frame_id_t frame_id) = 0;
+  // 调用者：缓冲池；作用：清除 frame 的历史和候选状态；返回：操作状态。
+  [[nodiscard]] virtual Status Remove(frame_id_t frame_id) = 0;
   // 调用者：缓冲池；作用：选择一个候选 frame；返回：frame 编号或错误。
   [[nodiscard]] virtual Result<frame_id_t> Victim() = 0;
   // 调用者：缓冲池或测试；作用：查询候选 frame 数量；返回：数量。
@@ -141,6 +146,8 @@ class FIFOReplacer final : public Replacer {
   explicit FIFOReplacer(std::size_t capacity);
   [[nodiscard]] Status Pin(frame_id_t frame_id) override;
   [[nodiscard]] Status Unpin(frame_id_t frame_id) override;
+  [[nodiscard]] Status RecordAccess(frame_id_t frame_id) override;
+  [[nodiscard]] Status Remove(frame_id_t frame_id) override;
   [[nodiscard]] Result<frame_id_t> Victim() override;
   [[nodiscard]] std::size_t Size() const override;
 
@@ -149,6 +156,8 @@ class FIFOReplacer final : public Replacer {
   mutable std::mutex mutex_;
   std::list<frame_id_t> order_;
   std::unordered_set<frame_id_t> candidates_;
+  std::unordered_map<frame_id_t, std::uint64_t> arrival_order_;
+  std::uint64_t next_arrival_{0};
 };
 
 // 调用者：缓冲池或替换策略测试；作用：按最近成为候选的时间淘汰 frame；返回：确定性替换器。
@@ -157,6 +166,8 @@ class LRUReplacer final : public Replacer {
   explicit LRUReplacer(std::size_t capacity);
   [[nodiscard]] Status Pin(frame_id_t frame_id) override;
   [[nodiscard]] Status Unpin(frame_id_t frame_id) override;
+  [[nodiscard]] Status RecordAccess(frame_id_t frame_id) override;
+  [[nodiscard]] Status Remove(frame_id_t frame_id) override;
   [[nodiscard]] Result<frame_id_t> Victim() override;
   [[nodiscard]] std::size_t Size() const override;
 
@@ -165,6 +176,8 @@ class LRUReplacer final : public Replacer {
   mutable std::mutex mutex_;
   std::list<frame_id_t> order_;
   std::unordered_set<frame_id_t> candidates_;
+  std::unordered_map<frame_id_t, std::uint64_t> last_used_;
+  std::uint64_t access_clock_{0};
 };
 
 class BufferPoolManager;
@@ -235,6 +248,7 @@ class SlottedPage {
   static constexpr std::uint32_t kPageType = 1;
   static constexpr std::size_t kHeaderSize = 32;
   static constexpr std::size_t kSlotSize = 12;
+  static constexpr std::size_t kMaxRecordSize = Page::kSize - kHeaderSize - kSlotSize;
   static constexpr std::size_t kPageTypeOffset = 0;
   static constexpr std::size_t kSlotCountOffset = 4;
   static constexpr std::size_t kFreeStartOffset = 8;
@@ -332,8 +346,14 @@ class BufferPoolManager {
     mutable std::shared_mutex latch;
   };
 
-  [[nodiscard]] Result<frame_id_t> SelectFrameUnlocked();
-  void RestoreVictimUnlocked(frame_id_t frame_id);
+  struct FrameSelection {
+    frame_id_t frame_id{0};
+    bool from_free_list{false};
+  };
+
+  [[nodiscard]] Result<FrameSelection> SelectFrameUnlocked();
+  void RestoreSelectionUnlocked(const FrameSelection &selection);
+  [[nodiscard]] Status ReturnFreeFrameUnlocked(frame_id_t frame_id);
   [[nodiscard]] Status ReleaseGuard(frame_id_t frame_id, page_id_t page_id, bool is_dirty) noexcept;
   [[nodiscard]] Status EnsureReadyUnlocked() const;
   [[nodiscard]] Status ValidateDataPageId(page_id_t page_id) const;
@@ -345,6 +365,8 @@ class BufferPoolManager {
   Status init_status_;
   mutable std::mutex mutex_;
   std::vector<Frame> frames_;
+  std::deque<frame_id_t> free_frames_;
+  std::unordered_set<frame_id_t> free_frame_set_;
   std::unordered_map<page_id_t, frame_id_t> page_table_;
   std::unique_ptr<Replacer> replacer_;
   std::uint64_t access_count_{0};

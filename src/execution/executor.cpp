@@ -17,6 +17,7 @@ Status Contextualize(const char *layer, const Status &status) {
     case ErrorCode::AlreadyExists: return Status::AlreadyExists(message);
     case ErrorCode::TypeMismatch: return Status::TypeMismatch(message);
     case ErrorCode::OutOfSpace: return Status::OutOfSpace(message);
+    case ErrorCode::RecordTooLarge: return Status::RecordTooLarge(message);
     case ErrorCode::IOError: return Status::IOError(message);
     case ErrorCode::InternalError: return Status::InternalError(message);
     case ErrorCode::Ok: return Status::InternalError(message);
@@ -240,8 +241,8 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
     return Result<SourcePlan>(Status::InvalidArgument("ExecutionEngine SELECT 缺少根算子"));
   }
 
-  std::function<Result<SourcePlan>(const std::shared_ptr<PlanNode> &)> build_node;
-  build_node = [&](const std::shared_ptr<PlanNode> &node) -> Result<SourcePlan> {
+  std::function<Result<SourcePlan>(const std::shared_ptr<const PlanNode> &)> build_node;
+  build_node = [&](const std::shared_ptr<const PlanNode> &node) -> Result<SourcePlan> {
     if (node == nullptr) return Result<SourcePlan>(Status::InvalidArgument("执行计划包含空算子"));
     return std::visit(
         [&](const auto &operation) -> Result<SourcePlan> {
@@ -314,10 +315,6 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
         }
       },
       plan);
-}
-
-Status Executor::Execute(const Plan &, Catalog &) const {
-  return Status::NotImplemented("Executor 兼容接口未绑定 BufferPoolManager，请使用 ExecutionEngine");
 }
 
 }  // namespace oursql

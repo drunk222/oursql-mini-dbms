@@ -127,6 +127,42 @@ void PrintMeasurement(const std::string &pattern, const std::string &policy,
             << " elapsed_ms=" << std::setprecision(3) << measurement.elapsed_ms << '\n';
 }
 
+void RunContrast(const std::filesystem::path &path, oursql::ReplacementPolicy policy,
+                 const std::string &name) {
+  oursql::DiskManager disk;
+  if (!disk.Open(path).ok()) {
+    std::cout << "contrast " << name << " ERROR\n";
+    return;
+  }
+  oursql::BufferPoolManager buffer_pool(3, &disk, policy, oursql::FlushPolicy::WriteBack);
+  if (!buffer_pool.GetInitStatus().ok()) {
+    std::cout << "contrast " << name << " ERROR\n";
+    return;
+  }
+  const std::vector<oursql::page_id_t> requests{1, 2, 3, 1, 4};
+  for (const auto page_id : requests) {
+    auto page = buffer_pool.FetchPage(page_id);
+    if (!page.ok()) {
+      std::cout << "contrast " << name << " ERROR\n";
+      return;
+    }
+    auto guard = std::move(page.value());
+  }
+  const auto eviction_log = buffer_pool.GetEvictionLog();
+  auto last = buffer_pool.FetchPage(1);
+  if (!last.ok()) {
+    std::cout << "contrast " << name << " ERROR\n";
+    return;
+  }
+  auto last_guard = std::move(last.value());
+  const auto evicted = eviction_log.empty() ? oursql::INVALID_PAGE_ID : eviction_log.front();
+  std::cout << "contrast " << name << " sequence=1,2,3,1,4,1"
+            << " first_evicted=" << evicted << " hits=" << buffer_pool.GetHitCount()
+            << " misses=" << buffer_pool.GetMissCount() << '\n';
+  (void)buffer_pool.Close();
+  (void)disk.Close();
+}
+
 }  // namespace
 
 int main() {
@@ -141,6 +177,8 @@ int main() {
     PrintMeasurement(pattern, "FIFO", Run(temp.path, oursql::ReplacementPolicy::FIFO, requests));
     PrintMeasurement(pattern, "LRU", Run(temp.path, oursql::ReplacementPolicy::LRU, requests));
   }
+  RunContrast(temp.path, oursql::ReplacementPolicy::FIFO, "FIFO");
+  RunContrast(temp.path, oursql::ReplacementPolicy::LRU, "LRU");
   oursql::DiskManager disk;
   if (!disk.Open(temp.path).ok()) return 1;
   oursql::BufferPoolManager write_through_pool(4, &disk, oursql::ReplacementPolicy::LRU,

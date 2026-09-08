@@ -16,6 +16,7 @@ Status Contextualize(const char *layer, const Status &status) {
     case ErrorCode::AlreadyExists: return Status::AlreadyExists(message);
     case ErrorCode::TypeMismatch: return Status::TypeMismatch(message);
     case ErrorCode::OutOfSpace: return Status::OutOfSpace(message);
+    case ErrorCode::RecordTooLarge: return Status::RecordTooLarge(message);
     case ErrorCode::IOError: return Status::IOError(message);
     case ErrorCode::InternalError: return Status::InternalError(message);
     case ErrorCode::Ok: return Status::InternalError(message);
@@ -83,27 +84,37 @@ DatabaseStatistics DatabaseEngine::GetStatistics() const {
                             disk_manager_.GetWriteCount()};
 }
 
-Result<ExecutionResult> DatabaseEngine::ExecuteSql(std::string_view sql) {
+Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string_view sql) {
   if (!init_status_.ok()) {
-    return Result<ExecutionResult>(Contextualize("DatabaseEngine", init_status_));
+    return Result<std::vector<ExecutionResult>>(Contextualize("DatabaseEngine", init_status_));
   }
   if (closed_) {
-    return Result<ExecutionResult>(Status::InvalidArgument("DatabaseEngine 已关闭"));
+    return Result<std::vector<ExecutionResult>>(Status::InvalidArgument("DatabaseEngine 已关闭"));
   }
 
   auto statements = parser_.Parse(sql);
   if (!statements.ok()) {
-    return Result<ExecutionResult>(Contextualize("Parser/Lexer", statements.status()));
+    return Result<std::vector<ExecutionResult>>(Contextualize("Parser/Lexer", statements.status()));
   }
-  ExecutionResult last_result;
+  std::vector<ExecutionResult> results;
+  results.reserve(statements.value().size());
   for (const auto &statement : statements.value()) {
     auto plan = planner_.Build(statement, catalog_);
-    if (!plan.ok()) return Result<ExecutionResult>(Contextualize("Planner", plan.status()));
+    if (!plan.ok()) return Result<std::vector<ExecutionResult>>(Contextualize("Planner", plan.status()));
     auto result = execution_engine_.Execute(plan.value());
-    if (!result.ok()) return Result<ExecutionResult>(Contextualize("Execution", result.status()));
-    last_result = std::move(result.value());
+    if (!result.ok()) return Result<std::vector<ExecutionResult>>(Contextualize("Execution", result.status()));
+    results.push_back(std::move(result.value()));
   }
-  return Result<ExecutionResult>(std::move(last_result));
+  return Result<std::vector<ExecutionResult>>(std::move(results));
+}
+
+Result<ExecutionResult> DatabaseEngine::ExecuteSql(std::string_view sql) {
+  auto results = ExecuteSqlBatch(sql);
+  if (!results.ok()) return Result<ExecutionResult>(results.status());
+  if (results.value().empty()) {
+    return Result<ExecutionResult>(Status::InternalError("DatabaseEngine 未产生 SQL 执行结果"));
+  }
+  return Result<ExecutionResult>(std::move(results.value().back()));
 }
 
 }  // namespace oursql

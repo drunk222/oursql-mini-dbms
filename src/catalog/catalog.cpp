@@ -70,6 +70,10 @@ Result<std::vector<std::byte>> EncodeTable(const TableMetadata &table) {
     AppendU32(&bytes, column.length.has_value() ? static_cast<std::uint32_t>(*column.length) : 0U);
     for (const auto character : column.name) bytes.push_back(std::byte{static_cast<unsigned char>(character)});
   }
+  if (bytes.size() > SlottedPage::kMaxRecordSize) {
+    return Result<std::vector<std::byte>>(Status::RecordTooLarge(
+        "Catalog 表元数据超过页面上限: " + std::to_string(SlottedPage::kMaxRecordSize)));
+  }
   return Result<std::vector<std::byte>>(std::move(bytes));
 }
 
@@ -193,6 +197,10 @@ Status Catalog::CreateTable(TableInfo table) {
   auto valid = ValidateTable(table);
   if (!valid.ok()) return valid;
   if (tables_.find(table.name) != tables_.end()) return Status::AlreadyExists("表已存在: " + table.name);
+
+  // 先按不影响记录长度的占位 page_id 编码，超大元数据不得触发任何页面申请。
+  auto encoded_size_check = EncodeTable(table);
+  if (!encoded_size_check.ok()) return encoded_size_check.status();
 
   const bool persistent = buffer_pool_ != nullptr || disk_manager_ != nullptr;
   if (persistent) {

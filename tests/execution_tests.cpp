@@ -59,6 +59,12 @@ bool TestMinimumChainAndRestart() {
                "SELECT * 应保留有效 RID")) {
       return false;
     }
+    auto batch = engine.ExecuteSqlBatch("INSERT INTO student VALUES(2, 'Bob');SELECT * FROM student;");
+    if (!Check(batch.ok() && batch.value().size() == 2 && batch.value()[0].affected_rows == 1 &&
+                   batch.value()[1].rows.size() == 2,
+               "批量接口应保留每条 SQL 的结果")) {
+      return false;
+    }
     if (!Check(engine.Close().ok(), "初次关闭应成功")) return false;
   }
 
@@ -66,10 +72,12 @@ bool TestMinimumChainAndRestart() {
   if (!Check(reopened.GetInitStatus().ok(), "重启后 DatabaseEngine 打开应成功")) return false;
   auto result = reopened.ExecuteSql("SELECT * FROM student;");
   const bool ok = Check(result.ok(), "重启后 SELECT * 应成功") &&
-                  Check(result.value().rows.size() == 1, "重启后应保留一行") &&
+                  Check(result.value().rows.size() == 2, "重启后应保留两条已提交数据") &&
                   Check(result.value().rows[0][0].AsInt() == 1 &&
-                            result.value().rows[0][1].AsVarchar() == "Alice",
-                        "重启后应保留 Alice 数据");
+                            result.value().rows[0][1].AsVarchar() == "Alice" &&
+                            result.value().rows[1][0].AsInt() == 2 &&
+                            result.value().rows[1][1].AsVarchar() == "Bob",
+                        "重启后应保留 Alice 和 Bob 数据");
   return reopened.Close().ok() && ok;
 }
 

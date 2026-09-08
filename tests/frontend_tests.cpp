@@ -6,11 +6,20 @@
 #include "oursql/planner/planner.h"
 
 #include <iostream>
+#include <memory>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
 namespace {
+
+static_assert(std::is_same_v<decltype(std::declval<oursql::SelectPlan>().root),
+                             std::shared_ptr<const oursql::PlanNode>>);
+static_assert(std::is_same_v<decltype(std::declval<oursql::FilterPlan>().child),
+                             std::shared_ptr<const oursql::PlanNode>>);
+static_assert(std::is_same_v<decltype(std::declval<oursql::ProjectPlan>().child),
+                             std::shared_ptr<const oursql::PlanNode>>);
 
 bool Check(bool condition, const std::string &message) {
   if (!condition) std::cerr << "[FAIL] " << message << '\n';

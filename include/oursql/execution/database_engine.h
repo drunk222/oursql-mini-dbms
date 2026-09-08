@@ -46,6 +46,8 @@ class DatabaseEngine {
   [[nodiscard]] Status Flush();
   // 调用者：CLI 或答辩基准；作用：读取当前存储统计；返回：统计快照。
   [[nodiscard]] DatabaseStatistics GetStatistics() const;
+  // 调用者：CLI 或批处理客户端；作用：编译并逐条执行多条 SQL；返回：每条语句的结果序列。
+  [[nodiscard]] Result<std::vector<ExecutionResult>> ExecuteSqlBatch(std::string_view sql);
   // 调用者：命令行或客户端；作用：编译并执行多条 SQL；返回：最后一条结果或执行错误。
   [[nodiscard]] Result<ExecutionResult> ExecuteSql(std::string_view sql);
 

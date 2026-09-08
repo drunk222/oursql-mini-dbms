@@ -16,6 +16,7 @@ namespace oursql {
 struct Column {
   std::string name;
   DataType type{DataType::Int};
+  // VARCHAR(n) 的 n 是 UTF-8 编码后的最大字节数；std::string::size() 按字节计数。
   std::optional<std::size_t> length;
 
   Column() = default;
@@ -52,4 +53,3 @@ class Schema {
 };
 
 }  // namespace oursql
-

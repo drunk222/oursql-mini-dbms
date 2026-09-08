@@ -61,22 +61,24 @@ cmake --build build --config Debug --target oursql_benchmark
 
 ```text
 OurSQL buffer benchmark pool=4 requests=128 seed=20260908 write_policy=WriteBack
-sequential FIFO accesses=128 hits=0 misses=128 hit_rate=0.0000 evictions=124 disk_reads=129 disk_writes=12 elapsed_ms=0.674
-sequential LRU accesses=128 hits=0 misses=128 hit_rate=0.0000 evictions=124 disk_reads=129 disk_writes=12 elapsed_ms=0.798
-random FIFO accesses=128 hits=18 misses=110 hit_rate=0.1406 evictions=106 disk_reads=111 disk_writes=12 elapsed_ms=0.614
-random LRU accesses=128 hits=18 misses=110 hit_rate=0.1406 evictions=106 disk_reads=111 disk_writes=12 elapsed_ms=0.659
-hotspot FIFO accesses=128 hits=76 misses=52 hit_rate=0.5938 evictions=48 disk_reads=53 disk_writes=11 elapsed_ms=0.483
-hotspot LRU accesses=128 hits=76 misses=52 hit_rate=0.5938 evictions=48 disk_reads=53 disk_writes=11 elapsed_ms=0.596
+sequential FIFO accesses=128 hits=0 misses=128 hit_rate=0.0000 evictions=124 disk_reads=129 disk_writes=12 elapsed_ms=1.050
+sequential LRU accesses=128 hits=0 misses=128 hit_rate=0.0000 evictions=124 disk_reads=129 disk_writes=12 elapsed_ms=0.804
+random FIFO accesses=128 hits=19 misses=109 hit_rate=0.1484 evictions=105 disk_reads=110 disk_writes=12 elapsed_ms=0.664
+random LRU accesses=128 hits=18 misses=110 hit_rate=0.1406 evictions=106 disk_reads=111 disk_writes=12 elapsed_ms=0.753
+hotspot FIFO accesses=128 hits=70 misses=58 hit_rate=0.5469 evictions=54 disk_reads=59 disk_writes=11 elapsed_ms=0.507
+hotspot LRU accesses=128 hits=76 misses=52 hit_rate=0.5938 evictions=48 disk_reads=53 disk_writes=11 elapsed_ms=0.689
+contrast FIFO sequence=1,2,3,1,4,1 first_evicted=1 hits=1 misses=5
+contrast LRU sequence=1,2,3,1,4,1 first_evicted=2 hits=2 misses=4
 write_through_status=NotImplemented: WriteThrough 刷新策略尚未实现
 ```
 
-预期解释：顺序扫描超出 4 个 frame 的容量，命中率接近零；热点访问会重复访问少数页面，命中率明显提高；随机模式介于两者之间。当前真实实现中 FIFO 和 LRU 的测试指标可能相同，因为两种 Replacer 都在 Pin 时移出候选、Unpin 时重新加入队列；当前代码没有把它包装成传统意义上完全不同的算法。耗时只能作为本机同次运行的参考，不能据此宣称某策略普遍更快。
+预期解释：顺序扫描超出 4 个 frame 的容量，命中率接近零；热点访问会重复访问少数页面，命中率明显提高；随机模式介于两者之间。固定对照序列用于直接观察两种替换顺序的差异。耗时只能作为本机同次运行的参考，不能据此宣称某策略普遍更快。
 
 ## 常见问题
 
 ### FIFO 和 LRU 有什么区别？
 
-设计意图是 FIFO 按进入候选集合的顺序淘汰，LRU 按最近使用时间淘汰。当前代码的两个 Replacer 接口和测试均存在，但其 Pin/Unpin 队列更新逻辑相同，所以当前基准中命中率和淘汰数可能相同。这是当前实现的已知风险，后续若要严格区分，需要单独设计访问记录接口并增加回归测试，不能在答辩中声称已经实现了经典 FIFO/LRU 差异。
+FIFO 按页面进入缓冲池的到达顺序记录历史。命中后的 Pin/Unpin 不改变这个到达顺序；页面被淘汰后重新装入时获得新的到达顺序。LRU 在每次成功 Fetch 命中时更新时间戳，候选页按最近使用时间排序。固定序列 `1,2,3,1,4,1` 中，FIFO 先淘汰 1，最后一次访问 1 是 miss；LRU 先淘汰 2，最后一次访问 1 是 hit。
 
 ### pin_count 是锁吗？
 
@@ -90,6 +92,22 @@ WritePageGuard 修改页面后调用 `MarkDirty()`，guard 释放时脏状态保
 
 不支持。`FlushPolicy::WriteThrough` 配置接口已经保留，但 BufferPoolManager 构造时返回明确的 `NotImplemented` 状态；基准也会打印该状态。后续实现应单独改变写路径和测试，不能把 WriteBack 静默当成 WriteThrough。
 
+### RecordTooLarge 和 OutOfSpace 有什么区别？
+
+`RecordTooLarge` 表示单条记录超过空白 Slotted Page 的最大记录大小 `4096-32-12=4052` 字节，无论当前页面是否有空间都不会申请新页。`OutOfSpace` 表示记录本身不超过 4052 字节，但当前页面在必要整理后仍放不下。Catalog 元数据也遵守同一单条记录上限。
+
+### VARCHAR(n) 的 n 按什么计数？
+
+`n` 表示 UTF-8 编码后的最大字节数，不是 Unicode 字符数。例如“你好”占 6 个字节，因此 `VARCHAR(6)` 接受，`VARCHAR(5)` 拒绝。实现使用 `std::string::size()`，不做额外 Unicode 字符计数。
+
+### 内存 FreeList 和磁盘空闲链有什么区别？
+
+BufferPool 的 FreeList 只记录尚未占用的内存 frame；磁盘 Superblock 的 free list 记录数据库文件中已经释放的 page。读取或分配失败时，BufferPool 会把取出的 frame 归还 FreeList；成功删除缓存页后也会清除替换历史再归还。
+
+### Plan 为什么不会被执行器修改？
+
+`SelectPlan::root`、`FilterPlan::child` 和 `ProjectPlan::child` 都是 `std::shared_ptr<const PlanNode>`。Planner 构造完成后，ExecutionEngine 只能读取 `const PlanNode`，不能通过这些指针修改算子树。
+
 ### 一条数据如何落到磁盘？
 
 RowCodec 把 Values 编成带边界信息的记录，HeapTable 沿数据页链寻找空间，SlottedPage 写入槽目录和记录区，WritePageGuard 标记 dirty，BufferPoolManager 最终把 4096 字节 Page 交给 DiskManager，DiskManager 写入 `.oursql` 文件。
@@ -102,6 +120,6 @@ RowCodec 把 Values 编成带边界信息的记录，HeapTable 沿数据页链�
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-当前阶段实际结果为 `7/7` 通过，包含公共类型、DiskManager、Replacer、BufferPool、Slotted Page、RowCodec、Catalog、Parser/Planner、Executor、重启端到端和边界测试。另有 `oursql_benchmark` 基准目标，不作为 CTest 用例。
+本次最新构建的 CTest 实际结果为 `7/7` 通过，包含公共类型、DiskManager、Replacer、BufferPool、Slotted Page、RowCodec、Catalog、Parser/Planner、Executor、重启端到端和边界测试。另有 `oursql_benchmark` 基准目标，不作为 CTest 用例。
 
 当前没有实现：JOIN、索引、事务、MVCC、完整 WAL、WriteThrough、ALTER/DROP、网络服务和 GUI。数据库仍是单数据库、单表查询教学实现；这些功能不能在演示中包装成已实现能力。

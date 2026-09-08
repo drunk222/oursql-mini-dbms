@@ -26,22 +26,26 @@ constexpr std::size_t kFreeListHeadOffset = 20;
 constexpr std::size_t kCatalogHeadOffset = 24;
 constexpr std::size_t kSuperblockHeaderSize = 28;
 
-std::uint32_t LoadU32(const std::byte *data, std::size_t offset) {
-  std::uint32_t value = 0;
-  std::memcpy(&value, data + offset, sizeof(value));
-  return value;
+std::uint32_t LoadU32FileLittleEndian(const std::byte *data, std::size_t offset) {
+  return static_cast<std::uint32_t>(data[offset]) |
+         (static_cast<std::uint32_t>(data[offset + 1]) << 8U) |
+         (static_cast<std::uint32_t>(data[offset + 2]) << 16U) |
+         (static_cast<std::uint32_t>(data[offset + 3]) << 24U);
 }
 
-void StoreU32(std::byte *data, std::size_t offset, std::uint32_t value) {
-  std::memcpy(data + offset, &value, sizeof(value));
+void StoreU32FileLittleEndian(std::byte *data, std::size_t offset, std::uint32_t value) {
+  data[offset] = std::byte{static_cast<unsigned char>(value & 0xFFU)};
+  data[offset + 1] = std::byte{static_cast<unsigned char>((value >> 8U) & 0xFFU)};
+  data[offset + 2] = std::byte{static_cast<unsigned char>((value >> 16U) & 0xFFU)};
+  data[offset + 3] = std::byte{static_cast<unsigned char>((value >> 24U) & 0xFFU)};
 }
 
 page_id_t LoadPageId(const std::byte *data, std::size_t offset) {
-  return static_cast<page_id_t>(LoadU32(data, offset));
+  return static_cast<page_id_t>(LoadU32FileLittleEndian(data, offset));
 }
 
 void StorePageId(std::byte *data, std::size_t offset, page_id_t value) {
-  StoreU32(data, offset, static_cast<std::uint32_t>(value));
+  StoreU32FileLittleEndian(data, offset, static_cast<std::uint32_t>(value));
 }
 
 bool SameMagic(const std::byte *data) {
@@ -257,13 +261,13 @@ Status DiskManager::OpenExistingFileUnlocked(const std::filesystem::path &file_p
     return Status::InvalidArgument("数据库文件魔数不匹配");
   }
 
-  const auto format_version = LoadU32(superblock.Data(), kFormatVersionOffset);
+  const auto format_version = LoadU32FileLittleEndian(superblock.Data(), kFormatVersionOffset);
   if (format_version != kFormatVersion) {
     CloseUnlocked();
     return Status::NotImplemented("不支持的数据库文件格式版本");
   }
 
-  const auto page_size = LoadU32(superblock.Data(), kPageSizeOffset);
+  const auto page_size = LoadU32FileLittleEndian(superblock.Data(), kPageSizeOffset);
   if (page_size != Page::kSize) {
     CloseUnlocked();
     return Status::InvalidArgument("数据库文件页面大小不匹配");
@@ -307,8 +311,8 @@ Status DiskManager::PersistSuperblockUnlocked() {
   Page superblock;
   auto *data = superblock.Data();
   std::memcpy(data + kMagicOffset, kMagic.data(), kMagic.size());
-  StoreU32(data, kFormatVersionOffset, kFormatVersion);
-  StoreU32(data, kPageSizeOffset, static_cast<std::uint32_t>(Page::kSize));
+  StoreU32FileLittleEndian(data, kFormatVersionOffset, kFormatVersion);
+  StoreU32FileLittleEndian(data, kPageSizeOffset, static_cast<std::uint32_t>(Page::kSize));
   StorePageId(data, kPageCountOffset, page_count_);
   StorePageId(data, kFreeListHeadOffset, free_list_head_);
   StorePageId(data, kCatalogHeadOffset, catalog_head_);
@@ -515,8 +519,36 @@ Status FIFOReplacer::Unpin(frame_id_t frame_id) {
   if (candidates_.find(frame_id) != candidates_.end()) {
     return Status::AlreadyExists("FIFO frame 已在候选集合: " + std::to_string(frame_id));
   }
+  if (arrival_order_.find(frame_id) == arrival_order_.end()) {
+    arrival_order_[frame_id] = next_arrival_++;
+  }
   candidates_.insert(frame_id);
-  order_.push_back(frame_id);
+  const auto arrival = arrival_order_[frame_id];
+  auto position = order_.begin();
+  while (position != order_.end() && arrival_order_[*position] <= arrival) ++position;
+  order_.insert(position, frame_id);
+  return Status::Ok();
+}
+
+Status FIFOReplacer::RecordAccess(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("FIFO frame 编号越界: " + std::to_string(frame_id));
+  }
+  if (arrival_order_.find(frame_id) == arrival_order_.end()) {
+    arrival_order_[frame_id] = next_arrival_++;
+  }
+  return Status::Ok();
+}
+
+Status FIFOReplacer::Remove(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("FIFO frame 编号越界: " + std::to_string(frame_id));
+  }
+  candidates_.erase(frame_id);
+  order_.remove(frame_id);
+  arrival_order_.erase(frame_id);
   return Status::Ok();
 }
 
@@ -545,10 +577,12 @@ Status LRUReplacer::Pin(frame_id_t frame_id) {
   }
   const auto found = candidates_.find(frame_id);
   if (found == candidates_.end()) {
+    last_used_[frame_id] = ++access_clock_;
     return Status::Ok();
   }
   candidates_.erase(found);
   order_.remove(frame_id);
+  last_used_[frame_id] = ++access_clock_;
   return Status::Ok();
 }
 
@@ -560,8 +594,43 @@ Status LRUReplacer::Unpin(frame_id_t frame_id) {
   if (candidates_.find(frame_id) != candidates_.end()) {
     return Status::AlreadyExists("LRU frame 已在候选集合: " + std::to_string(frame_id));
   }
+  if (last_used_.find(frame_id) == last_used_.end()) {
+    last_used_[frame_id] = ++access_clock_;
+  }
   candidates_.insert(frame_id);
-  order_.push_back(frame_id);
+  const auto last_used = last_used_[frame_id];
+  auto position = order_.begin();
+  while (position != order_.end() && last_used_[*position] <= last_used) ++position;
+  order_.insert(position, frame_id);
+  return Status::Ok();
+}
+
+Status LRUReplacer::RecordAccess(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("LRU frame 编号越界: " + std::to_string(frame_id));
+  }
+  last_used_[frame_id] = ++access_clock_;
+  if (candidates_.find(frame_id) != candidates_.end()) {
+    candidates_.erase(frame_id);
+    order_.remove(frame_id);
+    candidates_.insert(frame_id);
+    const auto last_used = last_used_[frame_id];
+    auto position = order_.begin();
+    while (position != order_.end() && last_used_[*position] <= last_used) ++position;
+    order_.insert(position, frame_id);
+  }
+  return Status::Ok();
+}
+
+Status LRUReplacer::Remove(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("LRU frame 编号越界: " + std::to_string(frame_id));
+  }
+  candidates_.erase(frame_id);
+  order_.remove(frame_id);
+  last_used_.erase(frame_id);
   return Status::Ok();
 }
 
@@ -787,7 +856,7 @@ Status SlottedPage::ValidateBytes(const std::byte *data) {
       }
       continue;
     }
-    if (offset < free_end || offset > Page::kSize ||
+    if (offset < free_start || offset < free_end || offset > Page::kSize ||
         static_cast<std::uint64_t>(offset) + length > Page::kSize) {
       return Status::InvalidArgument("Slotted Page 记录边界非法: " + std::to_string(slot));
     }
@@ -845,12 +914,20 @@ Result<slot_id_t> SlottedPage::InsertRecord(WritePageGuard &page,
   if (record.size() > std::numeric_limits<std::uint32_t>::max()) {
     return Result<slot_id_t>(Status::InvalidArgument("记录长度超过页面格式上限"));
   }
+  if (record.size() > kMaxRecordSize) {
+    return Result<slot_id_t>(Status::RecordTooLarge(
+        "单条记录超过 Slotted Page 上限: " + std::to_string(kMaxRecordSize)));
+  }
 
   auto *data = page.Data();
   auto slot_count = LoadU32LittleEndian(data, kSlotCountOffset);
   const auto max_slots = (Page::kSize - kHeaderSize) / kSlotSize;
-  if (slot_count >= max_slots) {
-    return Result<slot_id_t>(Status::OutOfSpace("槽目录已满"));
+  slot_id_t reusable_slot = INVALID_SLOT_ID;
+  for (std::uint32_t slot = 0; slot < slot_count; ++slot) {
+    if (SlotField(data, static_cast<slot_id_t>(slot), 8) == kDeletedSlot) {
+      reusable_slot = static_cast<slot_id_t>(slot);
+      break;
+    }
   }
   const auto free_start = LoadU32LittleEndian(data, kFreeStartOffset);
   auto free_end = LoadU32LittleEndian(data, kFreeEndOffset);
@@ -860,14 +937,21 @@ Result<slot_id_t> SlottedPage::InsertRecord(WritePageGuard &page,
       active_bytes += SlotField(data, static_cast<slot_id_t>(slot), 4);
     }
   }
-  const auto required = static_cast<std::uint64_t>(kSlotSize) + record.size();
+  const auto required = static_cast<std::uint64_t>(record.size()) +
+                        (reusable_slot == INVALID_SLOT_ID ? kSlotSize : 0);
   const auto total_free = static_cast<std::uint64_t>(Page::kSize) - free_start - active_bytes;
   if (required > total_free) {
     return Result<slot_id_t>(Status::OutOfSpace("页面没有足够的总空间容纳记录"));
   }
+  if (reusable_slot == INVALID_SLOT_ID && slot_count >= max_slots) {
+    return Result<slot_id_t>(Status::OutOfSpace("槽目录已满"));
+  }
 
   auto has_contiguous_space = [&]() {
-    const auto new_free_start = kHeaderSize + (static_cast<std::size_t>(slot_count) + 1) * kSlotSize;
+    const auto new_free_start = kHeaderSize +
+                                (static_cast<std::size_t>(slot_count) +
+                                 (reusable_slot == INVALID_SLOT_ID ? 1U : 0U)) *
+                                    kSlotSize;
     return new_free_start <= free_end && record.size() <= free_end - new_free_start;
   };
   if (!has_contiguous_space()) {
@@ -883,23 +967,31 @@ Result<slot_id_t> SlottedPage::InsertRecord(WritePageGuard &page,
     }
   }
 
-  const auto new_free_start = kHeaderSize + (static_cast<std::size_t>(slot_count) + 1) * kSlotSize;
+  const auto new_free_start = kHeaderSize +
+                              (static_cast<std::size_t>(slot_count) +
+                               (reusable_slot == INVALID_SLOT_ID ? 1U : 0U)) *
+                                  kSlotSize;
   const auto new_free_end = free_end - static_cast<std::uint32_t>(record.size());
   if (!record.empty()) {
     std::memcpy(data + new_free_end, record.data(), record.size());
   }
-  SetSlotField(data, static_cast<slot_id_t>(slot_count), 0, new_free_end);
-  SetSlotField(data, static_cast<slot_id_t>(slot_count), 4,
+  const auto target_slot = reusable_slot == INVALID_SLOT_ID
+                               ? static_cast<slot_id_t>(slot_count)
+                               : reusable_slot;
+  SetSlotField(data, target_slot, 0, new_free_end);
+  SetSlotField(data, target_slot, 4,
                static_cast<std::uint32_t>(record.size()));
-  SetSlotField(data, static_cast<slot_id_t>(slot_count), 8, kUsedSlot);
-  StoreU32LittleEndian(data, kSlotCountOffset, slot_count + 1);
+  SetSlotField(data, target_slot, 8, kUsedSlot);
+  if (reusable_slot == INVALID_SLOT_ID) {
+    StoreU32LittleEndian(data, kSlotCountOffset, slot_count + 1);
+  }
   StoreU32LittleEndian(data, kFreeStartOffset, static_cast<std::uint32_t>(new_free_start));
   StoreU32LittleEndian(data, kFreeEndOffset, new_free_end);
   auto dirty_status = page.MarkDirty();
   if (!dirty_status.ok()) {
     return Result<slot_id_t>(dirty_status);
   }
-  return Result<slot_id_t>(static_cast<slot_id_t>(slot_count));
+  return Result<slot_id_t>(target_slot);
 }
 
 Result<std::vector<std::byte>> SlottedPage::GetRecord(const ReadPageGuard &page, slot_id_t slot_id) {
@@ -1033,6 +1125,10 @@ BufferPoolManager::BufferPoolManager(std::size_t pool_size, DiskManager *disk_ma
       flush_policy_(flush_policy),
       init_status_(Status::Ok()),
       frames_(pool_size) {
+  for (frame_id_t frame_id = 0; frame_id < pool_size_; ++frame_id) {
+    free_frames_.push_back(frame_id);
+    free_frame_set_.insert(frame_id);
+  }
   if (pool_size_ == 0) {
     init_status_ = Status::InvalidArgument("缓冲池容量必须大于 0");
   } else if (disk_manager_ == nullptr) {
@@ -1071,22 +1167,26 @@ Status BufferPoolManager::ValidateDataPageId(page_id_t page_id) const {
   return Status::Ok();
 }
 
-Result<frame_id_t> BufferPoolManager::SelectFrameUnlocked() {
-  for (frame_id_t frame_id = 0; frame_id < frames_.size(); ++frame_id) {
-    if (frames_[frame_id].page_id == INVALID_PAGE_ID) {
-      return Result<frame_id_t>(frame_id);
+Result<BufferPoolManager::FrameSelection> BufferPoolManager::SelectFrameUnlocked() {
+  if (!free_frames_.empty()) {
+    const frame_id_t frame_id = free_frames_.front();
+    free_frames_.pop_front();
+    free_frame_set_.erase(frame_id);
+    if (frame_id >= frames_.size() || frames_[frame_id].page_id != INVALID_PAGE_ID) {
+      return Result<FrameSelection>(Status::InternalError("BufferPool 空闲 frame 状态损坏"));
     }
+    return Result<FrameSelection>(FrameSelection{frame_id, true});
   }
 
   auto victim = replacer_->Victim();
   if (!victim.ok()) {
-    return Result<frame_id_t>(Status::NotFound("没有可淘汰的 frame，所有页面都被 pin"));
+    return Result<FrameSelection>(Status::NotFound("没有可淘汰的 frame，所有页面都被 pin"));
   }
 
   const frame_id_t frame_id = victim.value();
   Frame &frame = frames_[frame_id];
   if (frame.pin_count != 0 || frame.page_id == INVALID_PAGE_ID) {
-    return Result<frame_id_t>(Status::InternalError("替换器返回了无效的 frame"));
+    return Result<FrameSelection>(Status::InternalError("替换器返回了无效的 frame"));
   }
 
   if (frame.is_dirty) {
@@ -1094,18 +1194,36 @@ Result<frame_id_t> BufferPoolManager::SelectFrameUnlocked() {
     const auto write_status = disk_manager_->WritePage(frame.page_id, frame.page);
     if (!write_status.ok()) {
       (void)replacer_->Unpin(frame_id);
-      return Result<frame_id_t>(write_status);
+      return Result<FrameSelection>(write_status);
     }
     frame.is_dirty = false;
   }
-  return Result<frame_id_t>(frame_id);
+  return Result<FrameSelection>(FrameSelection{frame_id, false});
 }
 
-void BufferPoolManager::RestoreVictimUnlocked(frame_id_t frame_id) {
-  if (frame_id < frames_.size() && frames_[frame_id].page_id != INVALID_PAGE_ID &&
-      frames_[frame_id].pin_count == 0) {
-    (void)replacer_->Unpin(frame_id);
+void BufferPoolManager::RestoreSelectionUnlocked(const FrameSelection &selection) {
+  if (selection.from_free_list) {
+    (void)ReturnFreeFrameUnlocked(selection.frame_id);
+    return;
   }
+  if (selection.frame_id < frames_.size() && frames_[selection.frame_id].page_id != INVALID_PAGE_ID &&
+      frames_[selection.frame_id].pin_count == 0) {
+    (void)replacer_->Unpin(selection.frame_id);
+  }
+}
+
+Status BufferPoolManager::ReturnFreeFrameUnlocked(frame_id_t frame_id) {
+  if (frame_id >= frames_.size()) {
+    return Status::InvalidArgument("归还的 free frame 编号越界: " + std::to_string(frame_id));
+  }
+  if (frames_[frame_id].page_id != INVALID_PAGE_ID || frames_[frame_id].pin_count != 0) {
+    return Status::InternalError("只能归还未占用的 free frame: " + std::to_string(frame_id));
+  }
+  if (!free_frame_set_.insert(frame_id).second) {
+    return Status::InternalError("free frame 重复归还: " + std::to_string(frame_id));
+  }
+  free_frames_.push_back(frame_id);
+  return Status::Ok();
 }
 
 Status BufferPoolManager::ReleaseGuard(frame_id_t frame_id, page_id_t page_id,
@@ -1141,6 +1259,8 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
   const auto found = page_table_.find(page_id);
   if (found != page_table_.end()) {
     Frame &frame = frames_[found->second];
+    const auto access_status = replacer_->RecordAccess(found->second);
+    if (!access_status.ok()) return Result<ReadPageGuard>(access_status);
     ++frame.pin_count;
     const auto pin_status = replacer_->Pin(found->second);
     if (!pin_status.ok()) {
@@ -1156,12 +1276,13 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
   if (!selected.ok()) {
     return Result<ReadPageGuard>(selected.status());
   }
-  const frame_id_t frame_id = selected.value();
+  const auto selection = selected.value();
+  const frame_id_t frame_id = selection.frame_id;
   Frame &frame = frames_[frame_id];
   const page_id_t old_page_id = frame.page_id;
   auto page = disk_manager_->ReadPage(page_id);
   if (!page.ok()) {
-    RestoreVictimUnlocked(frame_id);
+    RestoreSelectionUnlocked(selection);
     return Result<ReadPageGuard>(page.status());
   }
 
@@ -1173,7 +1294,9 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
   frame.pin_count = 1;
   frame.is_dirty = false;
   page_table_[page_id] = frame_id;
-  if (old_page_id != INVALID_PAGE_ID) {
+  (void)replacer_->Remove(frame_id);
+  (void)replacer_->RecordAccess(frame_id);
+  if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
     ++eviction_count_;
     eviction_log_.push_back(old_page_id);
   }
@@ -1195,6 +1318,8 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
   const auto found = page_table_.find(page_id);
   if (found != page_table_.end()) {
     Frame &frame = frames_[found->second];
+    const auto access_status = replacer_->RecordAccess(found->second);
+    if (!access_status.ok()) return Result<WritePageGuard>(access_status);
     ++frame.pin_count;
     const auto pin_status = replacer_->Pin(found->second);
     if (!pin_status.ok()) {
@@ -1210,12 +1335,13 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
   if (!selected.ok()) {
     return Result<WritePageGuard>(selected.status());
   }
-  const frame_id_t frame_id = selected.value();
+  const auto selection = selected.value();
+  const frame_id_t frame_id = selection.frame_id;
   Frame &frame = frames_[frame_id];
   const page_id_t old_page_id = frame.page_id;
   auto page = disk_manager_->ReadPage(page_id);
   if (!page.ok()) {
-    RestoreVictimUnlocked(frame_id);
+    RestoreSelectionUnlocked(selection);
     return Result<WritePageGuard>(page.status());
   }
 
@@ -1227,7 +1353,9 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
   frame.pin_count = 1;
   frame.is_dirty = false;
   page_table_[page_id] = frame_id;
-  if (old_page_id != INVALID_PAGE_ID) {
+  (void)replacer_->Remove(frame_id);
+  (void)replacer_->RecordAccess(frame_id);
+  if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
     ++eviction_count_;
     eviction_log_.push_back(old_page_id);
   }
@@ -1245,12 +1373,13 @@ Result<WritePageGuard> BufferPoolManager::NewPage() {
   if (!selected.ok()) {
     return Result<WritePageGuard>(selected.status());
   }
-  const frame_id_t frame_id = selected.value();
+  const auto selection = selected.value();
+  const frame_id_t frame_id = selection.frame_id;
   Frame &frame = frames_[frame_id];
   const page_id_t old_page_id = frame.page_id;
   auto allocated = disk_manager_->AllocatePage();
   if (!allocated.ok()) {
-    RestoreVictimUnlocked(frame_id);
+    RestoreSelectionUnlocked(selection);
     return Result<WritePageGuard>(allocated.status());
   }
 
@@ -1262,7 +1391,9 @@ Result<WritePageGuard> BufferPoolManager::NewPage() {
   frame.pin_count = 1;
   frame.is_dirty = false;
   page_table_[allocated.value()] = frame_id;
-  if (old_page_id != INVALID_PAGE_ID) {
+  (void)replacer_->Remove(frame_id);
+  (void)replacer_->RecordAccess(frame_id);
+  if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
     ++eviction_count_;
     eviction_log_.push_back(old_page_id);
   }
@@ -1377,6 +1508,10 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
     frame.page_id = INVALID_PAGE_ID;
     frame.pin_count = 0;
     frame.is_dirty = false;
+  }
+  (void)replacer_->Remove(frame_id);
+  if (const auto free_status = ReturnFreeFrameUnlocked(frame_id); !free_status.ok()) {
+    return free_status;
   }
   return Status::Ok();
 }

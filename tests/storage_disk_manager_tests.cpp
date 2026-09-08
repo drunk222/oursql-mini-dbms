@@ -325,7 +325,7 @@ bool TestReplacerPolicies() {
     return false;
   }
   auto fifo_second = fifo.Victim();
-  if (!Check(fifo_second.ok() && fifo_second.value() == 2, "FIFO 顺序不应受访问刷新影响")) {
+  if (!Check(fifo_second.ok() && fifo_second.value() == 1, "FIFO 应恢复页面原到达顺序")) {
     return false;
   }
 
@@ -462,6 +462,140 @@ bool TestFifoAndLruEvictionOrder() {
   const bool ok = Check(lru_log.size() == 1 && lru_log[0] == pages[1],
                         "LRU 应淘汰最近访问之外的最旧页");
   return CloseDb(dm) && ok;
+}
+
+bool TestFreeFrameListAndPolicyContrast() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  std::vector<oursql::page_id_t> pages;
+  if (!AllocatePages(dm, 4, &pages)) {
+    CloseDb(dm);
+    return false;
+  }
+
+  oursql::BufferPoolManager free_bpm(2, &dm);
+  auto fetch_and_release = [](oursql::BufferPoolManager &bpm, oursql::page_id_t page_id) {
+    auto result = bpm.FetchPage(page_id);
+    if (!result.ok()) return false;
+    auto guard = std::move(result.value());
+    return guard.IsValid();
+  };
+  if (!Check(fetch_and_release(free_bpm, pages[0]) && fetch_and_release(free_bpm, pages[1]),
+             "容量为 2 时应先使用两个空 frame")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(free_bpm.GetEvictionCount() == 0, "使用空 frame 不应计为 eviction")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(free_bpm.DeletePage(pages[1]).ok(), "删除未 pin 页面应成功归还 frame")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(fetch_and_release(free_bpm, pages[2]) && free_bpm.GetEvictionCount() == 0,
+             "删除后应复用空 frame 且不增加 eviction")) {
+    CloseDb(dm);
+    return false;
+  }
+  {
+    auto retained = free_bpm.FetchPage(pages[0]);
+    if (!Check(retained.ok(), "未被删除的缓存页应继续命中")) {
+      CloseDb(dm);
+      return false;
+    }
+    auto retained_guard = std::move(retained.value());
+  }
+  if (!Check(free_bpm.Close().ok(), "FreeList 测试缓冲池关闭应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+
+  oursql::BufferPoolManager free_failure_bpm(2, &dm);
+  auto failed_free_fetch = free_failure_bpm.FetchPage(99);
+  if (!Check(!failed_free_fetch.ok(), "空 frame 读取不存在页面应失败")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(fetch_and_release(free_failure_bpm, pages[3]) &&
+                 free_failure_bpm.GetEvictionCount() == 0,
+             "空 frame 读取失败后应归还并可再次使用")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(free_failure_bpm.Close().ok(), "空 frame 失败回滚测试关闭应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+
+  oursql::BufferPoolManager failed_bpm(1, &dm);
+  if (!Check(fetch_and_release(failed_bpm, pages[0]), "失败回滚测试预热应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto missing = failed_bpm.FetchPage(99);
+  if (!Check(!missing.ok(), "不存在页面读取应失败")) {
+    CloseDb(dm);
+    return false;
+  }
+  {
+    auto recovered = failed_bpm.FetchPage(pages[0]);
+    if (!Check(recovered.ok(), "牺牲页读取失败后 frame 应恢复为可用候选")) {
+      CloseDb(dm);
+      return false;
+    }
+    auto recovered_guard = std::move(recovered.value());
+  }
+  if (!Check(failed_bpm.Close().ok(), "失败回滚测试缓冲池关闭应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+
+  oursql::BufferPoolManager fifo_bpm(3, &dm, oursql::ReplacementPolicy::FIFO);
+  oursql::BufferPoolManager lru_bpm(3, &dm, oursql::ReplacementPolicy::LRU);
+  for (const auto page_id : {pages[0], pages[1], pages[2]}) {
+    if (!Check(fetch_and_release(fifo_bpm, page_id) && fetch_and_release(lru_bpm, page_id),
+               "对照序列预热应成功")) {
+      CloseDb(dm);
+      return false;
+    }
+  }
+  if (!Check(fetch_and_release(fifo_bpm, pages[0]) && fetch_and_release(lru_bpm, pages[0]),
+             "对照序列第二次访问 Page 1 应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(fetch_and_release(fifo_bpm, pages[3]) && fetch_and_release(lru_bpm, pages[3]),
+             "对照序列访问 Page 4 应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  const auto fifo_log = fifo_bpm.GetEvictionLog();
+  const auto lru_log = lru_bpm.GetEvictionLog();
+  if (!Check(fifo_log.size() == 1 && fifo_log[0] == pages[0], "FIFO 对照序列应淘汰 Page 1")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(lru_log.size() == 1 && lru_log[0] == pages[1], "LRU 对照序列应淘汰 Page 2")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto fifo_last = fifo_bpm.FetchPage(pages[0]);
+  auto lru_last = lru_bpm.FetchPage(pages[0]);
+  const bool stats_ok = Check(fifo_last.ok() && lru_last.ok(), "对照序列最后访问应成功") &&
+                        Check(fifo_bpm.GetHitCount() == 1 && fifo_bpm.GetMissCount() == 5,
+                              "FIFO 对照序列命中未命中统计应为 1/5") &&
+                        Check(lru_bpm.GetHitCount() == 2 && lru_bpm.GetMissCount() == 4,
+                              "LRU 对照序列命中未命中统计应为 2/4");
+  if (fifo_last.ok()) {
+    auto guard = std::move(fifo_last.value());
+  }
+  if (lru_last.ok()) {
+    auto guard = std::move(lru_last.value());
+  }
+  return Check(fifo_bpm.Close().ok() && lru_bpm.Close().ok(), "策略对照缓冲池关闭应成功") &&
+         CloseDb(dm) && stats_ok;
 }
 
 bool TestDirtyAndCleanEviction() {
@@ -612,6 +746,7 @@ int main() {
   run("FIFO and LRU replacers", &TestReplacerPolicies);
   run("Buffer pool hit and pinned failure", &TestBufferPoolHitAndPinnedFailure);
   run("FIFO and LRU eviction order", &TestFifoAndLruEvictionOrder);
+  run("Free frame list and policy contrast", &TestFreeFrameListAndPolicyContrast);
   run("Dirty and clean eviction", &TestDirtyAndCleanEviction);
   run("Page guards and explicit errors", &TestGuardAndExplicitErrors);
 

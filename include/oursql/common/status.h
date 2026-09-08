@@ -15,6 +15,7 @@ enum class ErrorCode {
   AlreadyExists,
   TypeMismatch,
   OutOfSpace,
+  RecordTooLarge,
   IOError,
   InternalError,
 };
@@ -43,6 +44,9 @@ class Status {
 
   // 调用者：页面或存储层；作用：表示可用空间不足；返回：带上下文的错误状态。
   static Status OutOfSpace(std::string message);
+
+  // 调用者：记录或元数据写入流程；作用：表示单条记录超过页面上限；返回：带上下文的错误状态。
+  static Status RecordTooLarge(std::string message);
 
   // 调用者：上层控制器；作用：构造 I/O 错误；返回：带上下文的错误状态。
   static Status IOError(std::string message);

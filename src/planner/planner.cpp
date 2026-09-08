@@ -70,7 +70,7 @@ std::string PredicateText(const Predicate &predicate) {
          (predicate.value.IsInt() ? predicate.value.ToString() : "'" + predicate.value.AsVarchar() + "'");
 }
 
-std::string NodeText(const std::shared_ptr<PlanNode> &node) {
+std::string NodeText(const std::shared_ptr<const PlanNode> &node) {
   if (node == nullptr) return "<null>";
   return std::visit(
       [&](const auto &operation) -> std::string {
@@ -133,7 +133,7 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
             auto predicate_status = CheckPredicate(*value.where, table.value()->schema);
             if (!predicate_status.ok()) return Result<Plan>(predicate_status);
           }
-          auto root = std::make_shared<PlanNode>(SeqScanPlan{value.table_name});
+          std::shared_ptr<const PlanNode> root = std::make_shared<PlanNode>(SeqScanPlan{value.table_name});
           if (value.where.has_value()) root = std::make_shared<PlanNode>(FilterPlan{root, *value.where});
           root = std::make_shared<PlanNode>(ProjectPlan{root, value.projection, value.select_all});
           return Result<Plan>(SelectPlan{value.table_name, std::move(root)});

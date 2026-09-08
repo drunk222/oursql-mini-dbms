@@ -28,12 +28,12 @@ struct SeqScanPlan {
 struct PlanNode;
 
 struct FilterPlan {
-  std::shared_ptr<PlanNode> child;
+  std::shared_ptr<const PlanNode> child;
   Predicate predicate;
 };
 
 struct ProjectPlan {
-  std::shared_ptr<PlanNode> child;
+  std::shared_ptr<const PlanNode> child;
   std::vector<std::string> columns;
   bool select_all{false};
 };
@@ -47,7 +47,7 @@ struct PlanNode {
 
 struct SelectPlan {
   std::string table_name;
-  std::shared_ptr<PlanNode> root;
+  std::shared_ptr<const PlanNode> root;
 };
 
 struct DeletePlan {

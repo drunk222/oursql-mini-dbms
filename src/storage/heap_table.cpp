@@ -81,6 +81,10 @@ Result<RID> HeapTable::InsertRow(const Row &row) {
   }
   auto encoded = RowCodec::Encode(metadata_.schema, row);
   if (!encoded.ok()) return Result<RID>(encoded.status());
+  if (encoded.value().size() > SlottedPage::kMaxRecordSize) {
+    return Result<RID>(Status::RecordTooLarge(
+        "HeapTable 单行超过页面上限: " + std::to_string(SlottedPage::kMaxRecordSize)));
+  }
 
   page_id_t current = metadata_.first_data_page_id;
   std::unordered_set<page_id_t> visited;
@@ -144,8 +148,37 @@ Result<RID> HeapTable::InsertRow(const Row &row) {
   }
 }
 
+Status HeapTable::ValidateRidPage(page_id_t page_id) {
+  if (page_id == 0 || page_id == INVALID_PAGE_ID) {
+    return Status::NotFound("RID 页面编号非法: " + std::to_string(page_id));
+  }
+  if (metadata_.first_data_page_id == 0 || metadata_.first_data_page_id == INVALID_PAGE_ID) {
+    return Status::InvalidArgument("HeapTable 缺少首数据页");
+  }
+
+  page_id_t current = metadata_.first_data_page_id;
+  std::unordered_set<page_id_t> visited;
+  while (current != INVALID_PAGE_ID) {
+    if (current == 0 || !visited.insert(current).second) {
+      return Status::InvalidArgument("数据页链表损坏或成环");
+    }
+    auto page_result = buffer_pool_->FetchPage(current);
+    if (!page_result.ok()) return page_result.status();
+    auto page = std::move(page_result.value());
+    auto valid = SlottedPage::Validate(page);
+    if (!valid.ok()) return valid;
+    auto next = SlottedPage::NextPageId(page);
+    if (!next.ok()) return next.status();
+    if (current == page_id) return Status::Ok();
+    current = next.value();
+  }
+  return Status::NotFound("RID 页面不属于当前表: " + std::to_string(page_id));
+}
+
 Result<Row> HeapTable::GetRow(const RID &rid) {
   if (buffer_pool_ == nullptr) return Result<Row>(Status::InvalidArgument("HeapTable 缺少 BufferPoolManager"));
+  auto ownership = ValidateRidPage(rid.page_id);
+  if (!ownership.ok()) return Result<Row>(ownership);
   auto page_result = buffer_pool_->FetchPage(rid.page_id);
   if (!page_result.ok()) return Result<Row>(page_result.status());
   auto page = std::move(page_result.value());
@@ -156,6 +189,8 @@ Result<Row> HeapTable::GetRow(const RID &rid) {
 
 Status HeapTable::DeleteRow(const RID &rid) {
   if (buffer_pool_ == nullptr) return Status::InvalidArgument("HeapTable 缺少 BufferPoolManager");
+  auto ownership = ValidateRidPage(rid.page_id);
+  if (!ownership.ok()) return ownership;
   auto page_result = buffer_pool_->FetchPageWrite(rid.page_id);
   if (!page_result.ok()) return page_result.status();
   auto page = std::move(page_result.value());

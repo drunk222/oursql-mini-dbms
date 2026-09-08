@@ -60,6 +60,29 @@ const Status &DatabaseEngine::GetInitStatus() const noexcept {
   return init_status_;
 }
 
+std::vector<TableMetadata> DatabaseEngine::ListTables() const {
+  return catalog_.ListTables();
+}
+
+Result<TableMetadata> DatabaseEngine::GetTableMetadata(std::string_view table_name) const {
+  auto metadata = catalog_.GetTableMetadata(table_name);
+  if (!metadata.ok()) return Result<TableMetadata>(metadata.status());
+  return Result<TableMetadata>(*metadata.value());
+}
+
+Status DatabaseEngine::Flush() {
+  if (!init_status_.ok()) return Contextualize("DatabaseEngine", init_status_);
+  if (closed_) return Status::InvalidArgument("DatabaseEngine 已关闭");
+  return buffer_pool_.FlushAllPages();
+}
+
+DatabaseStatistics DatabaseEngine::GetStatistics() const {
+  return DatabaseStatistics{buffer_pool_.GetAccessCount(), buffer_pool_.GetHitCount(),
+                            buffer_pool_.GetMissCount(), buffer_pool_.GetHitRate(),
+                            buffer_pool_.GetEvictionCount(), disk_manager_.GetReadCount(),
+                            disk_manager_.GetWriteCount()};
+}
+
 Result<ExecutionResult> DatabaseEngine::ExecuteSql(std::string_view sql) {
   if (!init_status_.ok()) {
     return Result<ExecutionResult>(Contextualize("DatabaseEngine", init_status_));

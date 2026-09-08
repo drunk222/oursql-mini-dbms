@@ -29,6 +29,9 @@ endif()
 
 add_executable(oursql src/app/main.cpp)
 target_link_libraries(oursql PRIVATE oursql_core)
+if (MINGW)
+  target_link_options(oursql PRIVATE -municode)
+endif()
 
 add_executable(oursql_tests tests/oursql_tests.cpp)
 target_link_libraries(oursql_tests PRIVATE oursql_core)
@@ -48,6 +51,12 @@ target_link_libraries(oursql_catalog_heap_tests PRIVATE oursql_core)
 add_executable(oursql_execution_tests tests/execution_tests.cpp)
 target_link_libraries(oursql_execution_tests PRIVATE oursql_core)
 
+add_executable(oursql_edge_case_tests tests/edge_case_tests.cpp)
+target_link_libraries(oursql_edge_case_tests PRIVATE oursql_core)
+
+add_executable(oursql_benchmark benchmarks/storage_benchmark.cpp)
+target_link_libraries(oursql_benchmark PRIVATE oursql_core)
+
 enable_testing()
 add_test(NAME oursql_tests COMMAND oursql_tests)
 add_test(NAME oursql_storage_tests COMMAND oursql_storage_tests)
@@ -55,3 +64,4 @@ add_test(NAME oursql_slotted_page_tests COMMAND oursql_slotted_page_tests)
 add_test(NAME oursql_frontend_tests COMMAND oursql_frontend_tests)
 add_test(NAME oursql_catalog_heap_tests COMMAND oursql_catalog_heap_tests)
 add_test(NAME oursql_execution_tests COMMAND oursql_execution_tests)
+add_test(NAME oursql_edge_case_tests COMMAND oursql_edge_case_tests)

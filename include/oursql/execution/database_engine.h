@@ -5,9 +5,22 @@
 #include "oursql/planner/planner.h"
 
 #include <filesystem>
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace oursql {
+
+struct DatabaseStatistics {
+  std::uint64_t buffer_accesses{0};
+  std::uint64_t buffer_hits{0};
+  std::uint64_t buffer_misses{0};
+  double buffer_hit_rate{0.0};
+  std::uint64_t evictions{0};
+  std::uint64_t disk_reads{0};
+  std::uint64_t disk_writes{0};
+};
 
 class DatabaseEngine {
  public:
@@ -25,6 +38,14 @@ class DatabaseEngine {
   [[nodiscard]] Status Close();
   // 调用者：程序或测试；作用：查询构造期间的打开状态；返回：成功或上下文错误。
   [[nodiscard]] const Status &GetInitStatus() const noexcept;
+  // 调用者：CLI 或管理工具；作用：列出已登记表；返回：表元数据副本。
+  [[nodiscard]] std::vector<TableMetadata> ListTables() const;
+  // 调用者：CLI 或管理工具；作用：读取一张表的元数据；返回：元数据副本或错误。
+  [[nodiscard]] Result<TableMetadata> GetTableMetadata(std::string_view table_name) const;
+  // 调用者：CLI 或测试；作用：显式写回缓冲池脏页；返回：成功或 I/O 错误。
+  [[nodiscard]] Status Flush();
+  // 调用者：CLI 或答辩基准；作用：读取当前存储统计；返回：统计快照。
+  [[nodiscard]] DatabaseStatistics GetStatistics() const;
   // 调用者：命令行或客户端；作用：编译并执行多条 SQL；返回：最后一条结果或执行错误。
   [[nodiscard]] Result<ExecutionResult> ExecuteSql(std::string_view sql);
 

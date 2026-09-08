@@ -100,8 +100,15 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
       continue;
     }
 
-    if (std::isdigit(static_cast<unsigned char>(character))) {
+    if (std::isdigit(static_cast<unsigned char>(character)) ||
+        (character == '-' && offset + 1 < sql.size() &&
+         std::isdigit(static_cast<unsigned char>(sql[offset + 1])))) {
       std::string number;
+      if (character == '-') {
+        number.push_back(character);
+        advance(character, &line, &column);
+        ++offset;
+      }
       while (offset < sql.size() && std::isdigit(static_cast<unsigned char>(sql[offset]))) {
         number.push_back(sql[offset]);
         advance(sql[offset], &line, &column);

@@ -4,6 +4,8 @@
 #include "oursql/storage/row_codec.h"
 #include "oursql/storage/storage.h"
 
+#include <optional>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -15,6 +17,37 @@ class HeapTable {
  public:
   // 调用者：执行器；作用：绑定一张已登记的堆表和缓冲池；返回：非拥有表对象。
   HeapTable(BufferPoolManager *buffer_pool, TableMetadata metadata) noexcept;
+
+  class ScanCursor {
+   public:
+    ScanCursor() = default;
+    ~ScanCursor() = default;
+    ScanCursor(const ScanCursor &) = delete;
+    ScanCursor &operator=(const ScanCursor &) = delete;
+    ScanCursor(ScanCursor &&) noexcept = default;
+    ScanCursor &operator=(ScanCursor &&) noexcept = default;
+
+    // 调用者：SeqScanExecutor；作用：逐行读取下一条有效记录；返回：行地址与行，结束时返回空值。
+    [[nodiscard]] Result<std::optional<RowEntry>> Next();
+
+   private:
+    friend class HeapTable;
+    ScanCursor(BufferPoolManager *buffer_pool, TableMetadata metadata) noexcept
+        : buffer_pool_(buffer_pool), metadata_(std::move(metadata)),
+          current_page_(metadata_.first_data_page_id) {}
+
+    BufferPoolManager *buffer_pool_{nullptr};
+    TableMetadata metadata_;
+    page_id_t current_page_{INVALID_PAGE_ID};
+    std::uint32_t next_slot_{0};
+    std::optional<ReadPageGuard> page_guard_;
+    bool page_loaded_{false};
+    std::uint32_t slot_count_{0};
+    std::unordered_set<page_id_t> visited_pages_;
+  };
+
+  // 调用者：SeqScanExecutor 或测试；作用：创建按页面链惰性读取的游标；返回：游标或错误。
+  [[nodiscard]] Result<ScanCursor> BeginScan();
 
   // 调用者：插入执行器；作用：沿数据页链插入一行；返回：新行 RID 或错误。
   [[nodiscard]] Result<RID> InsertRow(const Row &row);

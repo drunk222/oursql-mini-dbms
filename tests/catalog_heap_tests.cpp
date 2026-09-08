@@ -130,7 +130,11 @@ bool TestHeapTableAcrossPagesDeleteAndRestart() {
     expected.push_back(row);
   }
   auto scanned = table.Scan();
-  if (!Check(scanned.ok() && scanned.value().size() == expected.size(), "跨页扫描数量应正确")) return false;
+  if (!Check(scanned.ok() && scanned.value().size() == expected.size(), "跨页扫描数量应正确")) {
+    if (!scanned.ok()) std::cerr << scanned.status().ToString() << '\n';
+    else std::cerr << "实际扫描数量: " << scanned.value().size() << '\n';
+    return false;
+  }
   for (std::size_t i = 0; i < scanned.value().size(); ++i) {
     if (!Check(SameRow(scanned.value()[i].second, expected[i]), "跨页扫描内容应按顺序一致")) return false;
   }

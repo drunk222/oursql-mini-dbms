@@ -9,7 +9,7 @@
 ```powershell
 cmake -S . -B build
 cmake --build build --config Debug
-.\build\oursql.exe .\build\demo.oursql
+.\build\Debug\oursql.exe .\build\demo.oursql
 ```
 
 在 CLI 中逐行输入：
@@ -52,7 +52,7 @@ SQL 必须以分号结束；关键字、表名和列名按前端规则处理。C
 
 ```powershell
 cmake --build build --config Debug --target oursql_benchmark
-.\build\oursql_benchmark.exe
+.\build\Debug\oursql_benchmark.exe
 ```
 
 预期流程：基准先通过 DiskManager 创建 32 个数据页，再用固定 `pool=4`、`128` 次请求、随机种子 `20260908`，分别运行顺序、随机、热点请求，并打印 FIFO/LRU 的访问次数、命中率、淘汰数、磁盘读写数和耗时。

@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# MSVC 在中文 Windows 上默认用 GBK(代码页 936) 读源码，会导致 UTF-8 源文件中的
+# 中文注释/字符串被误解析。add_compile_options 只对「其后」创建的 target 生效，
+# 所以必须放在所有 add_library/add_executable 之前，才能让库和所有可执行文件都按 UTF-8 编译。
+if (MSVC)
+  add_compile_options(/utf-8)
+endif()
+
 add_library(oursql_core
   src/common/status.cpp
   src/common/value.cpp

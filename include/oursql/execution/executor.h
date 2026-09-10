@@ -79,6 +79,22 @@ class ProjectExecutor {
       const ProjectPlan &plan, std::unique_ptr<RowSource> child, const Schema &schema) const;
 };
 
+class GroupByExecutor {
+ public:
+  // 调用者：ExecutionEngine；作用：按分组列去除重复分组并保留每组第一行。
+  [[nodiscard]] Result<std::unique_ptr<RowSource>> Execute(
+      const GroupByPlan &plan, std::unique_ptr<RowSource> child,
+      const Schema &schema) const;
+};
+
+class OrderByExecutor {
+ public:
+  // 调用者：ExecutionEngine；作用：物化子结果并按多个排序键稳定排序。
+  [[nodiscard]] Result<std::unique_ptr<RowSource>> Execute(
+      const OrderByPlan &plan, std::unique_ptr<RowSource> child,
+      const Schema &schema) const;
+};
+
 class DeleteExecutor {
  public:
   DeleteExecutor(Catalog *catalog, BufferPoolManager *buffer_pool) noexcept
@@ -86,6 +102,19 @@ class DeleteExecutor {
 
   // 调用者：ExecutionEngine；作用：扫描并删除满足条件的行；返回：删除行数或错误。
   [[nodiscard]] Result<ExecutionResult> Execute(const DeletePlan &plan) const;
+
+ private:
+  Catalog *catalog_{nullptr};
+  BufferPoolManager *buffer_pool_{nullptr};
+};
+
+class UpdateExecutor {
+ public:
+  UpdateExecutor(Catalog *catalog, BufferPoolManager *buffer_pool) noexcept
+      : catalog_(catalog), buffer_pool_(buffer_pool) {}
+
+  // 调用者：ExecutionEngine；作用：扫描并替换满足条件的行；返回影响行数和新 RID。
+  [[nodiscard]] Result<ExecutionResult> Execute(const UpdatePlan &plan) const;
 
  private:
   Catalog *catalog_{nullptr};

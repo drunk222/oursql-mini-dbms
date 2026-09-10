@@ -10,7 +10,13 @@ namespace oursql {
 
 namespace {
 
+// Catalog 是数据库的“表目录”：tables_ 是运行时内存索引；每个 TableMetadata
+// 同时会编码为 Catalog 页面链中的一条记录。用户、权限也可沿用此持久化模式。
+
 constexpr std::uint32_t kCatalogRecordMagic = 0x314C4254U;
+
+// Catalog 记录格式（小端序）：magic、首数据页、表名长度、列数、表名，随后是
+// 重复的 [列名长度、类型标签、VARCHAR 上限、列名]；0 表示 VARCHAR 未指定上限。
 
 void AppendU32(std::vector<std::byte> *bytes, std::uint32_t value) {
   bytes->push_back(std::byte{static_cast<unsigned char>(value & 0xFFU)});
@@ -31,6 +37,7 @@ std::uint32_t ReadU32(const std::vector<std::byte> &bytes, std::size_t offset) {
 }
 
 Status ValidateTable(const TableMetadata &table) {
+  // 在写盘和恢复后都调用同一校验，保证内存目录只包含合法且列名唯一的表结构。
   if (table.name.empty()) return Status::InvalidArgument("表名不能为空");
   if (table.schema.size() == 0) return Status::InvalidArgument("表结构不能为空");
   std::unordered_set<std::string> names;
@@ -52,6 +59,7 @@ Result<std::vector<std::byte>> EncodeTable(const TableMetadata &table) {
       table.schema.size() > std::numeric_limits<std::uint32_t>::max()) {
     return Result<std::vector<std::byte>>(Status::InvalidArgument("Catalog 表元数据长度超过上限"));
   }
+  // 明确逐字段编码，不直接序列化 C++ 对象（其中含 string/vector 等进程内指针）。
   std::vector<std::byte> bytes;
   AppendU32(&bytes, kCatalogRecordMagic);
   AppendU32(&bytes, table.first_data_page_id);
@@ -78,6 +86,7 @@ Result<std::vector<std::byte>> EncodeTable(const TableMetadata &table) {
 }
 
 Result<TableMetadata> DecodeTable(const std::vector<std::byte> &bytes) {
+  // 磁盘内容不可信：每次读取变长字段前都验证剩余字节范围。
   if (!CanRead(bytes, 0, 16) || ReadU32(bytes, 0) != kCatalogRecordMagic) {
     return Result<TableMetadata>(Status::InvalidArgument("Catalog 表记录头损坏"));
   }
@@ -136,6 +145,7 @@ Status Catalog::Open() {
   }
   if (!buffer_pool_->GetInitStatus().ok()) return buffer_pool_->GetInitStatus();
 
+  // superblock 保存 Catalog 页链的入口；新库没有入口时创建首个 Catalog 页。
   catalog_head_ = disk_manager_->GetCatalogHead();
   if (catalog_head_ == INVALID_PAGE_ID) {
     auto page_result = buffer_pool_->NewPageGuarded();
@@ -149,6 +159,12 @@ Status Catalog::Open() {
         return init_status;
       }
     }
+    // 先持久化有效的 Catalog 页，再让 superblock 指向它。否则调试器在两次写盘之间
+    // 停止进程时，下一次启动会读到一个仍全为零的 Catalog 页。
+    auto flush_status = buffer_pool_->FlushPage(new_head);
+    if (!flush_status.ok()) {
+      return flush_status;
+    }
     auto set_status = disk_manager_->SetCatalogHead(new_head);
     if (!set_status.ok()) {
       (void)buffer_pool_->DeletePage(new_head);
@@ -161,6 +177,7 @@ Status Catalog::Open() {
 
   std::unordered_set<page_id_t> visited;
   page_id_t current = catalog_head_;
+  // 重启恢复路径：遍历 Catalog 页链，将每条元数据记录还原到 tables_。
   while (current != INVALID_PAGE_ID) {
     if (current == 0 || !visited.insert(current).second) {
       return Status::InvalidArgument("Catalog 页面链表损坏或成环");
@@ -202,6 +219,7 @@ Status Catalog::CreateTable(TableInfo table) {
   auto encoded_size_check = EncodeTable(table);
   if (!encoded_size_check.ok()) return encoded_size_check.status();
 
+  // 无存储依赖时退化为纯内存 Catalog，便于上层组件和单元测试独立使用。
   const bool persistent = buffer_pool_ != nullptr || disk_manager_ != nullptr;
   if (persistent) {
     if (buffer_pool_ == nullptr || disk_manager_ == nullptr) {
@@ -211,6 +229,7 @@ Status Catalog::CreateTable(TableInfo table) {
       auto open_status = Open();
       if (!open_status.ok()) return open_status;
     }
+    // 每张新表先分配自己的首数据页，再把该页号与 schema 一起写进 Catalog。
     auto data_page_result = buffer_pool_->NewPageGuarded();
     if (!data_page_result.ok()) return data_page_result.status();
     page_id_t data_page_id = INVALID_PAGE_ID;
@@ -229,6 +248,7 @@ Status Catalog::CreateTable(TableInfo table) {
 
     page_id_t current = catalog_head_;
     std::unordered_set<page_id_t> visited;
+    // 元数据也按 first-fit 写入 Catalog 页链；页满时沿链查找或追加新页。
     while (true) {
       if (current == 0 || current == INVALID_PAGE_ID || !visited.insert(current).second) {
         (void)buffer_pool_->DeletePage(data_page_id);
@@ -297,6 +317,7 @@ Status Catalog::CreateTable(TableInfo table) {
           return link_status;
         }
       }
+      // 新 Catalog 页已接到链尾，下一轮会把元数据记录写入该页。
       current = new_catalog_id;
     }
   }
@@ -306,6 +327,7 @@ Status Catalog::CreateTable(TableInfo table) {
 }
 
 Result<const TableInfo *> Catalog::FindTable(std::string_view table_name) const {
+  // 返回 map 内对象的只读指针；调用方不得跨越 Catalog 生命周期保存它。
   auto it = tables_.find(std::string(table_name));
   if (it == tables_.end()) {
     return Result<const TableInfo *>(Status::NotFound("Catalog 未找到表: " + std::string(table_name)));

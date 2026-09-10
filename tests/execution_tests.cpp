@@ -165,6 +165,59 @@ bool TestLargeTableAndRestart() {
   return reopened.Close().ok() && ok;
 }
 
+bool TestOrderGroupAndUpdate() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 3);
+  if (!Check(engine.GetInitStatus().ok(), "扩展执行测试数据库打开应成功")) return false;
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE scores(id INT, team VARCHAR(8), score INT);"
+      "INSERT INTO scores VALUES(1, 'red', 10);"
+      "INSERT INTO scores VALUES(2, 'blue', 30);"
+      "INSERT INTO scores VALUES(3, 'red', 30);"
+      "INSERT INTO scores VALUES(4, 'blue', 20);");
+  if (!Check(setup.ok(), "ORDER/GROUP/UPDATE 测试数据应创建成功")) return false;
+
+  auto ordered = engine.ExecuteSql(
+      "SELECT id FROM scores ORDER BY score DESC, id ASC;");
+  if (!Check(ordered.ok() && ordered.value().rows.size() == 4,
+             "多键 ORDER BY 应执行成功")) return false;
+  if (!Check(ordered.value().rows[0][0].AsInt() == 2 &&
+                 ordered.value().rows[1][0].AsInt() == 3 &&
+                 ordered.value().rows[2][0].AsInt() == 4 &&
+                 ordered.value().rows[3][0].AsInt() == 1,
+             "ORDER BY 应支持投影外排序列和 ASC/DESC")) return false;
+
+  auto grouped = engine.ExecuteSql(
+      "SELECT team FROM scores GROUP BY team ORDER BY team DESC;");
+  if (!Check(grouped.ok() && grouped.value().rows.size() == 2 &&
+                 grouped.value().rows[0][0].AsVarchar() == "red" &&
+                 grouped.value().rows[1][0].AsVarchar() == "blue",
+             "GROUP BY 应按分组键去重并可继续排序")) return false;
+
+  auto updated = engine.ExecuteSql(
+      "UPDATE scores SET score = score + 5, team = 'green' WHERE id = 1;");
+  if (!Check(updated.ok() && updated.value().affected_rows == 1 &&
+                 updated.value().rids.size() == 1,
+             "带 WHERE 和表达式的 UPDATE 应更新一行")) return false;
+  auto selected = engine.ExecuteSql("SELECT team, score FROM scores WHERE id = 1;");
+  if (!Check(selected.ok() && selected.value().rows.size() == 1 &&
+                 selected.value().rows[0][0].AsVarchar() == "green" &&
+                 selected.value().rows[0][1].AsInt() == 15,
+             "UPDATE 多列赋值应基于原行求值并持久化")) return false;
+
+  auto update_all = engine.ExecuteSql("UPDATE scores SET score = score * 2;");
+  if (!Check(update_all.ok() && update_all.value().affected_rows == 4,
+             "无 WHERE UPDATE 应更新整表")) return false;
+  auto divide_zero = engine.ExecuteSql("UPDATE scores SET score = score / 0 WHERE id = 2;");
+  if (!Check(!divide_zero.ok() &&
+                 divide_zero.status().code() == oursql::ErrorCode::InvalidArgument,
+             "UPDATE 运行时除零应返回错误且不修改行")) return false;
+  auto unchanged = engine.ExecuteSql("SELECT score FROM scores WHERE id = 2;");
+  return Check(unchanged.ok() && unchanged.value().rows.size() == 1 &&
+                   unchanged.value().rows[0][0].AsInt() == 60,
+               "UPDATE 求值失败时目标行应保持不变");
+}
+
 }  // namespace
 
 int main() {
@@ -180,7 +233,10 @@ int main() {
   }
   if (TestLargeTableAndRestart()) {
     std::cout << "[PASS] Large table and restart\n";
-    return 0;
+  } else {
+    return 1;
   }
-  return 1;
+  if (!TestOrderGroupAndUpdate()) return 1;
+  std::cout << "[PASS] ORDER BY, GROUP BY and UPDATE execution\n";
+  return 0;
 }

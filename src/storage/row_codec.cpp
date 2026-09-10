@@ -4,12 +4,17 @@
 
 namespace oursql {
 
+// RowCodec 是逻辑 Row 与磁盘字节记录之间的唯一转换点。
+// 格式：magic(4) + 列数(4) + 重复的 [类型标签(1) + 字节长度(4) + 字段内容]。
+// 修改记录格式时必须同时修改 Encode/Decode，并新增重启读取测试。
+
 namespace {
 
 constexpr std::uint32_t kRowMagic = 0x31574F52U;
 constexpr std::size_t kRowHeaderSize = 8;
 constexpr std::size_t kFieldHeaderSize = 5;
 
+// 所有整数都按小端序逐字节写入，避免把宿主机结构体布局直接落盘。
 void AppendU32(std::vector<std::byte> *record, std::uint32_t value) {
   record->push_back(std::byte{static_cast<unsigned char>(value & 0xFFU)});
   record->push_back(std::byte{static_cast<unsigned char>((value >> 8U) & 0xFFU)});
@@ -24,6 +29,7 @@ void AppendU64(std::vector<std::byte> *record, std::uint64_t value) {
 }
 
 bool CanRead(const std::vector<std::byte> &record, std::size_t offset, std::size_t length) {
+  // 先比较 offset，再用减法校验 length，避免 offset + length 整数溢出。
   return offset <= record.size() && length <= record.size() - offset;
 }
 
@@ -43,6 +49,7 @@ std::uint64_t ReadU64(const std::vector<std::byte> &record, std::size_t offset) 
 }
 
 std::uint8_t TypeTag(DataType type) {
+  // 持久化标签不依赖 enum 的底层数值，调整 DataType 声明不会悄然破坏旧数据。
   return type == DataType::Int ? 1U : 2U;
 }
 
@@ -58,6 +65,7 @@ Result<std::vector<std::byte>> RowCodec::Encode(const Schema &schema, const Row 
   record.reserve(kRowHeaderSize + row.size() * kFieldHeaderSize);
   AppendU32(&record, kRowMagic);
   AppendU32(&record, static_cast<std::uint32_t>(schema.size()));
+  // 每列带类型和长度，Decode 因而可以检测 schema/记录不一致或损坏。
   for (std::size_t i = 0; i < row.size(); ++i) {
     const auto &column = schema.At(i);
     if (row[i].type() != column.type) {
@@ -66,6 +74,7 @@ Result<std::vector<std::byte>> RowCodec::Encode(const Schema &schema, const Row 
     }
     record.push_back(std::byte{TypeTag(column.type)});
     if (column.type == DataType::Int) {
+      // INT 固定以 8 字节补码位模式保存；转为 uint64_t 后移位不会受符号扩展影响。
       AppendU32(&record, sizeof(std::int64_t));
       AppendU64(&record, static_cast<std::uint64_t>(row[i].AsInt()));
     } else {
@@ -99,6 +108,7 @@ Result<Row> RowCodec::Decode(const Schema &schema, const std::vector<std::byte> 
   Row row;
   row.reserve(schema.size());
   std::size_t offset = kRowHeaderSize;
+  // Decode 对所有偏移做边界检查，不能相信磁盘中的字节一定合法。
   for (std::size_t i = 0; i < schema.size(); ++i) {
     if (!CanRead(record, offset, kFieldHeaderSize)) {
       return Result<Row>(Status::InvalidArgument("Row 字段头部越界: 第 " + std::to_string(i + 1) + " 项"));
@@ -114,6 +124,7 @@ Result<Row> RowCodec::Decode(const Schema &schema, const std::vector<std::byte> 
       if (length != sizeof(std::int64_t) || !CanRead(record, offset, length)) {
         return Result<Row>(Status::InvalidArgument("Row INT 字段长度非法: 第 " + std::to_string(i + 1) + " 项"));
       }
+      // 还原写入时的 64 位位模式，包括负数。
       row.emplace_back(static_cast<std::int64_t>(ReadU64(record, offset)));
     } else {
       if (!CanRead(record, offset, length)) {

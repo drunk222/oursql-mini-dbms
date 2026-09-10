@@ -106,6 +106,28 @@ bool TestCatalogPersistenceAndChain() {
   return reopened_pool.Close().ok() && reopened_disk.Close().ok() && ok;
 }
 
+bool TestCatalogHeadIsDurableImmediately() {
+  TempDb temp;
+  oursql::DiskManager disk_manager;
+  if (!Check(disk_manager.Open(temp.path).ok(), "Catalog 即时持久化测试数据库打开应成功")) {
+    return false;
+  }
+  oursql::BufferPoolManager buffer_pool(2, &disk_manager);
+  oursql::Catalog catalog(&buffer_pool, &disk_manager);
+  if (!Check(catalog.Open().ok(), "首次打开 Catalog 应成功")) return false;
+
+  // Page 0 is the superblock, so a fresh database allocates Page 1 as its Catalog head.
+  auto persisted_page = disk_manager.ReadPage(1);
+  if (!Check(persisted_page.ok(), "Catalog 首页应能直接从磁盘读取")) return false;
+  const auto page_type = static_cast<std::uint32_t>(persisted_page.value().Data()[0]) |
+                         (static_cast<std::uint32_t>(persisted_page.value().Data()[1]) << 8U) |
+                         (static_cast<std::uint32_t>(persisted_page.value().Data()[2]) << 16U) |
+                         (static_cast<std::uint32_t>(persisted_page.value().Data()[3]) << 24U);
+  const bool ok = Check(page_type == oursql::SlottedPage::kPageType,
+                        "superblock 发布 Catalog 首页前，该页必须已经持久化");
+  return buffer_pool.Close().ok() && disk_manager.Close().ok() && ok;
+}
+
 bool TestHeapTableAcrossPagesDeleteAndRestart() {
   TempDb temp;
   oursql::DiskManager disk_manager;
@@ -265,6 +287,7 @@ int main() {
     else ++failures;
   };
   run("Row codec", &TestRowCodec);
+  run("Catalog head is durable immediately", &TestCatalogHeadIsDurableImmediately);
   run("Catalog persistence and chain", &TestCatalogPersistenceAndChain);
   run("HeapTable pages delete and restart", &TestHeapTableAcrossPagesDeleteAndRestart);
   run("RID ownership", &TestRidOwnership);

@@ -15,11 +15,14 @@ namespace oursql {
 // 源码位置：offset 与 token 起始偏移一致，行列从 1 开始。
 // 调用者：Lexer/Parser 与编译层诊断；作用：为 AST 节点记录出错位置。
 struct Position {
+  // offset 对应语句或 Token 的起始字节，line/column 供用户诊断和测试断言使用。
   std::size_t offset{0};
   std::size_t line{0};
   std::size_t column{0};
 };
 
+// 数据库层现有 Filter 只接受“列 = 常量”的等值谓词。Parser 在表达式恰好满足
+// 该形态时额外生成 Predicate，使原有执行路径无需理解完整 CompileExpr。
 struct Predicate {
   std::string column;
   Value value;
@@ -30,33 +33,42 @@ struct Predicate {
   Predicate(std::string column_name, Value literal) : column(std::move(column_name)), value(std::move(literal)) {}
 };
 
-// 编译层表达式：仅供解析与打印，不进入 Catalog/Executor。
+// 编译层表达式树：用于解析、语义类型推导、常量折叠和诊断打印。
+// 这些节点不会进入 Catalog、BufferPool 或 Executor；是否可执行由 Planner 决定。
 enum class CompileLiteralKind { Int, String, Bool };
 
 struct CompileExpr;
+// 表达式以只读共享指针组成树。常量折叠会创建新节点，不修改已有节点，
+// 因而 Parser 返回的 AST 可以被安全共享和重复检查。
 using CompileExprPtr = std::shared_ptr<const CompileExpr>;
 
+// 列引用只保存名称；列是否存在、属于哪种类型由 Planner 结合 Catalog 检查。
 struct CompileColumnExpr {
   std::string name;
 };
 
+// 整数值放在 integer 中；字符串和布尔值放在 text 中，kind 决定解释方式。
 struct CompileLiteralExpr {
   CompileLiteralKind kind{CompileLiteralKind::Int};
   std::int64_t integer{0};
   std::string text;
 };
 
+// op 保存解析后的运算符文本，例如 +、=、and；左右子树均可递归包含表达式。
 struct CompileBinaryExpr {
   std::string op;
   CompileExprPtr left;
   CompileExprPtr right;
 };
 
+// 当前一元运算用于负号和 NOT。
 struct CompileUnaryExpr {
   std::string op;
   CompileExprPtr operand;
 };
 
+// 使用 std::variant 表示固定表达式集合，配合 std::visit 强制所有访问点处理
+// 每种节点类型，避免继承层次中遗漏 dynamic_cast 分支。
 struct CompileExpr {
   using Data = std::variant<CompileColumnExpr, CompileLiteralExpr,
                             CompileBinaryExpr, CompileUnaryExpr>;
@@ -67,23 +79,30 @@ struct CompileExpr {
 
 enum class OrderDirection { Asc, Desc };
 
+// ORDER BY 的单个键。列名同样已在 Lexer 阶段规范化为小写。
 struct OrderKey {
   std::string column;
   OrderDirection direction{OrderDirection::Asc};
 };
 
+// CREATE TABLE 只保存结构化 Schema，不在 Parser 中访问或修改 Catalog。
 struct CreateTableStatement {
   std::string table_name;
   Schema schema;
   Position location;
 };
 
+// INSERT 只接受字面量，不支持 SELECT 子查询或表达式。
 struct InsertStatement {
   std::string table_name;
   std::vector<Value> values;
   Position location;
 };
 
+// SELECT 的 where 与 compile_where 分别服务于简单执行路径和完整语义检查：
+// - where：表达式可降级为“列 = 常量”时存在；
+// - compile_where：所有 WHERE 都保留完整表达式，供类型推导和诊断使用。
+// select_all 为 true 时 projection 应为空；二者由 Parser/Planner 保持一致。
 struct SelectStatement {
   std::string table_name;
   std::vector<std::string> projection;
@@ -95,6 +114,7 @@ struct SelectStatement {
   Position location;
 };
 
+// DELETE 当前只支持可选等值 WHERE；复杂表达式会保留在 compile_where 中。
 struct DeleteStatement {
   std::string table_name;
   std::optional<Predicate> where;
@@ -102,12 +122,15 @@ struct DeleteStatement {
   Position location;
 };
 
+// UPDATE 右值同时保留 CompileExpr 和可选的简单 Value：
+// 复杂表达式用于语义分析，字面量形式可用于未来执行器直接消费。
 struct UpdateAssignment {
   std::string column;
   CompileExprPtr expression;
   std::optional<Value> value;
 };
 
+// UPDATE 语句的完整编译层表示；执行器尚未实现 UpdatePlan。
 struct UpdateStatement {
   std::string table_name;
   std::vector<UpdateAssignment> assignments;
@@ -116,6 +139,8 @@ struct UpdateStatement {
   Position location;
 };
 
+// 一条完整 SQL 语句的封闭集合。新增语句类型时，所有 std::visit 调用点都会
+// 在编译期暴露出来，促使 Parser、Planner 和打印逻辑同步扩展。
 using Statement = std::variant<CreateTableStatement, InsertStatement,
                                 SelectStatement, DeleteStatement,
                                 UpdateStatement>;

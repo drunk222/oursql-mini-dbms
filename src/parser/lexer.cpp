@@ -6,10 +6,14 @@ namespace oursql {
 
 namespace {
 
+// SQL 关键字和当前项目的标识符都按 ASCII 大小写不敏感处理；字符串字面量不会
+// 走这个函数，因此其中内容仍保持原始大小写。
 char LowerAscii(char character) {
   return static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
 }
 
+// 将已经转成小写的标识符映射为关键字 Token。未命中的词保留为 Identifier，
+// 因此表名、列名不需要维护单独的保留字列表。
 TokenType KeywordType(std::string_view word) {
   if (word.compare("create") == 0) return TokenType::Create;
   if (word.compare("table") == 0) return TokenType::Table;
@@ -92,6 +96,8 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
   std::size_t line = 1;
   std::size_t column = 1;
 
+  // 更新逻辑行列。换行后列回到 1；原始字节偏移另由 offset 单独维护，
+  // 因而 Token 可以同时支持定点诊断和按字节切片。
   const auto advance = [&](char character, std::size_t *current_line,
                            std::size_t *current_column) {
     if (character == '\n') {
@@ -101,6 +107,9 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
       ++*current_column;
     }
   };
+
+  // 所有 Token 都通过该函数生成，保证起止偏移和行列字段的填充方式一致。
+  // end_offset 指向 Token 消耗完成后的位置，即采用左闭右开区间。
   const auto make_token = [&](TokenType type, std::size_t start, std::size_t start_line,
                               std::size_t start_column, std::size_t end, std::size_t end_line,
                               std::size_t end_column, std::string lexeme) {
@@ -108,6 +117,8 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
                            end_line, end_column});
   };
 
+  // 主循环只消费 offset 指向的字符。每个分支必须保证 offset 前进，避免非法
+  // 输入导致 Lexer 死循环。
   while (offset < sql.size()) {
     const char character = sql[offset];
     if (std::isspace(static_cast<unsigned char>(character))) {
@@ -160,6 +171,8 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
 
     if (std::isalpha(static_cast<unsigned char>(character)) || character == '_') {
       std::string word;
+      // 标识符首字符为 ASCII 字母或下划线，后续允许数字。写入 word 时统一
+      // 转小写，从而让 SQL 名称解析与关键字解析保持同一套大小写规则。
       while (offset < sql.size() &&
              (std::isalnum(static_cast<unsigned char>(sql[offset])) || sql[offset] == '_')) {
         word.push_back(LowerAscii(sql[offset]));
@@ -174,6 +187,8 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
     if (std::isdigit(static_cast<unsigned char>(character)) ||
         (character == '-' && offset + 1 < sql.size() &&
          std::isdigit(static_cast<unsigned char>(sql[offset + 1])))) {
+      // 负数与数字合并成一个 Integer Token；例如 -12 的 lexeme 为 "-12"。
+      // 当前数据类型只有 INT，不把小数点视为合法数字组成部分。
       std::string number;
       if (character == '-') {
         number.push_back(character);
@@ -204,6 +219,8 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
     }
 
     if (character == '\'') {
+      // 字符串内容不写入 Token.lexeme 的引号本身；连续两个单引号表示一个
+      // 转义单引号，例如 'It''s' 的 lexeme 是 It's。
       advance(character, &line, &column);
       ++offset;
       std::string value;
@@ -237,6 +254,7 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
       continue;
     }
 
+    // 先匹配双字符运算符，避免把 >=、<=、!=、==、<> 拆成两个 Token。
     if ((character == '>' || character == '<' || character == '!' ||
          character == '=') &&
         offset + 1 < sql.size() && sql[offset + 1] == '=') {
@@ -265,6 +283,7 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
       continue;
     }
 
+    // 剩余合法符号均为单字符标点或运算符。
     TokenType punctuation = TokenType::EndOfFile;
     switch (character) {
       case ',': punctuation = TokenType::Comma; break;
@@ -290,6 +309,7 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
                std::string(1, character));
   }
 
+  // EOF 不占用源码字符，start/end 均指向输入末尾；Parser 依赖该哨兵安全结束。
   tokens.push_back(Token{TokenType::EndOfFile, "", offset, offset, line, column, line, column});
   return Result<std::vector<Token>>(std::move(tokens));
 }

@@ -7,6 +7,11 @@ namespace oursql {
 
 namespace {
 
+// 阅读入口：一次 SQL 的固定主路径是
+// ExecuteSqlBatch -> Parser::Parse -> Planner::Build -> ExecutionEngine::Execute。
+// 调试 CRUD 时先在 ExecuteSqlBatch、再在对应 Executor::Execute 设断点；
+// 这里仅负责“编排”，不直接读写表数据。
+
 Status Contextualize(const char *layer, const Status &status) {
   const auto message = std::string(layer) + ": " + status.message();
   switch (status.code()) {
@@ -92,6 +97,7 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
     return Result<std::vector<ExecutionResult>>(Status::InvalidArgument("DatabaseEngine 已关闭"));
   }
 
+  // 1. 文本 SQL 变成 AST（Statement）。语法不合法会在此返回。
   auto statements = parser_.Parse(sql);
   if (!statements.ok()) {
     return Result<std::vector<ExecutionResult>>(Contextualize("Parser/Lexer", statements.status()));
@@ -99,8 +105,10 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
   std::vector<ExecutionResult> results;
   results.reserve(statements.value().size());
   for (const auto &statement : statements.value()) {
+    // 2. AST 做表/列/类型等语义检查，并变成可执行的 Plan。
     auto plan = planner_.Build(statement, catalog_);
     if (!plan.ok()) return Result<std::vector<ExecutionResult>>(Contextualize("Planner", plan.status()));
+    // 3. Plan 由执行器落实为 Catalog/HeapTable 操作或查询结果。
     auto result = execution_engine_.Execute(plan.value());
     if (!result.ok()) return Result<std::vector<ExecutionResult>>(Contextualize("Execution", result.status()));
     results.push_back(std::move(result.value()));

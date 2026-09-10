@@ -19,9 +19,21 @@ TokenType KeywordType(std::string_view word) {
   if (word.compare("select") == 0) return TokenType::Select;
   if (word.compare("from") == 0) return TokenType::From;
   if (word.compare("where") == 0) return TokenType::Where;
+  if (word.compare("group") == 0) return TokenType::Group;
+  if (word.compare("order") == 0) return TokenType::Order;
+  if (word.compare("by") == 0) return TokenType::By;
+  if (word.compare("asc") == 0) return TokenType::Asc;
+  if (word.compare("desc") == 0) return TokenType::Desc;
   if (word.compare("delete") == 0) return TokenType::Delete;
+  if (word.compare("update") == 0) return TokenType::Update;
+  if (word.compare("set") == 0) return TokenType::Set;
   if (word.compare("int") == 0) return TokenType::Int;
   if (word.compare("varchar") == 0) return TokenType::Varchar;
+  if (word.compare("and") == 0) return TokenType::And;
+  if (word.compare("or") == 0) return TokenType::Or;
+  if (word.compare("not") == 0) return TokenType::Not;
+  if (word.compare("true") == 0) return TokenType::True;
+  if (word.compare("false") == 0) return TokenType::False;
   return TokenType::Identifier;
 }
 
@@ -32,11 +44,24 @@ const char *TokenTypeName(TokenType type) noexcept {
     case TokenType::Identifier: return "identifier";
     case TokenType::Integer: return "integer";
     case TokenType::String: return "string";
+    case TokenType::True: return "TRUE";
+    case TokenType::False: return "FALSE";
     case TokenType::Comma: return "','";
     case TokenType::LeftParen: return "'('";
     case TokenType::RightParen: return "')'";
     case TokenType::Star: return "'*'";
     case TokenType::Equal: return "'='";
+    case TokenType::NotEqual: return "'!='";
+    case TokenType::Greater: return "'>'";
+    case TokenType::GreaterEqual: return "'>='";
+    case TokenType::Less: return "'<'";
+    case TokenType::LessEqual: return "'<='";
+    case TokenType::Plus: return "'+'";
+    case TokenType::Minus: return "'-'";
+    case TokenType::Slash: return "'/'";
+    case TokenType::And: return "AND";
+    case TokenType::Or: return "OR";
+    case TokenType::Not: return "NOT";
     case TokenType::Semicolon: return "';'";
     case TokenType::Create: return "CREATE";
     case TokenType::Table: return "TABLE";
@@ -46,7 +71,14 @@ const char *TokenTypeName(TokenType type) noexcept {
     case TokenType::Select: return "SELECT";
     case TokenType::From: return "FROM";
     case TokenType::Where: return "WHERE";
+    case TokenType::Group: return "GROUP";
+    case TokenType::Order: return "ORDER";
+    case TokenType::By: return "BY";
+    case TokenType::Asc: return "ASC";
+    case TokenType::Desc: return "DESC";
     case TokenType::Delete: return "DELETE";
+    case TokenType::Update: return "UPDATE";
+    case TokenType::Set: return "SET";
     case TokenType::Int: return "INT";
     case TokenType::Varchar: return "VARCHAR";
     case TokenType::EndOfFile: return "EOF";
@@ -87,6 +119,45 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
     const auto start = offset;
     const auto start_line = line;
     const auto start_column = column;
+
+    // 行注释：-- 到行尾，负数仍以 -digit 形式保留。
+    if (character == '-' && offset + 1 < sql.size() && sql[offset + 1] == '-') {
+      while (offset < sql.size() && sql[offset] != '\n' && sql[offset] != '\r') {
+        advance(sql[offset], &line, &column);
+        ++offset;
+      }
+      continue;
+    }
+    // 块注释：/* ... */，允许跨行。
+    if (character == '/' && offset + 1 < sql.size() && sql[offset + 1] == '*') {
+      const auto comment_line = start_line;
+      const auto comment_column = start_column;
+      advance(sql[offset], &line, &column);
+      ++offset;
+      advance(sql[offset], &line, &column);
+      ++offset;
+      bool closed = false;
+      while (offset < sql.size()) {
+        if (sql[offset] == '*' && offset + 1 < sql.size() &&
+            sql[offset + 1] == '/') {
+          advance(sql[offset], &line, &column);
+          ++offset;
+          advance(sql[offset], &line, &column);
+          ++offset;
+          closed = true;
+          break;
+        }
+        advance(sql[offset], &line, &column);
+        ++offset;
+      }
+      if (!closed) {
+        return Result<std::vector<Token>>(Status::InvalidArgument(
+            "未闭合块注释，位置 " + std::to_string(comment_line) + ":" +
+            std::to_string(comment_column)));
+      }
+      continue;
+    }
+
     if (std::isalpha(static_cast<unsigned char>(character)) || character == '_') {
       std::string word;
       while (offset < sql.size() &&
@@ -113,6 +184,19 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
         number.push_back(sql[offset]);
         advance(sql[offset], &line, &column);
         ++offset;
+      }
+      if (offset + 1 < sql.size() && sql[offset] == '.' &&
+          std::isdigit(static_cast<unsigned char>(sql[offset + 1]))) {
+        while (offset < sql.size() &&
+               (std::isdigit(static_cast<unsigned char>(sql[offset])) ||
+                sql[offset] == '.')) {
+          number.push_back(sql[offset]);
+          advance(sql[offset], &line, &column);
+          ++offset;
+        }
+        return Result<std::vector<Token>>(Status::InvalidArgument(
+            "非法数字格式 '" + number + "'，位置 " +
+            std::to_string(start_line) + ":" + std::to_string(start_column)));
       }
       make_token(TokenType::Integer, start, start_line, start_column, offset, line, column,
                  std::move(number));
@@ -153,6 +237,34 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
       continue;
     }
 
+    if ((character == '>' || character == '<' || character == '!' ||
+         character == '=') &&
+        offset + 1 < sql.size() && sql[offset + 1] == '=') {
+      TokenType pair_type = TokenType::EndOfFile;
+      if (character == '>' && sql[offset + 1] == '=') pair_type = TokenType::GreaterEqual;
+      if (character == '<' && sql[offset + 1] == '=') pair_type = TokenType::LessEqual;
+      if (character == '!' && sql[offset + 1] == '=') pair_type = TokenType::NotEqual;
+      if (character == '=' && sql[offset + 1] == '=') pair_type = TokenType::Equal;
+      std::string pair;
+      pair.push_back(character);
+      pair.push_back(sql[offset + 1]);
+      advance(sql[offset], &line, &column);
+      advance(sql[offset + 1], &line, &column);
+      offset += 2;
+      make_token(pair_type, start, start_line, start_column, offset, line,
+                 column, std::move(pair));
+      continue;
+    }
+    if (character == '<' && offset + 1 < sql.size() &&
+        sql[offset + 1] == '>') {
+      advance(sql[offset], &line, &column);
+      advance(sql[offset + 1], &line, &column);
+      offset += 2;
+      make_token(TokenType::NotEqual, start, start_line, start_column, offset,
+                 line, column, "<>");
+      continue;
+    }
+
     TokenType punctuation = TokenType::EndOfFile;
     switch (character) {
       case ',': punctuation = TokenType::Comma; break;
@@ -160,6 +272,12 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
       case ')': punctuation = TokenType::RightParen; break;
       case '*': punctuation = TokenType::Star; break;
       case '=': punctuation = TokenType::Equal; break;
+      case '>': punctuation = TokenType::Greater; break;
+      case '<': punctuation = TokenType::Less; break;
+      case '!': punctuation = TokenType::NotEqual; break;
+      case '+': punctuation = TokenType::Plus; break;
+      case '-': punctuation = TokenType::Minus; break;
+      case '/': punctuation = TokenType::Slash; break;
       case ';': punctuation = TokenType::Semicolon; break;
       default:
         return Result<std::vector<Token>>(Status::InvalidArgument(

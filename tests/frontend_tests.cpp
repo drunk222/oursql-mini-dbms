@@ -44,11 +44,38 @@ bool TestLexer() {
                "标识符应规范化并记录起始位置");
 }
 
+bool TestLexerCommentsAndNumberErrors() {
+  oursql::Lexer lexer;
+  auto result = lexer.Tokenize(
+      "SELECT id /* column comment */ FROM users -- line comment\n"
+      "WHERE id = 1;");
+  if (!Check(result.ok(), "注释不应阻止 Lexer 成功")) return false;
+  bool has_select = false;
+  bool has_where = false;
+  for (const auto &token : result.value()) {
+    if (token.type == oursql::TokenType::Select) has_select = true;
+    if (token.type == oursql::TokenType::Where) has_where = true;
+  }
+  if (!Check(has_select && has_where, "注释内容不应生成 Token")) return false;
+
+  auto bad_number = lexer.Tokenize("SELECT 1.2;");
+  if (!Check(!bad_number.ok() &&
+                 bad_number.status().message().find("非法数字") != std::string::npos,
+             "非法数字应返回专门错误")) {
+    return false;
+  }
+  auto unclosed = lexer.Tokenize("SELECT 1; /* no close");
+  return Check(!unclosed.ok() &&
+                   unclosed.status().message().find("未闭合块注释") != std::string::npos,
+               "未闭合块注释应报错");
+}
+
 bool TestParserAndCaseInsensitiveMultiStatement() {
   oursql::Parser parser;
   auto result = parser.Parse(
       "CrEaTe TaBlE Users(ID INT, Name VARCHAR); INSERT INTO USERS VALUES(1, 'Alice'); "
-      "SELECT ID, Name FROM users WHERE ID = 1; DELETE FROM users WHERE id = 1;");
+      "SELECT ID, Name FROM users WHERE ID = 1 GROUP BY ID, Name ORDER BY ID DESC; "
+      "DELETE FROM users WHERE id = 1;");
   if (!Check(result.ok() && result.value().size() == 4, "大小写不敏感多语句应解析成功")) return false;
 
   const auto &create = std::get<oursql::CreateTableStatement>(result.value()[0]);
@@ -66,11 +93,20 @@ bool TestParserAndCaseInsensitiveMultiStatement() {
                                 select.projection == std::vector<std::string>{"id", "name"} &&
                                 select.where.has_value() && select.where->value.AsInt() == 1,
                             "SELECT AST 核心字段应正确") &&
+                      Check(select.group_by == std::vector<std::string>{"id", "name"} &&
+                                select.order_by.size() == 1 &&
+                                select.order_by[0].column == "id" &&
+                                select.order_by[0].direction ==
+                                    oursql::OrderDirection::Desc,
+                            "GROUP BY/ORDER BY AST 字段应正确") &&
+                      Check(select.location.line > 0 && select.location.column > 0,
+                            "SELECT AST 应记录起始位置") &&
                       Check(delete_statement.table_name == "users" && delete_statement.where.has_value(),
                             "DELETE AST 核心字段应正确");
   if (!fields) return false;
   return Check(oursql::ToString(result.value()[2]) ==
-                   "SelectStatement(table=users,projection=[id,name],where=id=1)",
+                   "SelectStatement(table=users,projection=[id,name],where=id=1,"
+                   "group_by=[id,name],order_by=[id DESC])",
                "AST 文本格式应稳定");
 }
 
@@ -115,6 +151,8 @@ bool TestPlannerSemanticChecks() {
   const std::vector<std::pair<std::string, oursql::ErrorCode>> invalid{
       {"INSERT INTO missing VALUES(1, 'a');", oursql::ErrorCode::NotFound},
       {"SELECT unknown FROM users;", oursql::ErrorCode::NotFound},
+      {"SELECT id FROM users ORDER BY missing;", oursql::ErrorCode::NotFound},
+      {"SELECT id FROM users GROUP BY missing;", oursql::ErrorCode::NotFound},
       {"SELECT id, id FROM users;", oursql::ErrorCode::AlreadyExists},
       {"CREATE TABLE duplicate(id INT, id VARCHAR);", oursql::ErrorCode::AlreadyExists},
       {"INSERT INTO users VALUES(1);", oursql::ErrorCode::InvalidArgument},
@@ -177,6 +215,130 @@ bool TestPlanTreeAndPrinting() {
   return Check(project_all.select_all && project_all.columns.empty(), "SELECT * 的 ProjectPlan 应保留全列标记");
 }
 
+bool TestUpdateCompileOnly() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+  auto parsed = parser.Parse(
+      "UPDATE users SET name = 'Bob', id = 2 WHERE id = 1;");
+  if (!Check(parsed.ok(), "UPDATE 应可解析")) return false;
+  const auto &update =
+      std::get<oursql::UpdateStatement>(parsed.value()[0]);
+  if (!Check(update.table_name == "users" &&
+                 update.assignments.size() == 2 &&
+                 update.assignments[0].column == "name" &&
+                 update.assignments[1].value.has_value() &&
+                 update.assignments[1].value->AsInt() == 2 &&
+                 update.where.has_value(),
+             "UPDATE AST 核心字段应正确")) {
+    return false;
+  }
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(!plan.ok() && plan.status().code() == oursql::ErrorCode::NotImplemented &&
+                 plan.status().message().find("仅编译层支持") != std::string::npos,
+             "UPDATE 应在 Planner 被明确拒绝为未实现")) {
+    return false;
+  }
+
+  auto missing_table = parser.Parse("UPDATE ghost SET id = 1;");
+  auto bad_table = planner.Build(missing_table.value()[0], catalog);
+  auto missing_column =
+      parser.Parse("UPDATE users SET missing = 1;");
+  auto bad_column = planner.Build(missing_column.value()[0], catalog);
+  auto wrong_type =
+      parser.Parse("UPDATE users SET id = 'text';");
+  auto type_status = planner.Build(wrong_type.value()[0], catalog);
+  auto expression_update =
+      parser.Parse("UPDATE users SET id = id + 1;");
+  if (!Check(expression_update.ok(), "UPDATE SET 表达式应可解析")) {
+    return false;
+  }
+  const auto &expression_assignment =
+      std::get<oursql::UpdateStatement>(expression_update.value()[0])
+          .assignments[0];
+  if (!Check(expression_assignment.expression != nullptr &&
+                 !expression_assignment.value.has_value(),
+             "UPDATE SET 表达式 AST 应保留 CompileExpr")) {
+    return false;
+  }
+  auto expression_status =
+      planner.Build(expression_update.value()[0], catalog);
+  return Check(!bad_table.ok() &&
+                   bad_table.status().code() == oursql::ErrorCode::NotFound &&
+                   !bad_column.ok() &&
+                   bad_column.status().code() == oursql::ErrorCode::NotFound &&
+                   !type_status.ok() &&
+                   type_status.status().code() == oursql::ErrorCode::TypeMismatch &&
+                   !expression_status.ok() &&
+                   expression_status.status().code() ==
+                       oursql::ErrorCode::NotImplemented,
+               "UPDATE 语义错误应被 Planner 拒绝");
+}
+
+bool TestOrderGroupCompileOnly() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+  const std::vector<std::string> rejected{
+      "SELECT id FROM users ORDER BY id DESC;",
+      "SELECT id FROM users GROUP BY id;",
+      "SELECT id FROM users GROUP BY id ORDER BY id;",
+  };
+  for (const auto &sql : rejected) {
+    auto parsed = parser.Parse(sql);
+    if (!Check(parsed.ok(), "GROUP BY/ORDER BY 应可解析: " + sql)) return false;
+    auto plan = planner.Build(parsed.value()[0], catalog);
+    if (!Check(!plan.ok() &&
+                   plan.status().code() == oursql::ErrorCode::NotImplemented &&
+                   plan.status().message().find("仅编译层支持") !=
+                       std::string::npos,
+               "GROUP BY/ORDER BY 应返回 NotImplemented: " + sql)) {
+      return false;
+    }
+  }
+  // 列存在性仍然先于"未实现"被检查，保证诊断精确。
+  auto missing = parser.Parse("SELECT id FROM users ORDER BY missing;");
+  auto missing_plan = planner.Build(missing.value()[0], catalog);
+  return Check(!missing_plan.ok() &&
+                   missing_plan.status().code() == oursql::ErrorCode::NotFound,
+               "ORDER BY 列不存在时应先报 NotFound");
+}
+
+bool TestCompileExpressionParsing() {
+  oursql::Parser parser;
+  auto parsed = parser.Parse(
+      "SELECT * FROM users WHERE age > 1 AND (name = 'Alice' OR id >= 2);");
+  if (!Check(parsed.ok(), "复杂 WHERE 表达式应可解析")) return false;
+  const auto &select = std::get<oursql::SelectStatement>(parsed.value()[0]);
+  if (!Check(select.compile_where != nullptr && !select.where.has_value(),
+             "复杂表达式不应伪装成数据库等值谓词")) {
+    return false;
+  }
+  const std::string text = oursql::ToString(parsed.value()[0]);
+  if (!Check(text.find("where_expr=") != std::string::npos &&
+                 text.find(">") != std::string::npos &&
+                 text.find("and") != std::string::npos,
+             "复杂表达式应进入 AST 文本")) {
+    return false;
+  }
+
+  auto catalog = MakeCatalog();
+  oursql::Planner planner;
+  auto missing = parser.Parse(
+      "SELECT * FROM users WHERE missing > 1;");
+  auto missing_status = planner.Build(missing.value()[0], catalog);
+  auto wrong_type = parser.Parse(
+      "SELECT * FROM users WHERE id + 'text' > 1;");
+  auto type_status = planner.Build(wrong_type.value()[0], catalog);
+  return Check(!missing_status.ok() &&
+                   missing_status.status().code() ==
+                       oursql::ErrorCode::NotFound &&
+                   !type_status.ok() &&
+                   type_status.status().code() ==
+                       oursql::ErrorCode::TypeMismatch,
+               "复杂表达式也应执行列和类型语义检查");
+}
+
 }  // namespace
 
 int main() {
@@ -186,10 +348,14 @@ int main() {
     else ++failures;
   };
   run("Lexer tokens", &TestLexer);
+  run("Lexer comments and number errors", &TestLexerCommentsAndNumberErrors);
   run("Parser AST and multi-statement", &TestParserAndCaseInsensitiveMultiStatement);
   run("Parser errors and positions", &TestParserErrorsHavePositions);
   run("Planner semantic checks", &TestPlannerSemanticChecks);
   run("Plan tree and printing", &TestPlanTreeAndPrinting);
+  run("UPDATE compile-only", &TestUpdateCompileOnly);
+  run("ORDER BY/GROUP BY compile-only", &TestOrderGroupCompileOnly);
+  run("Compile expression parsing", &TestCompileExpressionParsing);
   if (failures == 0) {
     std::cout << "All frontend tests passed\n";
     return 0;

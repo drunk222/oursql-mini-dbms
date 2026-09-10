@@ -136,7 +136,3 @@ SELECT * FROM student GROUP BY name;      -- NotImplemented: Planner: GROUP BY �
 UPDATE student SET name = 'Zoe' WHERE id = 1;  -- NotImplemented: Planner: UPDATE 仅编译层支持，未接入数据库执行，位置 1:1
 SELECT * FROM student WHERE id > 1;       -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
 ```
-
-### 本地修改的范围是什么？
-
-本仓库的本地修改**只涉及编译层**：`src/parser`、`src/planner`、`src/optimizer` 与 `include/oursql/{parser,ast,plan,optimizer}`，外加 `tests/`、`CMakeLists.txt` 与本文档。数据库层 `src/storage`、`src/catalog`、`src/execution`（含 `DatabaseEngine`、Executor）以及 `include/oursql/{storage,catalog,execution,common}` **没有任何改动**，因此 4096 字节页、Page 0 Superblock、空闲页链表、Catalog Page、Slotted Page、BufferPool/PageGuard 与 Executor 的行为都保持原样。编译层新增能力只能通过「Planner 语义检查 + 明确报错」的方式暴露，不能靠修改数据库层来实现。

@@ -263,6 +263,12 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
             if (!source.ok()) return Result<SourcePlan>(source.status());
             return Result<SourcePlan>(SourcePlan{std::move(source.value()),
                                                  std::move(child.value().column_names)});
+          } else if constexpr (std::is_same_v<Type, GroupByPlan>) {
+            return Result<SourcePlan>(Status::NotImplemented(
+                "GROUP BY 仅编译层支持，未接入数据库执行"));
+          } else if constexpr (std::is_same_v<Type, OrderByPlan>) {
+            return Result<SourcePlan>(Status::NotImplemented(
+                "ORDER BY 仅编译层支持，未接入数据库执行"));
           } else {
             auto child = build_node(operation.child);
             if (!child.ok()) return Result<SourcePlan>(child.status());
@@ -310,6 +316,9 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
             result.rows.push_back(std::move(row_entry.second));
           }
           return Result<ExecutionResult>(std::move(result));
+        } else if constexpr (std::is_same_v<Type, UpdatePlan>) {
+          return Result<ExecutionResult>(Status::NotImplemented(
+              "UPDATE 仅编译层支持，未接入数据库执行"));
         } else {
           return DeleteExecutor(catalog_, buffer_pool_).Execute(operation);
         }

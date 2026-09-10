@@ -1,4 +1,5 @@
 #include "oursql/parser/parser.h"
+#include "oursql/optimizer/expression_optimizer.h"
 
 #include <charconv>
 #include <functional>
@@ -295,52 +296,11 @@ class ParserImpl {
   }
 
   std::optional<Predicate> ExtractPredicate(const CompileExprPtr &expr) {
-    if (expr == nullptr) return std::nullopt;
-    const auto *binary =
-        std::get_if<CompileBinaryExpr>(&expr->data);
-    if (binary == nullptr || binary->op != "=") return std::nullopt;
-    const auto *left_column =
-        binary->left ? std::get_if<CompileColumnExpr>(&binary->left->data)
-                     : nullptr;
-    const auto *right_column =
-        binary->right ? std::get_if<CompileColumnExpr>(&binary->right->data)
-                      : nullptr;
-    const auto *left_literal =
-        binary->left ? std::get_if<CompileLiteralExpr>(&binary->left->data)
-                     : nullptr;
-    const auto *right_literal =
-        binary->right ? std::get_if<CompileLiteralExpr>(&binary->right->data)
-                      : nullptr;
-    if (left_column != nullptr && right_literal != nullptr) {
-      if (right_literal->kind == CompileLiteralKind::Int) {
-        return Predicate(left_column->name, Value(right_literal->integer));
-      }
-      if (right_literal->kind == CompileLiteralKind::String) {
-        return Predicate(left_column->name, Value(right_literal->text));
-      }
-    }
-    if (right_column != nullptr && left_literal != nullptr) {
-      if (left_literal->kind == CompileLiteralKind::Int) {
-        return Predicate(right_column->name, Value(left_literal->integer));
-      }
-      if (left_literal->kind == CompileLiteralKind::String) {
-        return Predicate(right_column->name, Value(left_literal->text));
-      }
-    }
-    return std::nullopt;
+    return ExtractPredicateFromCompileExpr(expr);
   }
 
   std::optional<Value> ExtractLiteral(const CompileExprPtr &expr) {
-    if (expr == nullptr) return std::nullopt;
-    const auto *literal = std::get_if<CompileLiteralExpr>(&expr->data);
-    if (literal == nullptr) return std::nullopt;
-    if (literal->kind == CompileLiteralKind::Int) {
-      return Value(literal->integer);
-    }
-    if (literal->kind == CompileLiteralKind::String) {
-      return Value(literal->text);
-    }
-    return std::nullopt;
+    return ExtractLiteralValue(expr);
   }
 
   struct ParsedWhere {
@@ -351,8 +311,9 @@ class ParserImpl {
   Result<ParsedWhere> ParseWhere() {
     auto expression = ParseCompileExpr();
     if (!expression.ok()) return Result<ParsedWhere>(expression.status());
+    auto folded = FoldCompileExpr(expression.value());
     return Result<ParsedWhere>(
-        ParsedWhere{expression.value(), ExtractPredicate(expression.value())});
+        ParsedWhere{folded, ExtractPredicate(folded)});
   }
 
   Result<Statement> ParseCreateTable() {
@@ -536,10 +497,11 @@ class ParserImpl {
       if (!equal.ok()) return Result<Statement>(equal.status());
       auto expression = ParseCompileExpr();
       if (!expression.ok()) return Result<Statement>(expression.status());
+      auto folded = FoldCompileExpr(expression.value());
       statement.assignments.push_back(
           UpdateAssignment{std::move(column.value()),
-                           expression.value(),
-                           ExtractLiteral(expression.value())});
+                           folded,
+                           ExtractLiteral(folded)});
       if (!Match(TokenType::Comma)) break;
     } while (true);
 

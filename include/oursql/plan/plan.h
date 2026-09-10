@@ -38,8 +38,20 @@ struct ProjectPlan {
   bool select_all{false};
 };
 
+struct GroupByPlan {
+  std::shared_ptr<const PlanNode> child;
+  std::vector<std::string> columns;
+};
+
+struct OrderByPlan {
+  std::shared_ptr<const PlanNode> child;
+  std::vector<OrderKey> keys;
+};
+
 struct PlanNode {
-  using Operation = std::variant<SeqScanPlan, FilterPlan, ProjectPlan>;
+  using Operation =
+      std::variant<SeqScanPlan, FilterPlan, GroupByPlan, OrderByPlan,
+                   ProjectPlan>;
 
   explicit PlanNode(Operation operation_value) : operation(std::move(operation_value)) {}
   Operation operation;
@@ -55,7 +67,14 @@ struct DeletePlan {
   std::optional<Predicate> where;
 };
 
-using Plan = std::variant<CreateTablePlan, InsertPlan, SelectPlan, DeletePlan>;
+struct UpdatePlan {
+  std::string table_name;
+  std::vector<UpdateAssignment> assignments;
+  std::optional<Predicate> where;
+};
+
+using Plan = std::variant<CreateTablePlan, InsertPlan, SelectPlan, DeletePlan,
+                          UpdatePlan>;
 
 // 调用者：调试器或测试；作用：以稳定格式打印逻辑计划；返回：计划文本，不参与执行。
 [[nodiscard]] std::string ToString(const Plan &plan);

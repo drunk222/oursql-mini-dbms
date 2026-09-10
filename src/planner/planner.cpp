@@ -95,6 +95,31 @@ std::string PredicateText(const Predicate &predicate) {
          (predicate.value.IsInt() ? predicate.value.ToString() : "'" + predicate.value.AsVarchar() + "'");
 }
 
+std::string CompileExprText(const CompileExprPtr &expr) {
+  if (expr == nullptr) return "<null>";
+  return std::visit(
+      [&](const auto &value) -> std::string {
+        using Type = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Type, CompileColumnExpr>) {
+          return value.name;
+        } else if constexpr (std::is_same_v<Type, CompileLiteralExpr>) {
+          if (value.kind == CompileLiteralKind::Int) {
+            return std::to_string(value.integer);
+          }
+          if (value.kind == CompileLiteralKind::String) {
+            return "'" + value.text + "'";
+          }
+          return value.text;
+        } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
+          return "(" + CompileExprText(value.left) + " " + value.op + " " +
+                 CompileExprText(value.right) + ")";
+        } else {
+          return "(" + value.op + " " + CompileExprText(value.operand) + ")";
+        }
+      },
+      expr->data);
+}
+
 std::string NodeText(const std::shared_ptr<const PlanNode> &node) {
   if (node == nullptr) return "<null>";
   return std::visit(
@@ -104,6 +129,27 @@ std::string NodeText(const std::shared_ptr<const PlanNode> &node) {
           return "SeqScanPlan(table=" + operation.table_name + ")";
         } else if constexpr (std::is_same_v<Type, FilterPlan>) {
           return "FilterPlan(predicate=" + PredicateText(operation.predicate) +
+                 ",child=" + NodeText(operation.child) + ")";
+        } else if constexpr (std::is_same_v<Type, GroupByPlan>) {
+          std::string columns = "[";
+          for (std::size_t i = 0; i < operation.columns.size(); ++i) {
+            if (i != 0) columns += ",";
+            columns += operation.columns[i];
+          }
+          columns += "]";
+          return "GroupByPlan(columns=" + columns +
+                 ",child=" + NodeText(operation.child) + ")";
+        } else if constexpr (std::is_same_v<Type, OrderByPlan>) {
+          std::string keys = "[";
+          for (std::size_t i = 0; i < operation.keys.size(); ++i) {
+            if (i != 0) keys += ",";
+            keys += operation.keys[i].column;
+            keys += operation.keys[i].direction == OrderDirection::Desc
+                        ? " DESC"
+                        : " ASC";
+          }
+          keys += "]";
+          return "OrderByPlan(keys=" + keys +
                  ",child=" + NodeText(operation.child) + ")";
         } else {
           std::string columns = operation.select_all ? "*" : "[";
@@ -284,22 +330,20 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
               return fail_at(Status::NotFound("ORDER BY 列不存在: " + key.column));
             }
           }
-          // 执行层（Executor）没有排序/分组算子，且本项目约定本地修改只涉及
-          // 编译层。这里显式拒绝，避免生成一个执行器会静默忽略的 ProjectPlan。
-          if (!value.group_by.empty() || !value.order_by.empty()) {
-            const std::string clause =
-                !value.group_by.empty() && !value.order_by.empty()
-                    ? "GROUP BY/ORDER BY"
-                    : (!value.group_by.empty() ? "GROUP BY" : "ORDER BY");
-            return fail_at(Status::NotImplemented(
-                clause + " 仅编译层支持，未接入数据库执行"));
-          }
           if (value.where.has_value()) {
             auto predicate_status = CheckPredicate(*value.where, table.value()->schema);
             if (!predicate_status.ok()) return fail_at(predicate_status);
           }
           std::shared_ptr<const PlanNode> root = std::make_shared<PlanNode>(SeqScanPlan{value.table_name});
           if (value.where.has_value()) root = std::make_shared<PlanNode>(FilterPlan{root, *value.where});
+          if (!value.group_by.empty()) {
+            root = std::make_shared<PlanNode>(
+                GroupByPlan{root, value.group_by});
+          }
+          if (!value.order_by.empty()) {
+            root = std::make_shared<PlanNode>(
+                OrderByPlan{root, value.order_by});
+          }
           // 冻结计划形态：SELECT 的根算子固定为 Project，无 WHERE 时省略 Filter。
           root = std::make_shared<PlanNode>(
               ProjectPlan{root, value.projection, value.select_all});
@@ -385,10 +429,10 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                 CheckPredicate(*value.where, table.value()->schema);
             if (!predicate_status.ok()) return fail_at(predicate_status);
           }
-          // 执行层没有 UPDATE 算子，且本项目约定本地修改只涉及编译层，因此这里
-          // 在完成全部语义检查后明确拒绝，不生成执行器无法处理的计划。
-          return fail_at(Status::NotImplemented(
-              "UPDATE 仅编译层支持，未接入数据库执行"));
+          // 生成结构化 UpdatePlan；执行层会明确返回 NotImplemented，
+          // 因此计划本身只承担编译层表达与诊断职责。
+          return Result<Plan>(
+              UpdatePlan{value.table_name, value.assignments, value.where});
         }
       },
       statement);
@@ -420,9 +464,22 @@ std::string ToString(const Plan &plan) {
           return result + "])";
         } else if constexpr (std::is_same_v<Type, SelectPlan>) {
           return "SelectPlan(table=" + value.table_name + ",root=" + NodeText(value.root) + ")";
-        } else {
+        } else if constexpr (std::is_same_v<Type, DeletePlan>) {
           std::string result = "DeletePlan(table=" + value.table_name;
           if (value.where.has_value()) result += ",where=" + PredicateText(*value.where);
+          return result + ")";
+        } else {
+          std::string result = "UpdatePlan(table=" + value.table_name +
+                               ",assignments=[";
+          for (std::size_t i = 0; i < value.assignments.size(); ++i) {
+            if (i != 0) result += ",";
+            result += value.assignments[i].column + "=" +
+                      CompileExprText(value.assignments[i].expression);
+          }
+          result += "]";
+          if (value.where.has_value()) {
+            result += ",where=" + PredicateText(*value.where);
+          }
           return result + ")";
         }
       },

@@ -20,6 +20,7 @@ add_library(oursql_core
   src/parser/parser.cpp
   src/planner/planner.cpp
   src/optimizer/optimizer.cpp
+  src/optimizer/expression_optimizer.cpp
   src/execution/executor.cpp
   src/execution/database_engine.cpp
   src/parser/lexer.cpp

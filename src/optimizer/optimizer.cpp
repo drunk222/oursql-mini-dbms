@@ -13,12 +13,25 @@ namespace {
 bool IsFrozenSelectShape(const PlanNode &node) {
   const auto *project = std::get_if<ProjectPlan>(&node.operation);
   if (project == nullptr || project->child == nullptr) return false;
-  if (const auto *filter =
-          std::get_if<FilterPlan>(&project->child->operation)) {
+  const PlanNode *current = project->child.get();
+  // GROUP BY / ORDER BY 是编译层扩展算子，允许出现在 Project 与数据源之间。
+  while (current != nullptr) {
+    if (const auto *order = std::get_if<OrderByPlan>(&current->operation)) {
+      current = order->child.get();
+      continue;
+    }
+    if (const auto *group = std::get_if<GroupByPlan>(&current->operation)) {
+      current = group->child.get();
+      continue;
+    }
+    break;
+  }
+  if (current == nullptr) return false;
+  if (const auto *filter = std::get_if<FilterPlan>(&current->operation)) {
     return filter->child != nullptr &&
            std::holds_alternative<SeqScanPlan>(filter->child->operation);
   }
-  return std::holds_alternative<SeqScanPlan>(project->child->operation);
+  return std::holds_alternative<SeqScanPlan>(current->operation);
 }
 
 bool ProjectionCovers(const ProjectPlan &inner, const ProjectPlan &outer) {

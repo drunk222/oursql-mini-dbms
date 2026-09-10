@@ -234,9 +234,9 @@ bool TestUpdateCompileOnly() {
     return false;
   }
   auto plan = planner.Build(parsed.value()[0], catalog);
-  if (!Check(!plan.ok() && plan.status().code() == oursql::ErrorCode::NotImplemented &&
-                 plan.status().message().find("仅编译层支持") != std::string::npos,
-             "UPDATE 应在 Planner 被明确拒绝为未实现")) {
+  if (!Check(plan.ok() &&
+                 std::holds_alternative<oursql::UpdatePlan>(plan.value()),
+             "UPDATE 应生成 UpdatePlan")) {
     return false;
   }
 
@@ -269,9 +269,9 @@ bool TestUpdateCompileOnly() {
                    bad_column.status().code() == oursql::ErrorCode::NotFound &&
                    !type_status.ok() &&
                    type_status.status().code() == oursql::ErrorCode::TypeMismatch &&
-                   !expression_status.ok() &&
-                   expression_status.status().code() ==
-                       oursql::ErrorCode::NotImplemented,
+                   expression_status.ok() &&
+                   std::holds_alternative<oursql::UpdatePlan>(
+                       expression_status.value()),
                "UPDATE 语义错误应被 Planner 拒绝");
 }
 
@@ -279,21 +279,38 @@ bool TestOrderGroupCompileOnly() {
   oursql::Catalog catalog = MakeCatalog();
   oursql::Parser parser;
   oursql::Planner planner;
-  const std::vector<std::string> rejected{
+  const std::vector<std::string> accepted{
       "SELECT id FROM users ORDER BY id DESC;",
       "SELECT id FROM users GROUP BY id;",
       "SELECT id FROM users GROUP BY id ORDER BY id;",
   };
-  for (const auto &sql : rejected) {
+  for (const auto &sql : accepted) {
     auto parsed = parser.Parse(sql);
     if (!Check(parsed.ok(), "GROUP BY/ORDER BY 应可解析: " + sql)) return false;
     auto plan = planner.Build(parsed.value()[0], catalog);
-    if (!Check(!plan.ok() &&
-                   plan.status().code() == oursql::ErrorCode::NotImplemented &&
-                   plan.status().message().find("仅编译层支持") !=
-                       std::string::npos,
-               "GROUP BY/ORDER BY 应返回 NotImplemented: " + sql)) {
+    if (!Check(plan.ok() &&
+                   std::holds_alternative<oursql::SelectPlan>(plan.value()),
+               "GROUP BY/ORDER BY 应生成 SelectPlan: " + sql)) {
       return false;
+    }
+    const auto &select = std::get<oursql::SelectPlan>(plan.value());
+    const auto *project =
+        std::get_if<oursql::ProjectPlan>(&select.root->operation);
+    if (!Check(project != nullptr, "SELECT 根节点应为 ProjectPlan")) {
+      return false;
+    }
+    if (sql.find("ORDER BY") != std::string::npos) {
+      if (!Check(std::holds_alternative<oursql::OrderByPlan>(
+                     project->child->operation),
+                 "ORDER BY 应生成 OrderByPlan")) {
+        return false;
+      }
+    } else if (sql.find("GROUP BY") != std::string::npos) {
+      if (!Check(std::holds_alternative<oursql::GroupByPlan>(
+                     project->child->operation),
+                 "GROUP BY 应生成 GroupByPlan")) {
+        return false;
+      }
     }
   }
   // 列存在性仍然先于"未实现"被检查，保证诊断精确。
@@ -339,6 +356,51 @@ bool TestCompileExpressionParsing() {
                "复杂表达式也应执行列和类型语义检查");
 }
 
+bool TestCompileConstantFolding() {
+  oursql::Parser parser;
+  auto parsed = parser.Parse(
+      "SELECT * FROM users WHERE id = 10 + 8;");
+  if (!Check(parsed.ok(), "常量条件应可解析")) return false;
+  const auto &select = std::get<oursql::SelectStatement>(parsed.value()[0]);
+  if (!Check(select.where.has_value() &&
+                 select.where->value.AsInt() == 18,
+             "id = 10 + 8 应折叠为 Predicate(id,18)")) {
+    return false;
+  }
+
+  auto true_condition = parser.Parse(
+      "SELECT * FROM users WHERE 1 = 1;");
+  if (!Check(true_condition.ok(), "1 = 1 应可解析")) return false;
+  const auto &constant_select =
+      std::get<oursql::SelectStatement>(true_condition.value()[0]);
+  const auto *literal =
+      constant_select.compile_where
+          ? std::get_if<oursql::CompileLiteralExpr>(
+                &constant_select.compile_where->data)
+          : nullptr;
+  if (!Check(literal != nullptr &&
+                 literal->kind == oursql::CompileLiteralKind::Bool &&
+                 literal->text == "true",
+             "1 = 1 应折叠为 TRUE 字面量")) {
+    return false;
+  }
+
+  auto catalog = MakeCatalog();
+  oursql::Planner planner;
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok(), "折叠后的等值条件应可规划")) return false;
+  const auto &select_plan = std::get<oursql::SelectPlan>(plan.value());
+  const auto *project =
+      std::get_if<oursql::ProjectPlan>(&select_plan.root->operation);
+  const auto *filter =
+      project == nullptr || project->child == nullptr
+          ? nullptr
+          : std::get_if<oursql::FilterPlan>(&project->child->operation);
+  return Check(filter != nullptr &&
+                   filter->predicate.value.AsInt() == 18,
+               "折叠后的 Predicate 应进入 FilterPlan");
+}
+
 }  // namespace
 
 int main() {
@@ -356,6 +418,7 @@ int main() {
   run("UPDATE compile-only", &TestUpdateCompileOnly);
   run("ORDER BY/GROUP BY compile-only", &TestOrderGroupCompileOnly);
   run("Compile expression parsing", &TestCompileExpressionParsing);
+  run("Compile constant folding", &TestCompileConstantFolding);
   if (failures == 0) {
     std::cout << "All frontend tests passed\n";
     return 0;

@@ -108,6 +108,8 @@ BufferPool 的 FreeList 只记录尚未占用的内存 frame；磁盘 Superblock
 
 `SelectPlan::root`、`FilterPlan::child` 和 `ProjectPlan::child` 都是 `std::shared_ptr<const PlanNode>`。Planner 构造完成后，ExecutionEngine 只能读取 `const PlanNode`，不能通过这些指针修改算子树。
 
+编译层可选的后处理通道是 `Optimizer`（由 `Planner::Build` 在返回前调用）。它的职责是校验并要求「SELECT 的计划树固定为 `Project(Filter(SeqScan))`」，只允许不改变计划形态、也不改变执行结果的重写。当前包含「冗余内层 Project 裁剪」规则：只有在内层投影覆盖外层所需列时才删除内层 Project，根 Project 永不裁剪；传入不符合冻结形态的计划时，`Optimizer` 返回 `InternalError`。
+
 ### 一条数据如何落到磁盘？
 
 RowCodec 把 Values 编成带边界信息的记录，HeapTable 沿数据页链寻找空间，SlottedPage 写入槽目录和记录区，WritePageGuard 标记 dirty，BufferPoolManager 最终把 4096 字节 Page 交给 DiskManager，DiskManager 写入 `.oursql` 文件。
@@ -120,6 +122,21 @@ RowCodec 把 Values 编成带边界信息的记录，HeapTable 沿数据页链�
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-本次最新构建的 CTest 实际结果为 `7/7` 通过，包含公共类型、DiskManager、Replacer、BufferPool、Slotted Page、RowCodec、Catalog、Parser/Planner、Executor、重启端到端和边界测试。另有 `oursql_benchmark` 基准目标，不作为 CTest 用例。
+本次最新构建的 CTest 实际结果为 `8/8` 通过，对应 8 个测试目标：`oursql_tests`（公共类型与基础结构）、`oursql_storage_tests`（DiskManager/Replacer/BufferPool）、`oursql_slotted_page_tests`（Slotted Page 与 RowCodec）、`oursql_frontend_tests`（Lexer/Parser/Planner）、`oursql_optimizer_tests`（编译层计划形态校验）、`oursql_catalog_heap_tests`（Catalog 与 HeapTable）、`oursql_execution_tests`（Executor、重启端到端）、`oursql_edge_case_tests`（边界）。另有 `oursql_benchmark` 基准目标，不作为 CTest 用例。
+
+使用 Ninja 单配置生成器时，可执行文件位于 `build/`（例如 `build/oursql.exe`），而不是 `build/Debug/`。
 
 当前没有实现：JOIN、索引、事务、MVCC、完整 WAL、WriteThrough、ALTER/DROP、网络服务和 GUI。数据库仍是单数据库、单表查询教学实现；这些功能不能在演示中包装成已实现能力。
+
+编译层已能解析、但执行层没有对应算子的语法（`GROUP BY`、`ORDER BY`、`UPDATE`、复杂 WHERE 表达式）在本项目中**先完成表、列和类型语义检查，再明确报 `NotImplemented`**，绝不会生成一个执行器会静默忽略的计划。复杂表达式中的未知列和类型错误会在 `NotImplemented` 之前返回 `NotFound` / `TypeMismatch`。演示时可以直接展示这一行为：
+
+```sql
+SELECT * FROM student ORDER BY id DESC;   -- NotImplemented: Planner: ORDER BY 仅编译层支持，未接入数据库执行，位置 1:1
+SELECT * FROM student GROUP BY name;      -- NotImplemented: Planner: GROUP BY 仅编译层支持，未接入数据库执行，位置 1:1
+UPDATE student SET name = 'Zoe' WHERE id = 1;  -- NotImplemented: Planner: UPDATE 仅编译层支持，未接入数据库执行，位置 1:1
+SELECT * FROM student WHERE id > 1;       -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
+```
+
+### 本地修改的范围是什么？
+
+本仓库的本地修改**只涉及编译层**：`src/parser`、`src/planner`、`src/optimizer` 与 `include/oursql/{parser,ast,plan,optimizer}`，外加 `tests/`、`CMakeLists.txt` 与本文档。数据库层 `src/storage`、`src/catalog`、`src/execution`（含 `DatabaseEngine`、Executor）以及 `include/oursql/{storage,catalog,execution,common}` **没有任何改动**，因此 4096 字节页、Page 0 Superblock、空闲页链表、Catalog Page、Slotted Page、BufferPool/PageGuard 与 Executor 的行为都保持原样。编译层新增能力只能通过「Planner 语义检查 + 明确报错」的方式暴露，不能靠修改数据库层来实现。

@@ -1,5 +1,7 @@
 build/
+.vs/
 .vscode/
+build.stale-temp/
 *.user
 *.log
 *.oursql

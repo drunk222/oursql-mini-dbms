@@ -8,6 +8,10 @@
 #include <string>
 #include <string_view>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace {
 
 std::string LowerAscii(std::string text) {
@@ -32,6 +36,20 @@ bool HasStatementTerminator(std::string_view text) {
   }
   return false;
 }
+
+void PrintCliError(const oursql::Status &status) {
+  // CLI 的提示符走 stdout，错误也在输出前刷新，避免两个流在终端中乱序。
+  std::cout.flush();
+  std::cout << status.ToString() << '\n' << std::flush;
+}
+
+#ifdef _WIN32
+void ConfigureConsoleEncoding() {
+  // 源码和错误信息都是 UTF-8；切换代码页后，Windows 终端才能正确显示中文。
+  (void)::SetConsoleOutputCP(CP_UTF8);
+  (void)::SetConsoleCP(CP_UTF8);
+}
+#endif
 
 void PrintResult(const oursql::ExecutionResult &result) {
   if (!result.column_names.empty()) {
@@ -80,7 +98,7 @@ bool HandleMetaCommand(std::string_view line, oursql::DatabaseEngine *engine, bo
   if (command == ".quit") {
     *should_quit = true;
     auto status = engine->Close();
-    if (!status.ok()) std::cerr << status.ToString() << '\n';
+    if (!status.ok()) PrintCliError(status);
     return status.ok();
   }
   if (command == ".tables") {
@@ -89,12 +107,12 @@ bool HandleMetaCommand(std::string_view line, oursql::DatabaseEngine *engine, bo
   }
   if (command == ".schema") {
     if (argument.empty()) {
-      std::cerr << "Usage: .schema table_name\n";
+      std::cout << "Usage: .schema table_name\n" << std::flush;
       return false;
     }
     auto metadata = engine->GetTableMetadata(LowerAscii(argument));
     if (!metadata.ok()) {
-      std::cerr << metadata.status().ToString() << '\n';
+      PrintCliError(metadata.status());
       return false;
     }
     for (const auto &column : metadata.value().schema.columns()) {
@@ -111,11 +129,11 @@ bool HandleMetaCommand(std::string_view line, oursql::DatabaseEngine *engine, bo
   }
   if (command == ".flush") {
     auto status = engine->Flush();
-    if (!status.ok()) std::cerr << status.ToString() << '\n';
+    if (!status.ok()) PrintCliError(status);
     else std::cout << "Flushed\n";
     return status.ok();
   }
-  std::cerr << "Unknown command: " << command << '\n';
+  std::cout << "Unknown command: " << command << '\n' << std::flush;
   return false;
 }
 
@@ -127,6 +145,9 @@ int wmain(int argc, wchar_t **argv) {
 int main(int argc, char **argv) {
 #endif
   try {
+#ifdef _WIN32
+    ConfigureConsoleEncoding();
+#endif
 #ifdef _WIN32
     const bool help = argc == 2 &&
                       (std::wstring_view(argv[1]) == L"--help" ||
@@ -144,7 +165,7 @@ int main(int argc, char **argv) {
                                                           : "demo.oursql";
     oursql::DatabaseEngine engine(database_path);
     if (!engine.GetInitStatus().ok()) {
-      std::cerr << engine.GetInitStatus().ToString() << '\n';
+      PrintCliError(engine.GetInitStatus());
       return 1;
     }
 
@@ -163,7 +184,7 @@ int main(int argc, char **argv) {
       if (!HasStatementTerminator(sql_buffer)) continue;
       auto results = engine.ExecuteSqlBatch(sql_buffer);
       if (!results.ok()) {
-        std::cerr << results.status().ToString() << '\n';
+        PrintCliError(results.status());
       } else {
         for (const auto &result : results.value()) PrintResult(result);
       }
@@ -172,19 +193,19 @@ int main(int argc, char **argv) {
     if (!sql_buffer.empty() && !should_quit) {
       auto results = engine.ExecuteSqlBatch(sql_buffer);
       if (!results.ok()) {
-        std::cerr << results.status().ToString() << '\n';
+        PrintCliError(results.status());
       } else {
         for (const auto &result : results.value()) PrintResult(result);
       }
     }
     const auto status = engine.Close();
     if (!status.ok()) {
-      std::cerr << status.ToString() << '\n';
+      PrintCliError(status);
       return 1;
     }
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << "OurSQL error: " << error.what() << '\n';
+    std::cout << "OurSQL error: " << error.what() << '\n' << std::flush;
     return 1;
   }
 }

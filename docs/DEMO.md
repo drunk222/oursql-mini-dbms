@@ -9,7 +9,7 @@
 ```powershell
 cmake -S . -B build
 cmake --build build --config Debug
-.\build\Debug\oursql.exe .\build\demo.oursql
+.\build\oursql.exe .\build\demo.oursql
 ```
 
 在 CLI 中逐行输入：

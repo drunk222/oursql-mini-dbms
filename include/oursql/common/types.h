@@ -8,6 +8,7 @@ namespace oursql {
 
 using page_id_t = std::uint32_t;
 using slot_id_t = std::uint32_t;
+//inline 放在这里，是为了允许这个常量被多个源文件包含，而不会产生重复定义问题
 inline constexpr page_id_t INVALID_PAGE_ID = std::numeric_limits<page_id_t>::max();
 inline constexpr slot_id_t INVALID_SLOT_ID = std::numeric_limits<slot_id_t>::max();
 

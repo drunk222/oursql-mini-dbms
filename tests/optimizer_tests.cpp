@@ -190,15 +190,68 @@ bool TestNestedProjectPruned() {
       oursql::ProjectPlan{inner, {"id"}, false});
   oursql::Plan plan = oursql::SelectPlan{"users", outer};
 
-  auto optimized = optimizer.Optimize(plan);
+  auto optimized = optimizer.OptimizeWithStats(plan);
   if (!Check(optimized.ok(), "嵌套 Project 应可优化")) return false;
-  const auto &select = std::get<oursql::SelectPlan>(optimized.value());
+  const auto &select = std::get<oursql::SelectPlan>(optimized.value().plan);
   const auto &project =
       std::get<oursql::ProjectPlan>(select.root->operation);
   return Check(project.columns == std::vector<std::string>{"id"} &&
                    std::holds_alternative<oursql::SeqScanPlan>(
                        project.child->operation),
-               "冗余内层 Project 应被裁剪");
+               "冗余内层 Project 应被裁剪") &&
+         Check(optimized.value().stats.passes == 2,
+               "一次改写后应再执行一轮稳定检查") &&
+         Check(optimized.value().stats.rule_hits.at(
+                   "R1:冗余内层Project裁剪") == 1,
+               "规则命中次数应为 1");
+}
+
+bool TestSchedulerRepeatsUntilStable() {
+  oursql::Optimizer optimizer;
+  auto scan = std::make_shared<oursql::PlanNode>(
+      oursql::SeqScanPlan{"users"});
+  auto inner = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{scan, {"id", "name"}, false});
+  auto middle = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{inner, {"id", "name"}, false});
+  auto outer = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{middle, {"id"}, false});
+  oursql::Plan plan = oursql::SelectPlan{"users", outer};
+
+  auto optimized = optimizer.OptimizeWithStats(plan);
+  if (!Check(optimized.ok(), "多层冗余 Project 应可优化")) return false;
+  const auto &select =
+      std::get<oursql::SelectPlan>(optimized.value().plan);
+  const auto &project =
+      std::get<oursql::ProjectPlan>(select.root->operation);
+  return Check(project.child != nullptr &&
+                   std::holds_alternative<oursql::SeqScanPlan>(
+                       project.child->operation),
+               "调度器应重复运行直到计划稳定") &&
+         Check(optimized.value().stats.passes == 3,
+               "两次改写后应进行第三轮稳定检查") &&
+         Check(optimized.value().stats.rule_hits.at(
+                   "R1:冗余内层Project裁剪") == 2,
+               "连续两层冗余 Project 应累计两次规则命中");
+}
+
+bool TestSelectAllDoesNotPruneNarrowInnerProject() {
+  oursql::Optimizer optimizer;
+  auto scan = std::make_shared<oursql::PlanNode>(
+      oursql::SeqScanPlan{"users"});
+  auto inner = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{scan, {"id"}, false});
+  auto outer = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{inner, {}, true});
+  oursql::Plan plan = oursql::SelectPlan{"users", outer};
+
+  auto optimized = optimizer.OptimizeWithStats(plan);
+  // 如果 R1 错误地裁剪内层 Project，改写结果会满足冻结形态并成功返回；
+  // 当前实现不能证明 SELECT * 的完整列集合仍然存在，因此必须拒绝原计划。
+  return Check(!optimized.ok() &&
+                   optimized.status().code() ==
+                       oursql::ErrorCode::InternalError,
+               "外层 SELECT * 不能裁掉提供窄列集合的内层 Project");
 }
 
 }  // namespace
@@ -216,6 +269,9 @@ int main() {
   run("Optimize is idempotent", &TestOptimizeIsIdempotent);
   run("Non-SELECT plans unchanged", &TestNonSelectPlansUnchanged);
   run("Nested Project pruned", &TestNestedProjectPruned);
+  run("Scheduler repeats until stable", &TestSchedulerRepeatsUntilStable);
+  run("Unsafe SELECT * projection rejected",
+      &TestSelectAllDoesNotPruneNarrowInnerProject);
   if (failures == 0) {
     std::cout << "All optimizer tests passed\n";
     return 0;

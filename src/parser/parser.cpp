@@ -10,6 +10,8 @@ namespace oursql {
 
 namespace {
 
+// 以下格式化函数只用于 AST 的稳定文本输出。它们不解析 SQL、不访问数据库，
+// 测试和答辩展示可以依赖其格式，但执行链路不能依赖文本结果。
 std::string QuoteValue(const Value &value) {
   if (value.IsInt()) return value.ToString();
   return "'" + value.AsVarchar() + "'";
@@ -59,10 +61,16 @@ Position TokenPosition(const Token &token) noexcept {
   return Position{token.start_offset, token.line, token.column};
 }
 
+// 手写递归下降解析器。
+//
+// 游标 index_ 始终指向“下一个尚未消费的 Token”。Lexer 保证序列末尾有
+// EndOfFile，因此 Peek() 无需在每次访问前重复做越界判断。
 class ParserImpl {
  public:
   explicit ParserImpl(const std::vector<Token> &tokens) : tokens_(tokens) {}
 
+  // 循环解析直到 EOF。每条语句必须由对应 ParseXxx() 消费结束分号，
+  // 这样下一条语句才能从合法的 Token 边界开始。
   Result<std::vector<Statement>> Parse() {
     std::vector<Statement> statements;
     while (Peek().type != TokenType::EndOfFile) {
@@ -75,15 +83,22 @@ class ParserImpl {
   }
 
  private:
+  // 返回当前 Token。调用者不能保存该引用到下一次 Match/Expect 之后，
+  // 因为 index_ 可能移动。
   const Token &Peek() const { return tokens_[index_]; }
+
+  // 仅在确认 index_ > 0 后读取上一个已消费 Token，用于取得 Match 的 lexeme。
   const Token &Previous() const { return tokens_[index_ - 1]; }
 
+  // 若当前 Token 类型匹配，则消费一个 Token 并返回 true；否则游标保持不动。
   bool Match(TokenType type) {
     if (Peek().type != type) return false;
     ++index_;
     return true;
   }
 
+  // 统一构造语法错误，包含期望内容、实际 Token 和位置。实际 lexeme 会附加
+  // 在类型名后，例如 AND('and')，便于用户定位。
   Status Error(std::string expected, const Token &actual) const {
     std::string actual_text = TokenTypeName(actual.type);
     if (!actual.lexeme.empty()) actual_text += "('" + actual.lexeme + "')";
@@ -92,17 +107,21 @@ class ParserImpl {
                                    std::to_string(actual.column));
   }
 
+  // 强制消费指定类型的 Token。所有固定关键字和标点都应通过该函数读取。
   Result<Token> Expect(TokenType type, std::string expected) {
     if (Peek().type != type) return Result<Token>(Error(std::move(expected), Peek()));
     return Result<Token>(tokens_[index_++]);
   }
 
+  // 标识符在 Lexer 中已经转为小写，因此这里直接返回 lexeme 作为规范化名称。
   Result<std::string> ExpectIdentifier(std::string expected) {
     auto token = Expect(TokenType::Identifier, std::move(expected));
     if (!token.ok()) return Result<std::string>(token.status());
     return Result<std::string>(std::move(token.value().lexeme));
   }
 
+  // INSERT 值只允许整数或字符串字面量；布尔值、列引用和表达式不属于当前
+  // INSERT 语法。整数使用 from_chars 检查完整消费和 int64 溢出。
   Result<Value> ParseLiteral() {
     if (Match(TokenType::String)) return Result<Value>(Value(Previous().lexeme));
     if (Match(TokenType::Integer)) {
@@ -119,6 +138,8 @@ class ParserImpl {
     return Result<Value>(Error("整数或单引号字符串", Peek()));
   }
 
+  // 构造 CompileExpr 节点的小型工厂。表达式树使用 shared_ptr<const>，
+  // 构造完成后不会在 Parser 内继续修改节点内容。
   CompileExprPtr MakeColumnExpr(std::string name) {
     return std::make_shared<CompileExpr>(
         CompileExpr::Data(CompileColumnExpr{std::move(name)}));
@@ -172,6 +193,9 @@ class ParserImpl {
 
   Result<CompileExprPtr> ParseCompileExpr() { return ParseCompileOr(); }
 
+  // 表达式解析采用“每层只处理一种优先级”的递归下降结构：
+  // OR -> AND -> NOT -> 比较 -> 加减 -> 乘除 -> 一元 -> 原子。
+  // 这样不需要在单个函数中维护运算符优先级表。
   Result<CompileExprPtr> ParseCompileOr() {
     auto left = ParseCompileAnd();
     if (!left.ok()) return left;
@@ -204,6 +228,7 @@ class ParserImpl {
   }
 
   Result<CompileExprPtr> ParseCompileComparison() {
+    // 当前比较运算只解析一次，不形成类似 a < b < c 的链式比较。
     auto left = ParseCompileAdditive();
     if (!left.ok()) return left;
     if (IsComparisonType(Peek().type)) {
@@ -218,6 +243,7 @@ class ParserImpl {
   }
 
   Result<CompileExprPtr> ParseCompileAdditive() {
+    // 左侧结合：a - b - c 解析为 (a - b) - c。
     auto left = ParseCompileMultiplicative();
     if (!left.ok()) return left;
     while (IsAdditiveType(Peek().type)) {
@@ -232,6 +258,8 @@ class ParserImpl {
   }
 
   Result<CompileExprPtr> ParseCompileMultiplicative() {
+    // 乘除优先级高于加减，左侧结合；* 同时也可作为 SELECT 列表中的全列标记，
+    // 两个位置由不同解析入口区分。
     auto left = ParseCompileUnary();
     if (!left.ok()) return left;
     while (IsMultiplicativeType(Peek().type)) {
@@ -246,6 +274,7 @@ class ParserImpl {
   }
 
   Result<CompileExprPtr> ParseCompileUnary() {
+    // 一元负号允许递归构造，例如 -(-x) 会形成嵌套 UnaryExpr。
     if (Match(TokenType::Minus)) {
       auto operand = ParseCompileUnary();
       if (!operand.ok()) return operand;
@@ -255,6 +284,7 @@ class ParserImpl {
   }
 
   Result<CompileExprPtr> ParseCompilePrimary() {
+    // 原子表达式包括布尔值、字符串、整数、列名和括号表达式。
     if (Match(TokenType::True)) {
       return Result<CompileExprPtr>(MakeBoolExpr(true));
     }
@@ -309,6 +339,8 @@ class ParserImpl {
   };
 
   Result<ParsedWhere> ParseWhere() {
+    // 先保留完整表达式并执行常量折叠，再尝试抽取数据库层可执行的简单等值
+    // Predicate。即使无法抽取，compile_where 仍会留给 Planner 做语义检查。
     auto expression = ParseCompileExpr();
     if (!expression.ok()) return Result<ParsedWhere>(expression.status());
     auto folded = FoldCompileExpr(expression.value());
@@ -317,6 +349,8 @@ class ParserImpl {
   }
 
   Result<Statement> ParseCreateTable() {
+    // 语法：CREATE TABLE name (column type [, ...]);
+    // VARCHAR 的长度可选；长度必须为正整数，真正的 Schema 合法性交给 Planner。
     auto create = Expect(TokenType::Create, "CREATE");
     if (!create.ok()) return Result<Statement>(create.status());
     auto table = Expect(TokenType::Table, "TABLE");
@@ -368,6 +402,8 @@ class ParserImpl {
   }
 
   Result<Statement> ParseInsert() {
+    // 语法：INSERT INTO name VALUES (literal [, ...]);
+    // Parser 只负责收集字面量，列数、类型和 VARCHAR 长度由 Planner 校验。
     auto insert = Expect(TokenType::Insert, "INSERT");
     if (!insert.ok()) return Result<Statement>(insert.status());
     auto into = Expect(TokenType::Into, "INTO");
@@ -397,6 +433,7 @@ class ParserImpl {
   }
 
   Result<Statement> ParseSelect() {
+    // 语法顺序固定为 SELECT 列表 -> FROM -> WHERE? -> GROUP BY? -> ORDER BY?。
     auto select = Expect(TokenType::Select, "SELECT");
     if (!select.ok()) return Result<Statement>(select.status());
     SelectStatement statement;
@@ -458,6 +495,8 @@ class ParserImpl {
   }
 
   Result<Statement> ParseDelete() {
+    // 当前 DELETE 只支持单表以及可选 WHERE；复杂 WHERE 会通过 compile_where
+    // 进入语义检查，但执行层级尚未接入。
     auto delete_keyword = Expect(TokenType::Delete, "DELETE");
     if (!delete_keyword.ok()) return Result<Statement>(delete_keyword.status());
     auto from = Expect(TokenType::From, "FROM");
@@ -480,6 +519,8 @@ class ParserImpl {
   }
 
   Result<Statement> ParseUpdate() {
+    // 语法：UPDATE table SET col = expr [, ...] [WHERE expr]。
+    // 每个赋值都在解析后立即折叠常量，并保留可选的简单 Value。
     auto update = Expect(TokenType::Update, "UPDATE");
     if (!update.ok()) return Result<Statement>(update.status());
     auto table_name = ExpectIdentifier("UPDATE 后的表名");
@@ -518,6 +559,7 @@ class ParserImpl {
   }
 
   Result<Statement> ParseStatement() {
+    // 分派完全依据首个关键字 Token；不支持的关键字会给出预期的语句集合。
     switch (Peek().type) {
       case TokenType::Create: return ParseCreateTable();
       case TokenType::Insert: return ParseInsert();
@@ -536,6 +578,8 @@ class ParserImpl {
 }  // namespace
 
 Result<std::vector<Statement>> Parser::Parse(std::string_view sql) const {
+  // Parser 的统一入口：先完成词法切分，再构造解析器游标。任何词法错误都会
+  // 直接作为 Result 返回，不会进入语法阶段。
   Lexer lexer;
   auto tokens = lexer.Tokenize(sql);
   if (!tokens.ok()) return Result<std::vector<Statement>>(tokens.status());
@@ -543,6 +587,8 @@ Result<std::vector<Statement>> Parser::Parse(std::string_view sql) const {
 }
 
 std::string ToString(const Statement &statement) {
+  // 稳定打印格式用于测试、调试和说明文档；所有语义信息都来自结构化字段，
+  // 文本本身不会被再次解析或交给 Executor。
   return std::visit(
       [](const auto &value) -> std::string {
         using Type = std::decay_t<decltype(value)>;

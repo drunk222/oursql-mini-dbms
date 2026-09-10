@@ -10,11 +10,14 @@
 namespace oursql {
 
 enum class TokenType {
+  // 标识符和字面量：Lexer 会将关键字与标识符转为小写，但字符串内容保持原样。
   Identifier,
   Integer,
   String,
   True,
   False,
+
+  // 标点、比较运算和算术运算。
   Comma,
   LeftParen,
   RightParen,
@@ -31,6 +34,8 @@ enum class TokenType {
   And,
   Or,
   Not,
+
+  // 语句分隔符和 SQL 关键字。
   Semicolon,
   Create,
   Table,
@@ -54,10 +59,17 @@ enum class TokenType {
 };
 
 struct Token {
+  // 词法种别；EOF 是输入末尾的哨兵，Parser 依赖它避免越过 vector 边界。
   TokenType type{TokenType::EndOfFile};
+
+  // 规范化后的词素：关键字和标识符为小写，字符串保存去除外层引号后的内容。
   std::string lexeme;
+
+  // [start_offset, end_offset) 是 Token 在原始 SQL 中占用的字节区间。
   std::size_t start_offset{0};
   std::size_t end_offset{0};
+
+  // 起始行列从 1 开始；结束位置表示 Token 消耗完后的下一个位置。
   std::size_t line{1};
   std::size_t column{1};
   std::size_t end_line{1};

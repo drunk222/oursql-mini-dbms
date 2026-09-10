@@ -108,7 +108,7 @@ BufferPool 的 FreeList 只记录尚未占用的内存 frame；磁盘 Superblock
 
 `SelectPlan::root`、`FilterPlan::child` 和 `ProjectPlan::child` 都是 `std::shared_ptr<const PlanNode>`。Planner 构造完成后，ExecutionEngine 只能读取 `const PlanNode`，不能通过这些指针修改算子树。
 
-编译层可选的后处理通道是 `Optimizer`（由 `Planner::Build` 在返回前调用）。它的职责是校验并要求「SELECT 的计划树固定为 `Project(Filter(SeqScan))`」，只允许不改变计划形态、也不改变执行结果的重写。当前包含「冗余内层 Project 裁剪」规则：只有在内层投影覆盖外层所需列时才删除内层 Project，根 Project 永不裁剪；传入不符合冻结形态的计划时，`Optimizer` 返回 `InternalError`。
+编译层可选的后处理通道是 `Optimizer`（由 `Planner::Build` 在返回前调用）。它的职责是校验 SELECT 计划树的允许形态，只允许不改变计划结构和执行结果的重写。当前包含「冗余内层 Project 裁剪」规则：外层是显式投影时，内层必须覆盖它需要的列；外层是 `SELECT *` 时，内层也必须保留整行。根 Project 永不裁剪；传入不符合冻结形态的计划时，`Optimizer` 返回 `InternalError`。规则调度器用显式 `changed` 标志反复运行固定规则集，直到整轮没有改写，并通过 `OptimizeWithStats()` 返回 `passes` 和 `rule_hits` 供测试与答辩展示。
 
 ### 一条数据如何落到磁盘？
 

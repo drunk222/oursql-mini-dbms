@@ -27,6 +27,9 @@ add_library(oursql_core
   src/storage/row_codec.cpp
   src/storage/heap_table.cpp
   src/storage/storage.cpp
+  src/index/b_plus_tree_page.cpp
+  src/index/b_plus_tree.cpp
+  src/index/index_manager.cpp
 )
 
 target_include_directories(oursql_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -65,6 +68,9 @@ target_link_libraries(oursql_execution_tests PRIVATE oursql_core)
 add_executable(oursql_edge_case_tests tests/edge_case_tests.cpp)
 target_link_libraries(oursql_edge_case_tests PRIVATE oursql_core)
 
+add_executable(oursql_b_plus_tree_tests tests/b_plus_tree_tests.cpp)
+target_link_libraries(oursql_b_plus_tree_tests PRIVATE oursql_core)
+
 add_executable(oursql_benchmark benchmarks/storage_benchmark.cpp)
 target_link_libraries(oursql_benchmark PRIVATE oursql_core)
 
@@ -77,3 +83,4 @@ add_test(NAME oursql_optimizer_tests COMMAND oursql_optimizer_tests)
 add_test(NAME oursql_catalog_heap_tests COMMAND oursql_catalog_heap_tests)
 add_test(NAME oursql_execution_tests COMMAND oursql_execution_tests)
 add_test(NAME oursql_edge_case_tests COMMAND oursql_edge_case_tests)
+add_test(NAME oursql_b_plus_tree_tests COMMAND oursql_b_plus_tree_tests)

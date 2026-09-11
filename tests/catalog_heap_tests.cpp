@@ -1,4 +1,6 @@
 #include "oursql/catalog/catalog.h"
+#include "oursql/index/b_plus_tree.h"
+#include "oursql/index/index_manager.h"
 #include "oursql/storage/heap_table.h"
 #include "oursql/storage/row_codec.h"
 
@@ -278,6 +280,159 @@ bool TestOversizedRecordsDoNotAllocatePages() {
   return reopened_pool.Close().ok() && reopened_disk.Close().ok() && ok;
 }
 
+bool TestIndexMetadataPersistence() {
+  TempDb temp;
+  oursql::page_id_t expected_root = oursql::INVALID_PAGE_ID;
+  {
+    oursql::DiskManager disk_manager;
+    if (!Check(disk_manager.Open(temp.path).ok(), "索引元数据数据库打开应成功")) return false;
+    oursql::BufferPoolManager buffer_pool(6, &disk_manager);
+    oursql::Catalog catalog(&buffer_pool, &disk_manager);
+    if (!Check(catalog.Open().ok(), "索引元数据Catalog打开应成功")) return false;
+    const auto schema = UserSchema();
+    if (!Check(catalog.CreateTable(
+                   oursql::TableMetadata{"student", schema, oursql::INVALID_PAGE_ID}).ok(),
+               "student建表应成功")) return false;
+
+    auto tree_result = oursql::BPlusTree::CreatePersistent(&buffer_pool, 3, 3);
+    if (!Check(tree_result.ok(), "索引B+树创建应成功")) return false;
+    auto &tree = *tree_result.value();
+    if (!Check(tree.Insert(1, oursql::RID{2, 1}).ok(), "索引首条记录插入应成功")) return false;
+    if (!Check(catalog.CreateIndex(oursql::IndexMetadata{
+                   "idx_student_id", "student", "id", tree.GetRootPageId(), true}).ok(),
+               "索引元数据创建应成功")) return false;
+    if (!Check(!catalog.CreateIndex(oursql::IndexMetadata{
+                    "idx_student_id", "student", "id", tree.GetRootPageId(), true}).ok(),
+               "重复索引名应被拒绝")) return false;
+    if (!Check(!catalog.CreateIndex(oursql::IndexMetadata{
+                    "idx_missing", "student", "missing", tree.GetRootPageId(), false}).ok(),
+               "不存在的索引列应被拒绝")) return false;
+
+    for (std::int64_t key = 2; key <= 30; ++key) {
+      if (!Check(tree.Insert(key, oursql::RID{static_cast<oursql::page_id_t>(key + 1), 1}).ok(),
+                 "索引扩展插入应成功")) return false;
+    }
+    expected_root = tree.GetRootPageId();
+    if (!Check(catalog.UpdateIndexRootPageId("idx_student_id", expected_root).ok(),
+               "根分裂后Catalog应更新root page id")) return false;
+    if (!Check(catalog.ListIndexes().size() == 1 &&
+                   catalog.ListTableIndexes("student").size() == 1,
+               "Catalog应能列出全部索引和表索引")) return false;
+    if (!Check(buffer_pool.Close().ok() && disk_manager.Close().ok(),
+               "索引元数据数据库关闭应成功")) return false;
+  }
+
+  oursql::DiskManager reopened_disk;
+  if (!Check(reopened_disk.Open(temp.path).ok(), "索引元数据数据库重开应成功")) return false;
+  oursql::BufferPoolManager reopened_pool(6, &reopened_disk);
+  oursql::Catalog reopened_catalog(&reopened_pool, &reopened_disk);
+  if (!Check(reopened_catalog.Open().ok(), "重开后索引元数据应恢复")) return false;
+  auto index = reopened_catalog.FindIndex("idx_student_id");
+  if (!Check(index.ok(), "重开后应按索引名查到元数据")) return false;
+  if (!Check(index.value()->table_name == "student" && index.value()->column_name == "id" &&
+                 index.value()->root_page_id == expected_root && index.value()->is_unique,
+             "索引名、表、列、根Page ID和唯一性应完整恢复")) return false;
+  oursql::BPlusTree reopened_tree(&reopened_pool, index.value()->root_page_id, 3, 3);
+  auto found = reopened_tree.GetValue(30);
+  const bool ok = Check(found.ok() && found.value().size() == 1,
+                        "使用Catalog恢复的根Page ID应能查询B+树");
+  return reopened_pool.Close().ok() && reopened_disk.Close().ok() && ok;
+}
+
+bool TestIndexManagerBuildMaintainAndDrop() {
+  TempDb temp;
+  {
+    oursql::DiskManager disk;
+    if (!Check(disk.Open(temp.path).ok(), "IndexManager数据库打开应成功")) return false;
+    oursql::BufferPoolManager pool(3, &disk);
+    oursql::Catalog catalog(&pool, &disk);
+    if (!Check(catalog.Open().ok(), "IndexManager Catalog打开应成功")) return false;
+    if (!Check(catalog.CreateTable(oursql::TableMetadata{
+                   "student", UserSchema(), oursql::INVALID_PAGE_ID}).ok(),
+               "IndexManager student建表应成功")) return false;
+    auto table_metadata = catalog.GetTableMetadata("student");
+    if (!table_metadata.ok()) return false;
+    oursql::HeapTable table(&pool, *table_metadata.value());
+    std::vector<oursql::RID> rids(1000);
+    for (std::int64_t i = 0; i < 1000; ++i) {
+      const auto key = (i * 37) % 1000;
+      auto rid = table.InsertRow(
+          {oursql::Value(key), oursql::Value("student_" + std::to_string(key))});
+      if (!Check(rid.ok(), "1000个乱序Key写入堆表应成功")) return false;
+      rids[static_cast<std::size_t>(key)] = rid.value();
+    }
+
+    oursql::IndexManager indexes(&catalog, &pool);
+    if (!Check(indexes.CreateIndex("idx_student_id", "student", "id", true).ok(),
+               "IndexManager应扫描现有1000行创建唯一索引")) return false;
+    for (const auto key : {0LL, 127LL, 511LL, 999LL}) {
+      auto found = indexes.Lookup("idx_student_id", key);
+      if (!Check(found.ok() && found.value().size() == 1 &&
+                     found.value()[0] == rids[static_cast<std::size_t>(key)],
+                 "IndexManager等值查询应返回现有RID")) return false;
+    }
+
+    const oursql::Row inserted_row{oursql::Value(static_cast<std::int64_t>(1001)),
+                                   oursql::Value("new")};
+    auto inserted_rid = table.InsertRow(inserted_row);
+    if (!Check(inserted_rid.ok() &&
+                   indexes.OnInsert("student", inserted_row, inserted_rid.value()).ok(),
+               "INSERT维护接口应增加索引项")) return false;
+
+    const oursql::Row deleted_row{oursql::Value(static_cast<std::int64_t>(100)),
+                                  oursql::Value("student_100")};
+    if (!Check(indexes.OnDelete("student", deleted_row, rids[100]).ok() &&
+                   table.DeleteRow(rids[100]).ok(),
+               "DELETE维护接口应删除索引项")) return false;
+
+    const oursql::Row old_row{oursql::Value(static_cast<std::int64_t>(200)),
+                              oursql::Value("student_200")};
+    const oursql::Row new_row{oursql::Value(static_cast<std::int64_t>(1200)),
+                              oursql::Value("updated")};
+    if (!Check(table.DeleteRow(rids[200]).ok(), "UPDATE模拟删除旧行应成功")) return false;
+    auto new_rid = table.InsertRow(new_row);
+    if (!Check(new_rid.ok() &&
+                   indexes.OnUpdate("student", old_row, rids[200], new_row, new_rid.value()).ok(),
+               "UPDATE维护接口应替换Key和RID")) return false;
+    auto old_lookup = indexes.Lookup("idx_student_id", 200);
+    auto new_lookup = indexes.Lookup("idx_student_id", 1200);
+    if (!Check(old_lookup.ok() && old_lookup.value().empty() && new_lookup.ok() &&
+                   new_lookup.value().size() == 1 && new_lookup.value()[0] == new_rid.value(),
+               "UPDATE维护后只应命中新Key/RID")) return false;
+    if (!Check(indexes.OnInsert(
+                   "student",
+                   {oursql::Value(static_cast<std::int64_t>(1)), oursql::Value("dup")},
+                   oursql::RID{9999, 1}).code() == oursql::ErrorCode::AlreadyExists,
+               "唯一索引维护应拒绝重复Key")) return false;
+    if (!Check(pool.Close().ok() && disk.Close().ok(), "IndexManager首次关闭应成功")) return false;
+  }
+  {
+    oursql::DiskManager disk;
+    if (!Check(disk.Open(temp.path).ok(), "IndexManager重开数据库应成功")) return false;
+    oursql::BufferPoolManager pool(3, &disk);
+    oursql::Catalog catalog(&pool, &disk);
+    if (!Check(catalog.Open().ok(), "IndexManager重开Catalog应成功")) return false;
+    oursql::IndexManager indexes(&catalog, &pool);
+    auto restored = indexes.Lookup("idx_student_id", 1200);
+    if (!Check(restored.ok() && restored.value().size() == 1,
+               "重启后维护过的索引仍应可查询")) return false;
+    if (!Check(indexes.DropIndex("idx_student_id").ok() && !catalog.HasIndex("idx_student_id"),
+               "DROP INDEX应删除元数据并释放B+树页面")) return false;
+    if (!Check(!indexes.Lookup("idx_student_id", 1200).ok(),
+               "DROP INDEX后查询应返回NotFound")) return false;
+    if (!Check(pool.Close().ok() && disk.Close().ok(), "IndexManager第二次关闭应成功")) return false;
+  }
+  {
+    oursql::DiskManager disk;
+    if (!disk.Open(temp.path).ok()) return false;
+    oursql::BufferPoolManager pool(3, &disk);
+    oursql::Catalog catalog(&pool, &disk);
+    if (!Check(catalog.Open().ok() && !catalog.HasIndex("idx_student_id"),
+               "重启后已DROP的索引元数据不应恢复")) return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -292,6 +447,8 @@ int main() {
   run("HeapTable pages delete and restart", &TestHeapTableAcrossPagesDeleteAndRestart);
   run("RID ownership", &TestRidOwnership);
   run("Oversized records do not allocate pages", &TestOversizedRecordsDoNotAllocatePages);
+  run("Index metadata persistence", &TestIndexMetadataPersistence);
+  run("IndexManager build maintain and drop", &TestIndexManagerBuildMaintainAndDrop);
   if (failures == 0) {
     std::cout << "All catalog and heap tests passed\n";
     return 0;

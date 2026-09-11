@@ -89,6 +89,14 @@ DatabaseStatistics DatabaseEngine::GetStatistics() const {
                             disk_manager_.GetWriteCount()};
 }
 
+Status DatabaseEngine::ResetStatistics() {
+  if (!init_status_.ok()) return Contextualize("DatabaseEngine", init_status_);
+  if (closed_) return Status::InvalidArgument("DatabaseEngine is closed");
+  buffer_pool_.ResetStatistics();
+  disk_manager_.ResetIoStatistics();
+  return Status::Ok();
+}
+
 Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string_view sql) {
   if (!init_status_.ok()) {
     return Result<std::vector<ExecutionResult>>(Contextualize("DatabaseEngine", init_status_));

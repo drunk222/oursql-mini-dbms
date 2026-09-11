@@ -228,4 +228,44 @@ Result<std::vector<RowEntry>> HeapTable::Scan() {
   return Result<std::vector<RowEntry>>(std::move(rows));
 }
 
+Status HeapTable::Destroy() {
+  if (buffer_pool_ == nullptr) {
+    return Status::InvalidArgument("HeapTable missing BufferPoolManager");
+  }
+  if (metadata_.first_data_page_id == 0 ||
+      metadata_.first_data_page_id == INVALID_PAGE_ID) {
+    return Status::InvalidArgument("HeapTable has no valid first data page");
+  }
+
+  // Phase one validates the complete chain before any page is released.
+  std::vector<page_id_t> pages;
+  std::unordered_set<page_id_t> visited;
+  page_id_t current = metadata_.first_data_page_id;
+  while (current != INVALID_PAGE_ID) {
+    if (current == 0 || !visited.insert(current).second) {
+      return Status::InvalidArgument("HeapTable data page chain is invalid or cyclic");
+    }
+    auto page_result = buffer_pool_->FetchPage(current);
+    if (!page_result.ok()) return page_result.status();
+    page_id_t next = INVALID_PAGE_ID;
+    {
+      auto page = std::move(page_result.value());
+      auto valid = SlottedPage::Validate(page);
+      if (!valid.ok()) return valid;
+      auto next_result = SlottedPage::NextPageId(page);
+      if (!next_result.ok()) return next_result.status();
+      next = next_result.value();
+    }
+    pages.push_back(current);
+    current = next;
+  }
+
+  // DeletePages checks every pin before changing any page. It is still not
+  // transactional: without WAL, a later I/O error can release only a prefix.
+  auto delete_status = buffer_pool_->DeletePages(pages);
+  if (!delete_status.ok()) return delete_status;
+  metadata_.first_data_page_id = INVALID_PAGE_ID;
+  return Status::Ok();
+}
+
 }  // namespace oursql

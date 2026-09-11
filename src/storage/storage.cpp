@@ -1470,6 +1470,43 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
   if (!ready.ok()) {
     return ready;
   }
+  return DeletePageUnlocked(page_id);
+}
+
+Status BufferPoolManager::DeletePages(const std::vector<page_id_t> &page_ids) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto ready = EnsureReadyUnlocked();
+  if (!ready.ok()) {
+    return ready;
+  }
+
+  std::unordered_set<page_id_t> seen;
+  seen.reserve(page_ids.size());
+  for (const auto page_id : page_ids) {
+    auto valid = ValidateDataPageId(page_id);
+    if (!valid.ok()) {
+      return valid;
+    }
+    if (!seen.insert(page_id).second) {
+      return Status::InvalidArgument("批量删除列表包含重复页面: " + std::to_string(page_id));
+    }
+    const auto found = page_table_.find(page_id);
+    if (found != page_table_.end() && frames_[found->second].pin_count != 0) {
+      return Status::InvalidArgument("被 pin 的页面不能删除: " + std::to_string(page_id));
+    }
+  }
+
+  // Without WAL, a later I/O failure may leave an earlier page already released.
+  for (const auto page_id : page_ids) {
+    auto status = DeletePageUnlocked(page_id);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return Status::Ok();
+}
+
+Status BufferPoolManager::DeletePageUnlocked(page_id_t page_id) {
   auto valid = ValidateDataPageId(page_id);
   if (!valid.ok()) {
     return valid;

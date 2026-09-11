@@ -725,6 +725,80 @@ bool TestGuardAndExplicitErrors() {
   return CloseDb(dm) && not_implemented;
 }
 
+bool TestPinnedDeletePreservesPageAndAllowsReuse() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!OpenDb(disk, temp.path)) return false;
+  oursql::BufferPoolManager pool(2, &disk);
+  oursql::page_id_t page_id = oursql::INVALID_PAGE_ID;
+  {
+    auto created = pool.NewPage();
+    if (!Check(created.ok(), "NewPage should succeed for pinned delete test")) return false;
+    auto guard = std::move(created.value());
+    page_id = guard.PageId();
+    guard.Data()[100] = std::byte{0x5A};
+    guard.Data()[101] = std::byte{0xC3};
+    if (!Check(guard.MarkDirty().ok(), "Pinned page marker should become dirty")) return false;
+
+    const auto rejected = pool.DeletePage(page_id);
+    if (!Check(rejected.code() == oursql::ErrorCode::InvalidArgument,
+               "Deleting a pinned page must return InvalidArgument")) return false;
+    if (!Check(rejected.message().find("被 pin 的页面不能删除") != std::string::npos,
+               "Pinned delete error should explain the stable contract")) return false;
+    if (!Check(guard.Data()[100] == std::byte{0x5A} &&
+                   guard.Data()[101] == std::byte{0xC3},
+               "Rejected delete must preserve page bytes and the live guard")) return false;
+  }
+
+  {
+    auto fetched = pool.FetchPage(page_id);
+    if (!Check(fetched.ok(), "Rejected page should remain fetchable")) return false;
+    auto guard = std::move(fetched.value());
+    if (!Check(guard.Data()[100] == std::byte{0x5A} &&
+                   guard.Data()[101] == std::byte{0xC3},
+               "Rejected page should retain its marker")) return false;
+  }
+  if (!Check(pool.DeletePage(page_id).ok(), "Delete should succeed after guards release")) {
+    return false;
+  }
+  {
+    auto reused = pool.NewPage();
+    if (!Check(reused.ok() && reused.value().PageId() == page_id,
+               "NewPage should immediately reuse the deleted page id")) return false;
+  }
+  return Check(pool.Close().ok() && disk.Close().ok(),
+               "Pinned delete test should close cleanly");
+}
+
+bool TestBufferPoolDeletePersistsFreeListAcrossRestart() {
+  TempDb temp;
+  oursql::page_id_t released_page = oursql::INVALID_PAGE_ID;
+  {
+    oursql::DiskManager disk;
+    if (!OpenDb(disk, temp.path)) return false;
+    oursql::BufferPoolManager pool(2, &disk);
+    {
+      auto created = pool.NewPage();
+      if (!Check(created.ok(), "NewPage should succeed before restart")) return false;
+      released_page = created.value().PageId();
+    }
+    if (!Check(pool.DeletePage(released_page).ok(),
+               "Unpinned page should be deleted before restart")) return false;
+    if (!Check(pool.Close().ok() && disk.Close().ok(),
+               "Free-list persistence setup should close cleanly")) return false;
+  }
+  {
+    oursql::DiskManager disk;
+    if (!OpenDb(disk, temp.path)) return false;
+    oursql::BufferPoolManager pool(2, &disk);
+    auto reused = pool.NewPage();
+    if (!Check(reused.ok() && reused.value().PageId() == released_page,
+               "Restarted NewPage should reuse the persisted free page")) return false;
+    return Check(pool.Close().ok() && disk.Close().ok(),
+                 "Free-list restart test should close cleanly");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -749,6 +823,10 @@ int main() {
   run("Free frame list and policy contrast", &TestFreeFrameListAndPolicyContrast);
   run("Dirty and clean eviction", &TestDirtyAndCleanEviction);
   run("Page guards and explicit errors", &TestGuardAndExplicitErrors);
+  run("Pinned delete preserves page and allows reuse",
+      &TestPinnedDeletePreservesPageAndAllowsReuse);
+  run("Buffer pool delete persists free list across restart",
+      &TestBufferPoolDeletePersistsFreeListAcrossRestart);
 
   if (failures == 0) {
     std::cout << "All storage tests passed\n";

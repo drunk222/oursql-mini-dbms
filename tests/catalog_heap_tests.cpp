@@ -4,12 +4,14 @@
 #include "oursql/storage/heap_table.h"
 #include "oursql/storage/row_codec.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -433,6 +435,316 @@ bool TestIndexManagerBuildMaintainAndDrop() {
   return true;
 }
 
+bool TestHeapTableDestroySinglePageAndPinnedRetry() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "Destroy test database should open")) return false;
+  oursql::BufferPoolManager pool(3, &disk);
+  oursql::page_id_t first_page = oursql::INVALID_PAGE_ID;
+  {
+    auto created = pool.NewPageGuarded();
+    if (!Check(created.ok(), "Destroy test data page should allocate")) return false;
+    auto page = std::move(created.value());
+    first_page = page.PageId();
+    if (!Check(oursql::SlottedPage::Initialize(page).ok(),
+               "Destroy test data page should initialize")) return false;
+  }
+  oursql::HeapTable table(
+      &pool, oursql::TableMetadata{"orphan_single",
+                                   oursql::Schema{{"value", oursql::DataType::Int}},
+                                   first_page});
+  {
+    auto external = pool.FetchPage(first_page);
+    if (!Check(external.ok(), "External guard should pin the table page")) return false;
+    const auto rejected = table.Destroy();
+    if (!Check(rejected.code() == oursql::ErrorCode::InvalidArgument &&
+                   rejected.message().find("被 pin 的页面不能删除") != std::string::npos,
+               "Destroy should propagate the pinned-page contract")) return false;
+  }
+  if (!Check(table.Destroy().ok(), "Destroy should succeed after the external guard releases")) {
+    return false;
+  }
+  {
+    auto reused = pool.NewPage();
+    if (!Check(reused.ok() && reused.value().PageId() == first_page,
+               "Single-page Destroy should make the page immediately reusable")) return false;
+  }
+  return Check(pool.Close().ok() && disk.Close().ok(),
+               "Single-page Destroy test should close cleanly");
+}
+
+bool TestHeapTableDestroyMultiplePages() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "Multi-page Destroy database should open")) return false;
+  oursql::BufferPoolManager pool(4, &disk);
+  oursql::page_id_t first_page = oursql::INVALID_PAGE_ID;
+  {
+    auto created = pool.NewPageGuarded();
+    if (!Check(created.ok(), "Multi-page first data page should allocate")) return false;
+    auto page = std::move(created.value());
+    first_page = page.PageId();
+    if (!Check(oursql::SlottedPage::Initialize(page).ok(),
+               "Multi-page first data page should initialize")) return false;
+  }
+  const oursql::Schema schema{{"id", oursql::DataType::Int},
+                              {"payload", oursql::DataType::Varchar, 512}};
+  oursql::HeapTable table(
+      &pool, oursql::TableMetadata{"orphan_multi", schema, first_page});
+  for (std::int64_t key = 0; key < 120; ++key) {
+    auto inserted = table.InsertRow(
+        {oursql::Value(key), oursql::Value(std::string(300, static_cast<char>('a' + key % 26)))});
+    if (!Check(inserted.ok(), "Rows should fill multiple HeapTable pages")) return false;
+  }
+  auto scanned = table.Scan();
+  if (!Check(scanned.ok(), "Multi-page HeapTable should scan before Destroy")) return false;
+  std::unordered_set<oursql::page_id_t> table_pages;
+  for (const auto &entry : scanned.value()) table_pages.insert(entry.first.page_id);
+  if (!Check(table_pages.size() > 1, "Destroy test must actually span multiple pages")) {
+    return false;
+  }
+  const auto file_size_before = std::filesystem::file_size(temp.path);
+  if (!Check(table.Destroy().ok(), "Multi-page HeapTable Destroy should succeed")) return false;
+
+  std::unordered_set<oursql::page_id_t> reused_pages;
+  for (std::size_t i = 0; i < table_pages.size(); ++i) {
+    auto reused = pool.NewPage();
+    if (!Check(reused.ok(), "Every destroyed table page should be reusable")) return false;
+    reused_pages.insert(reused.value().PageId());
+  }
+  if (!Check(reused_pages == table_pages,
+             "NewPage should reuse the complete destroyed data-page set")) return false;
+  if (!Check(std::filesystem::file_size(temp.path) == file_size_before,
+             "Reusing destroyed table pages must not grow the file")) return false;
+  return Check(pool.Close().ok() && disk.Close().ok(),
+               "Multi-page Destroy test should close cleanly");
+}
+
+bool TestHeapTableDestroyMiddlePinnedIsAllOrNothing() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "Middle-pinned Destroy database should open")) {
+    return false;
+  }
+  oursql::BufferPoolManager pool(4, &disk);
+  std::vector<oursql::page_id_t> pages;
+  for (int i = 0; i < 3; ++i) {
+    auto created = pool.NewPageGuarded();
+    if (!Check(created.ok(), "Three-page Destroy chain should allocate")) return false;
+    auto page = std::move(created.value());
+    pages.push_back(page.PageId());
+    if (!Check(oursql::SlottedPage::Initialize(page).ok(),
+               "Three-page Destroy chain page should initialize")) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i + 1 < pages.size(); ++i) {
+    auto linked = pool.FetchPageWrite(pages[i]);
+    if (!Check(linked.ok(), "Three-page Destroy chain page should be writable")) return false;
+    auto page = std::move(linked.value());
+    if (!Check(oursql::SlottedPage::SetNextPageId(page, pages[i + 1]).ok(),
+               "Three-page Destroy chain should link pages")) {
+      return false;
+    }
+  }
+
+  oursql::HeapTable table(
+      &pool, oursql::TableMetadata{"middle_pinned",
+                                   oursql::Schema{{"value", oursql::DataType::Int}}, pages[0]});
+  const auto file_size_before = std::filesystem::file_size(temp.path);
+  {
+    auto pinned_result = pool.FetchPage(pages[1]);
+    if (!Check(pinned_result.ok(), "Middle page should be pinned for regression test")) {
+      return false;
+    }
+    auto pinned = std::move(pinned_result.value());
+    const auto rejected = table.Destroy();
+    if (!Check(rejected.code() == oursql::ErrorCode::InvalidArgument &&
+                   rejected.message().find(u8"被 pin 的页面不能删除") != std::string::npos,
+               "Destroy should reject a pinned middle page before deleting anything")) {
+      return false;
+    }
+
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+      auto fetched = pool.FetchPage(pages[i]);
+      if (!Check(fetched.ok(), "Pinned Destroy failure must keep every page present")) {
+        return false;
+      }
+      auto page = std::move(fetched.value());
+      if (!Check(oursql::SlottedPage::Validate(page).ok(),
+                 "Pinned Destroy failure must keep every page valid")) {
+        return false;
+      }
+      auto next = oursql::SlottedPage::NextPageId(page);
+      const auto expected = i + 1 < pages.size() ? pages[i + 1] : oursql::INVALID_PAGE_ID;
+      if (!Check(next.ok() && next.value() == expected,
+                 "Pinned Destroy failure must preserve the complete page chain")) {
+        return false;
+      }
+    }
+  }
+
+  for (std::size_t i = 0; i < pages.size(); ++i) {
+    auto fetched = pool.FetchPage(pages[i]);
+    if (!Check(fetched.ok(), "Released middle pin should leave every page fetchable")) {
+      return false;
+    }
+    auto page = std::move(fetched.value());
+    if (!Check(oursql::SlottedPage::Validate(page).ok(),
+               "Released middle pin should leave every page valid")) {
+      return false;
+    }
+    auto next = oursql::SlottedPage::NextPageId(page);
+    const auto expected = i + 1 < pages.size() ? pages[i + 1] : oursql::INVALID_PAGE_ID;
+    if (!Check(next.ok() && next.value() == expected,
+               "Released middle pin should preserve the complete page chain")) {
+      return false;
+    }
+  }
+  if (!Check(table.Destroy().ok(), "Destroy should succeed after releasing the middle pin")) {
+    return false;
+  }
+
+  std::unordered_set<oursql::page_id_t> reused;
+  for (std::size_t i = 0; i < pages.size(); ++i) {
+    auto created = pool.NewPage();
+    if (!Check(created.ok(), "Destroyed pages should all return to the Free List")) return false;
+    reused.insert(created.value().PageId());
+  }
+  if (!Check(reused.size() == pages.size() &&
+                 std::all_of(pages.begin(), pages.end(), [&](oursql::page_id_t page_id) {
+                   return reused.count(page_id) != 0;
+                 }),
+             "Destroyed three-page chain should be completely reusable")) {
+    return false;
+  }
+  if (!Check(std::filesystem::file_size(temp.path) == file_size_before,
+             "Reusing destroyed pages must not expand the database file")) {
+    return false;
+  }
+  return Check(pool.Close().ok() && disk.Close().ok(),
+               "Middle-pinned Destroy test should close cleanly");
+}
+
+bool TestHeapTableDestroyRejectsCycleBeforeDeleting() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "Cycle Destroy database should open")) return false;
+  oursql::BufferPoolManager pool(3, &disk);
+  oursql::page_id_t first = oursql::INVALID_PAGE_ID;
+  oursql::page_id_t second = oursql::INVALID_PAGE_ID;
+  {
+    auto page_result = pool.NewPageGuarded();
+    if (!page_result.ok()) return false;
+    auto page = std::move(page_result.value());
+    first = page.PageId();
+    if (!oursql::SlottedPage::Initialize(page).ok()) return false;
+  }
+  {
+    auto page_result = pool.NewPageGuarded();
+    if (!page_result.ok()) return false;
+    auto page = std::move(page_result.value());
+    second = page.PageId();
+    if (!oursql::SlottedPage::Initialize(page, first).ok()) return false;
+  }
+  {
+    auto page_result = pool.FetchPageWrite(first);
+    if (!page_result.ok()) return false;
+    auto page = std::move(page_result.value());
+    if (!oursql::SlottedPage::SetNextPageId(page, second).ok()) return false;
+  }
+  oursql::HeapTable table(
+      &pool, oursql::TableMetadata{"cyclic", oursql::Schema{{"value", oursql::DataType::Int}},
+                                   first});
+  const auto rejected = table.Destroy();
+  if (!Check(rejected.code() == oursql::ErrorCode::InvalidArgument,
+             "Destroy should reject a cyclic data-page chain")) return false;
+  {
+    auto first_page = pool.FetchPage(first);
+    auto second_page = pool.FetchPage(second);
+    if (!Check(first_page.ok() && second_page.ok(),
+               "Cycle validation failure must occur before deleting any page")) return false;
+  }
+  {
+    auto page_result = pool.FetchPageWrite(second);
+    if (!page_result.ok()) return false;
+    auto page = std::move(page_result.value());
+    if (!oursql::SlottedPage::SetNextPageId(page, oursql::INVALID_PAGE_ID).ok()) return false;
+  }
+  if (!Check(table.Destroy().ok(), "Destroy should succeed after repairing the cycle")) {
+    return false;
+  }
+  return Check(pool.Close().ok() && disk.Close().ok(),
+               "Cycle Destroy test should close cleanly");
+}
+
+bool TestDropIndexReusesAllPagesAcrossRestart() {
+  TempDb temp;
+  std::uintmax_t page_count_before = 0;
+  std::uintmax_t page_count_after = 0;
+  {
+    oursql::DiskManager disk;
+    if (!Check(disk.Open(temp.path).ok(), "Drop-index reclaim database should open")) return false;
+    oursql::BufferPoolManager pool(6, &disk);
+    oursql::Catalog catalog(&pool, &disk);
+    if (!Check(catalog.Open().ok(), "Drop-index reclaim Catalog should open")) return false;
+    if (!Check(catalog.CreateTable(oursql::TableMetadata{
+                   "student", UserSchema(), oursql::INVALID_PAGE_ID}).ok(),
+               "Drop-index reclaim table should be created")) return false;
+    auto metadata = catalog.GetTableMetadata("student");
+    if (!metadata.ok()) return false;
+    oursql::HeapTable table(&pool, *metadata.value());
+    for (std::int64_t key = 0; key < 1000; ++key) {
+      auto inserted = table.InsertRow(
+          {oursql::Value(key), oursql::Value("student_" + std::to_string(key))});
+      if (!Check(inserted.ok(), "Drop-index reclaim rows should insert")) return false;
+    }
+    if (!Check(pool.FlushAllPages().ok(), "Table pages should flush before index measurement")) {
+      return false;
+    }
+    page_count_before = std::filesystem::file_size(temp.path) / oursql::Page::kSize;
+
+    oursql::IndexManager indexes(&catalog, &pool);
+    if (!Check(indexes.CreateIndex("idx_student_id", "student", "id", true).ok(),
+               "Drop-index reclaim index should be created")) return false;
+    if (!Check(pool.FlushAllPages().ok(), "Index pages should flush before measurement")) {
+      return false;
+    }
+    page_count_after = std::filesystem::file_size(temp.path) / oursql::Page::kSize;
+    if (!Check(page_count_after > page_count_before,
+               "Creating the index should allocate additional pages")) return false;
+    if (!Check(indexes.DropIndex("idx_student_id").ok() &&
+                   !catalog.HasIndex("idx_student_id"),
+               "DropIndex should remove metadata and destroy the tree")) return false;
+    if (!Check(pool.Close().ok() && disk.Close().ok(),
+               "Drop-index reclaim first lifetime should close cleanly")) return false;
+  }
+
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "Drop-index reclaim database should reopen")) return false;
+  oursql::BufferPoolManager pool(6, &disk);
+  oursql::Catalog catalog(&pool, &disk);
+  if (!Check(catalog.Open().ok() && !catalog.HasIndex("idx_student_id"),
+             "Dropped index metadata must stay absent after restart")) return false;
+
+  std::unordered_set<oursql::page_id_t> expected;
+  for (std::uintmax_t page = page_count_before; page < page_count_after; ++page) {
+    expected.insert(static_cast<oursql::page_id_t>(page));
+  }
+  std::unordered_set<oursql::page_id_t> reused;
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    auto page = pool.NewPage();
+    if (!Check(page.ok(), "Every dropped index page should be reallocated")) return false;
+    reused.insert(page.value().PageId());
+  }
+  if (!Check(reused == expected,
+             "Reallocated page ids should equal the complete dropped-index range")) return false;
+  if (!Check(std::filesystem::file_size(temp.path) == page_count_after * oursql::Page::kSize,
+             "Reallocating dropped-index pages must not grow the file")) return false;
+  return Check(pool.Close().ok() && disk.Close().ok(),
+               "Drop-index reclaim second lifetime should close cleanly");
+}
+
 }  // namespace
 
 int main() {
@@ -449,6 +761,15 @@ int main() {
   run("Oversized records do not allocate pages", &TestOversizedRecordsDoNotAllocatePages);
   run("Index metadata persistence", &TestIndexMetadataPersistence);
   run("IndexManager build maintain and drop", &TestIndexManagerBuildMaintainAndDrop);
+  run("HeapTable Destroy single page and pinned retry",
+      &TestHeapTableDestroySinglePageAndPinnedRetry);
+  run("HeapTable Destroy multiple pages", &TestHeapTableDestroyMultiplePages);
+  run("HeapTable Destroy middle pinned is all-or-nothing",
+      &TestHeapTableDestroyMiddlePinnedIsAllOrNothing);
+  run("HeapTable Destroy rejects cycle before deleting",
+      &TestHeapTableDestroyRejectsCycleBeforeDeleting);
+  run("DropIndex reuses all pages across restart",
+      &TestDropIndexReusesAllPagesAcrossRestart);
   if (failures == 0) {
     std::cout << "All catalog and heap tests passed\n";
     return 0;

@@ -30,9 +30,13 @@ bool IsFrozenSelectShape(const PlanNode &node) {
   if (current == nullptr) return false;
   if (const auto *filter = std::get_if<FilterPlan>(&current->operation)) {
     return filter->child != nullptr &&
-           std::holds_alternative<SeqScanPlan>(filter->child->operation);
+           (std::holds_alternative<SeqScanPlan>(
+                filter->child->operation) ||
+            std::holds_alternative<IndexScanPlan>(
+                filter->child->operation));
   }
-  return std::holds_alternative<SeqScanPlan>(current->operation);
+  return std::holds_alternative<SeqScanPlan>(current->operation) ||
+         std::holds_alternative<IndexScanPlan>(current->operation);
 }
 
 // 判断内层 Project 是否覆盖外层 Project 所需的全部列。
@@ -57,7 +61,8 @@ bool ProjectionCovers(const ProjectPlan &inner, const ProjectPlan &outer) {
 
 }  // namespace
 
-Result<OptimizationResult> Optimizer::OptimizeWithStats(Plan plan) const {
+Result<OptimizationResult> Optimizer::OptimizeWithStats(
+    Plan plan, const std::vector<IndexMetadata> &indexes) const {
   // 非 SELECT 计划当前没有适用规则，但仍返回统一的 stats，使调用方无需区分
   // 计划类型即可记录“执行了一次空优化”。
   OptimizationStats stats;
@@ -96,6 +101,42 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(Plan plan) const {
       }
     }
 
+    // R2：等值 INT 谓词存在匹配索引时，把 SeqScan 替换为 IndexScan。
+    // Filter 节点仍保留，执行时会对索引返回的行再次求值，保证正确性。
+    if (const auto *project =
+            std::get_if<ProjectPlan>(&select->root->operation)) {
+      if (project->child != nullptr) {
+        if (const auto *filter =
+                std::get_if<FilterPlan>(&project->child->operation)) {
+          if (filter->child != nullptr) {
+            if (const auto *scan =
+                    std::get_if<SeqScanPlan>(&filter->child->operation)) {
+              if (filter->predicate.value.IsInt()) {
+                for (const auto &index : indexes) {
+                  if (index.table_name != scan->table_name ||
+                      index.column_name != filter->predicate.column) {
+                    continue;
+                  }
+                  auto index_scan = std::make_shared<PlanNode>(
+                      IndexScanPlan{scan->table_name, index.name,
+                                    index.column_name,
+                                    filter->predicate.value});
+                  auto new_filter = std::make_shared<PlanNode>(
+                      FilterPlan{index_scan, filter->predicate});
+                  select->root = std::make_shared<PlanNode>(
+                      ProjectPlan{new_filter, project->columns,
+                                  project->select_all});
+                  ++stats.rule_hits["R2:等值谓词索引扫描"];
+                  changed = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     // 整轮没有命中说明计划已稳定。passes 会包含这次稳定检查轮。
     if (!changed) break;
   }
@@ -105,7 +146,7 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(Plan plan) const {
   if (!IsFrozenSelectShape(*select->root)) {
     return Result<OptimizationResult>(Status::InternalError(
         "Optimizer: SELECT 的计划树必须固定为 "
-        "Project(OrderBy?(GroupBy?(Filter?(SeqScan))))"));
+        "Project(OrderBy?(GroupBy?(Filter?(SeqScan|IndexScan))))"));
   }
   return Result<OptimizationResult>(
       OptimizationResult{std::move(plan), std::move(stats)});
@@ -113,7 +154,18 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(Plan plan) const {
 
 Result<Plan> Optimizer::Optimize(Plan plan) const {
   // 兼容性入口：普通编译管线只关心 Plan，展示和测试可使用带统计信息的方法。
-  auto result = OptimizeWithStats(std::move(plan));
+  auto result = OptimizeWithStats(std::move(plan), {});
+  if (!result.ok()) return Result<Plan>(result.status());
+  return Result<Plan>(std::move(result.value().plan));
+}
+
+Result<OptimizationResult> Optimizer::OptimizeWithStats(Plan plan) const {
+  return OptimizeWithStats(std::move(plan), {});
+}
+
+Result<Plan> Optimizer::Optimize(
+    Plan plan, const std::vector<IndexMetadata> &indexes) const {
+  auto result = OptimizeWithStats(std::move(plan), indexes);
   if (!result.ok()) return Result<Plan>(result.status());
   return Result<Plan>(std::move(result.value().plan));
 }

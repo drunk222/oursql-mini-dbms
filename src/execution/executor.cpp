@@ -1,5 +1,7 @@
 #include "oursql/execution/executor.h"
 
+#include "oursql/index/index_manager.h"
+
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -198,7 +200,7 @@ Result<Value> EvaluateUpdateExpression(const CompileExprPtr &expression,
                 "UPDATE SET 整数运算溢出"));
           }
           return Result<Value>(Value(-operand.value().AsInt()));
-        } else {
+        } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
           auto left = EvaluateUpdateExpression(node.left, row, schema);
           if (!left.ok()) return left;
           auto right = EvaluateUpdateExpression(node.right, row, schema);
@@ -245,6 +247,11 @@ Result<Value> EvaluateUpdateExpression(const CompileExprPtr &expression,
                                            : "UPDATE SET 整数运算溢出"));
           }
           return Result<Value>(Value(value));
+        } else {
+          // BETWEEN、IN 和聚合属于 SELECT/HAVING 编译层谓词，UPDATE SET
+          // 尚未提供这些值语义，必须显式拒绝。
+          return Result<Value>(Status::NotImplemented(
+              "UPDATE SET 暂不支持 BETWEEN、IN 或聚合表达式"));
         }
       },
       expression->data);
@@ -281,9 +288,25 @@ Result<ExecutionResult> InsertExecutor::Execute(const InsertPlan &plan) const {
   auto metadata = RequireMetadata(catalog_, plan.table_name);
   if (!metadata.ok()) return Result<ExecutionResult>(Contextualize("InsertExecutor", metadata.status()));
   // Catalog 给出 schema 与首数据页；HeapTable 用它们定位物理表。
+  // 数据库执行层当前只保留原有“单行、按 Schema 全列顺序”的写入路径。
+  // 指定列和多行 INSERT 已完成 AST、语义检查和 InsertPlan 表达，但在没有
+  // 默认值/批量写入语义前必须显式拒绝，不能把部分列或后续行静默丢弃。
+  if (!plan.columns.empty() || plan.rows.size() != 1) {
+    return Result<ExecutionResult>(Status::NotImplemented(
+        "指定列或多行 INSERT 仅编译层支持，未接入数据库执行"));
+  }
+
   HeapTable table(buffer_pool_, *metadata.value());
-  auto rid = table.InsertRow(plan.values);
+  auto rid = table.InsertRow(plan.rows.front());
   if (!rid.ok()) return Result<ExecutionResult>(Contextualize("InsertExecutor", rid.status()));
+  IndexManager index_manager(catalog_, buffer_pool_);
+  auto index_status =
+      index_manager.OnInsert(plan.table_name, plan.rows.front(), rid.value());
+  if (!index_status.ok()) {
+    (void)table.DeleteRow(rid.value());
+    return Result<ExecutionResult>(
+        Contextualize("InsertExecutor", index_status));
+  }
   ExecutionResult result;
   result.affected_rows = 1;
   result.rids.push_back(rid.value());
@@ -433,6 +456,7 @@ Result<ExecutionResult> DeleteExecutor::Execute(const DeletePlan &plan) const {
   }
 
   ExecutionResult result;
+  IndexManager index_manager(catalog_, buffer_pool_);
   // 先扫描取得 RID，再删除。不能只拿 Row 值删除，因为相同内容的行可出现多次。
   while (true) {
     auto entry = cursor.value().Next();
@@ -442,8 +466,19 @@ Result<ExecutionResult> DeleteExecutor::Execute(const DeletePlan &plan) const {
     const bool matches = !predicate_index.has_value() ||
                          row_entry.second[predicate_index.value()] == plan.where->value;
     if (!matches) continue;
+    auto index_status =
+        index_manager.OnDelete(plan.table_name, row_entry.second,
+                               row_entry.first);
+    if (!index_status.ok()) {
+      return Result<ExecutionResult>(
+          Contextualize("DeleteExecutor", index_status));
+    }
     auto status = table.DeleteRow(row_entry.first);
-    if (!status.ok()) return Result<ExecutionResult>(Contextualize("DeleteExecutor", status));
+    if (!status.ok()) {
+      (void)index_manager.OnInsert(plan.table_name, row_entry.second,
+                                   row_entry.first);
+      return Result<ExecutionResult>(Contextualize("DeleteExecutor", status));
+    }
     ++result.affected_rows;
   }
   return Result<ExecutionResult>(std::move(result));
@@ -483,7 +518,12 @@ Result<ExecutionResult> UpdateExecutor::Execute(const UpdatePlan &plan) const {
   if (!cursor.ok()) {
     return Result<ExecutionResult>(Contextualize("UpdateExecutor", cursor.status()));
   }
-  std::vector<RowEntry> replacements;
+  struct Replacement {
+    RID old_rid;
+    Row old_row;
+    Row new_row;
+  };
+  std::vector<Replacement> replacements;
   while (true) {
     auto entry = cursor.value().Next();
     if (!entry.ok()) {
@@ -515,18 +555,32 @@ Result<ExecutionResult> UpdateExecutor::Execute(const UpdatePlan &plan) const {
       }
       updated[assignment_indexes[i]] = std::move(value.value());
     }
-    replacements.emplace_back(original.first, std::move(updated));
+    replacements.push_back(
+        Replacement{original.first, original.second, std::move(updated)});
   }
 
   ExecutionResult result;
+  IndexManager index_manager(catalog_, buffer_pool_);
   for (const auto &replacement : replacements) {
-    auto new_rid = table.InsertRow(replacement.second);
+    auto new_rid = table.InsertRow(replacement.new_row);
     if (!new_rid.ok()) {
       return Result<ExecutionResult>(
           Contextualize("UpdateExecutor", new_rid.status()));
     }
-    auto delete_status = table.DeleteRow(replacement.first);
+    auto index_status =
+        index_manager.OnUpdate(plan.table_name, replacement.old_row,
+                               replacement.old_rid, replacement.new_row,
+                               new_rid.value());
+    if (!index_status.ok()) {
+      (void)table.DeleteRow(new_rid.value());
+      return Result<ExecutionResult>(
+          Contextualize("UpdateExecutor", index_status));
+    }
+    auto delete_status = table.DeleteRow(replacement.old_rid);
     if (!delete_status.ok()) {
+      (void)index_manager.OnUpdate(plan.table_name, replacement.new_row,
+                                   new_rid.value(), replacement.old_row,
+                                   replacement.old_rid);
       (void)table.DeleteRow(new_rid.value());
       return Result<ExecutionResult>(
           Contextualize("UpdateExecutor", delete_status));
@@ -547,6 +601,33 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
   }
 
   // 把逻辑计划树转换成可按 Next() 拉取数据的 RowSource 管道。
+  // DISTINCT 和 LIMIT 位于 SELECT 根计划修饰位。Parser/Planner 已完成语法和
+  // 语义表达，但当前 RowSource 链尚未提供去重与截断算子，必须显式拒绝。
+  if (plan.distinct || plan.limit.has_value()) {
+    return Result<SourcePlan>(Status::NotImplemented(
+        "DISTINCT/LIMIT 仅编译层支持，未接入数据库执行"));
+  }
+
+  // 聚合和 HAVING 已完成编译层类型/分组检查，但执行层尚无聚合状态和分组
+  // 过滤流程，必须显式拒绝。
+  if (plan.has_aggregates || plan.having != nullptr) {
+    return Result<SourcePlan>(Status::NotImplemented(
+        "聚合函数/HAVING 仅编译层支持，未接入数据库执行"));
+  }
+
+  // AS 别名已进入 SelectPlan，但当前单表执行链没有别名解析和输出重命名
+  // 逻辑，因此显式拒绝，避免忽略别名后产生看似成功的结果。
+  if (!plan.table_alias.empty()) {
+    return Result<SourcePlan>(Status::NotImplemented(
+        "表别名仅编译层支持，未接入数据库执行"));
+  }
+  for (const auto &alias : plan.projection_aliases) {
+    if (!alias.empty()) {
+      return Result<SourcePlan>(Status::NotImplemented(
+          "列别名仅编译层支持，未接入数据库执行"));
+    }
+  }
+
   std::function<Result<SourcePlan>(const std::shared_ptr<const PlanNode> &)> build_node;
   build_node = [&](const std::shared_ptr<const PlanNode> &node) -> Result<SourcePlan> {
     if (node == nullptr) return Result<SourcePlan>(Status::InvalidArgument("执行计划包含空算子"));
@@ -561,6 +642,40 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
             std::vector<std::string> names;
             for (const auto &column : metadata.value()->schema.columns()) names.push_back(column.name);
             return Result<SourcePlan>(SourcePlan{std::move(source.value()), std::move(names)});
+          } else if constexpr (std::is_same_v<Type, IndexScanPlan>) {
+            if (!operation.key.IsInt()) {
+              return Result<SourcePlan>(Status::TypeMismatch(
+                  "IndexScan 只支持 INT 等值键"));
+            }
+            auto index_metadata = catalog_->FindIndex(operation.index_name);
+            if (!index_metadata.ok()) {
+              return Result<SourcePlan>(index_metadata.status());
+            }
+            if (index_metadata.value()->table_name != operation.table_name ||
+                index_metadata.value()->column_name != operation.column_name) {
+              return Result<SourcePlan>(Status::InvalidArgument(
+                  "IndexScan 索引元数据与计划不匹配"));
+            }
+            IndexManager index_manager(catalog_, buffer_pool_);
+            auto rids = index_manager.Lookup(operation.index_name,
+                                             operation.key.AsInt());
+            if (!rids.ok()) return Result<SourcePlan>(rids.status());
+            HeapTable table(buffer_pool_, *metadata.value());
+            std::vector<RowEntry> rows;
+            rows.reserve(rids.value().size());
+            for (const auto &rid : rids.value()) {
+              auto row = table.GetRow(rid);
+              if (!row.ok()) return Result<SourcePlan>(row.status());
+              rows.emplace_back(rid, std::move(row.value()));
+            }
+            std::vector<std::string> names;
+            for (const auto &column : metadata.value()->schema.columns()) {
+              names.push_back(column.name);
+            }
+            std::unique_ptr<RowSource> source =
+                std::make_unique<MaterializedSource>(std::move(rows));
+            return Result<SourcePlan>(
+                SourcePlan{std::move(source), std::move(names)});
           } else if constexpr (std::is_same_v<Type, FilterPlan>) {
             auto child = build_node(operation.child);
             if (!child.ok()) return Result<SourcePlan>(child.status());
@@ -640,6 +755,33 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
             result.rids.push_back(row_entry.first);
             result.rows.push_back(std::move(row_entry.second));
           }
+          return Result<ExecutionResult>(std::move(result));
+        } else if constexpr (std::is_same_v<Type, DropTablePlan>) {
+          return Result<ExecutionResult>(Status::NotImplemented(
+              "DROP TABLE 仅编译层支持，未接入数据库执行"));
+        } else if constexpr (std::is_same_v<Type, CreateIndexPlan>) {
+          auto status = IndexManager(catalog_, buffer_pool_)
+                            .CreateIndex(operation.index_name,
+                                         operation.table_name,
+                                         operation.column_name,
+                                         operation.is_unique);
+          if (!status.ok()) {
+            return Result<ExecutionResult>(
+                Contextualize("CreateIndexExecutor", status));
+          }
+          return Result<ExecutionResult>(ExecutionResult{});
+        } else if constexpr (std::is_same_v<Type, DropIndexPlan>) {
+          auto status =
+              IndexManager(catalog_, buffer_pool_).DropIndex(operation.index_name);
+          if (!status.ok()) {
+            return Result<ExecutionResult>(
+                Contextualize("DropIndexExecutor", status));
+          }
+          return Result<ExecutionResult>(ExecutionResult{});
+        } else if constexpr (std::is_same_v<Type, ExplainPlan>) {
+          ExecutionResult result;
+          result.column_names = {"plan"};
+          result.rows.push_back({Value(ToString(operation.select))});
           return Result<ExecutionResult>(std::move(result));
         } else if constexpr (std::is_same_v<Type, UpdatePlan>) {
           return UpdateExecutor(catalog_, buffer_pool_).Execute(operation);

@@ -36,6 +36,10 @@ class CatalogView {
 
   // 调用者：Planner 等只读模块；作用：按表名读取元信息；返回：找到则返回只读指针，否则返回错误。
   virtual Result<const TableInfo *> FindTable(std::string_view table_name) const = 0;
+
+  // 调用者：Planner/Optimizer；作用：读取指定表的索引定义；返回：索引元数据副本。
+  virtual std::vector<IndexMetadata> ListTableIndexes(
+      std::string_view table_name) const = 0;
 };
 
 using CatalogReader = CatalogView;
@@ -92,7 +96,8 @@ class Catalog final : public CatalogView {
   [[nodiscard]] std::vector<IndexMetadata> ListIndexes() const;
 
   // 调用者：优化器或测试；作用：列出指定表的索引；返回：索引元数据副本。
-  [[nodiscard]] std::vector<IndexMetadata> ListTableIndexes(std::string_view table_name) const;
+  [[nodiscard]] std::vector<IndexMetadata> ListTableIndexes(
+      std::string_view table_name) const override;
 
  private:
   [[nodiscard]] Status AppendCatalogRecord(const std::vector<std::byte> &record);

@@ -32,6 +32,27 @@ std::string PredicateText(const Predicate &predicate) {
   return predicate.column + "=" + QuoteValue(predicate.value);
 }
 
+std::string AggregateName(CompileAggregateKind kind) {
+  switch (kind) {
+    case CompileAggregateKind::Count: return "count";
+    case CompileAggregateKind::Sum: return "sum";
+    case CompileAggregateKind::Avg: return "avg";
+    case CompileAggregateKind::Max: return "max";
+    case CompileAggregateKind::Min: return "min";
+  }
+  return "unknown";
+}
+
+std::optional<CompileAggregateKind> AggregateKindFromName(
+    std::string_view name) {
+  if (name == "count") return CompileAggregateKind::Count;
+  if (name == "sum") return CompileAggregateKind::Sum;
+  if (name == "avg") return CompileAggregateKind::Avg;
+  if (name == "max") return CompileAggregateKind::Max;
+  if (name == "min") return CompileAggregateKind::Min;
+  return std::nullopt;
+}
+
 std::string CompileExprText(const CompileExprPtr &expr) {
   if (expr == nullptr) return "<null>";
   return std::visit(
@@ -50,8 +71,25 @@ std::string CompileExprText(const CompileExprPtr &expr) {
         } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
           return "(" + CompileExprText(value.left) + " " + value.op + " " +
                  CompileExprText(value.right) + ")";
-        } else {
+        } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
           return "(" + value.op + " " + CompileExprText(value.operand) + ")";
+        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
+          return "(" + CompileExprText(value.operand) + " " +
+                 (value.negated ? "not between " : "between ") +
+                 CompileExprText(value.lower) + " and " +
+                 CompileExprText(value.upper) + ")";
+        } else if constexpr (std::is_same_v<Type, CompileInExpr>) {
+          std::string result = "(" + CompileExprText(value.operand) + " " +
+                               (value.negated ? "not in (" : "in (");
+          for (std::size_t i = 0; i < value.options.size(); ++i) {
+            if (i != 0) result += ", ";
+            result += CompileExprText(value.options[i]);
+          }
+          return result + "))";
+        } else {
+          std::string result = AggregateName(value.kind) + "(";
+          result += value.star ? "*" : CompileExprText(value.argument);
+          return result + ")";
         }
       },
       expr->data);
@@ -85,7 +123,9 @@ class ParserImpl {
  private:
   // 返回当前 Token。调用者不能保存该引用到下一次 Match/Expect 之后，
   // 因为 index_ 可能移动。
-  const Token &Peek() const { return tokens_[index_]; }
+  const Token &Peek(std::size_t lookahead = 0) const {
+    return tokens_[index_ + lookahead];
+  }
 
   // 仅在确认 index_ > 0 后读取上一个已消费 Token，用于取得 Match 的 lexeme。
   const Token &Previous() const { return tokens_[index_ - 1]; }
@@ -177,6 +217,64 @@ class ParserImpl {
         CompileExpr::Data(CompileUnaryExpr{std::move(op), std::move(operand)}));
   }
 
+  CompileExprPtr MakeBetween(bool negated, CompileExprPtr operand,
+                             CompileExprPtr lower, CompileExprPtr upper) {
+    return std::make_shared<CompileExpr>(CompileExpr::Data(
+        CompileBetweenExpr{std::move(operand), std::move(lower),
+                           std::move(upper), negated}));
+  }
+
+  CompileExprPtr MakeIn(bool negated, CompileExprPtr operand,
+                        std::vector<CompileExprPtr> options) {
+    return std::make_shared<CompileExpr>(CompileExpr::Data(
+        CompileInExpr{std::move(operand), std::move(options), negated}));
+  }
+
+  CompileExprPtr MakeAggregate(CompileAggregateKind kind, bool star,
+                               CompileExprPtr argument) {
+    return std::make_shared<CompileExpr>(CompileExpr::Data(
+        CompileAggregateExpr{kind, star, std::move(argument)}));
+  }
+
+  bool IsAggregateCall() const {
+    return Peek().type == TokenType::Identifier &&
+           Peek(1).type == TokenType::LeftParen &&
+           AggregateKindFromName(Peek().lexeme).has_value();
+  }
+
+  Result<CompileExprPtr> ParseAggregateExpr() {
+    auto function = ExpectIdentifier("聚合函数名");
+    if (!function.ok()) return Result<CompileExprPtr>(function.status());
+    const auto kind = AggregateKindFromName(function.value());
+    if (!kind.has_value()) {
+      return Result<CompileExprPtr>(Status::InvalidArgument(
+          "未知聚合函数: " + function.value() + "，位置 " +
+          std::to_string(Previous().line) + ":" +
+          std::to_string(Previous().column)));
+    }
+    auto left = Expect(TokenType::LeftParen, "聚合函数后的 '('");
+    if (!left.ok()) return Result<CompileExprPtr>(left.status());
+
+    bool star = Match(TokenType::Star);
+    CompileExprPtr argument;
+    if (!star) {
+      auto expression = ParseCompileExpr();
+      if (!expression.ok()) return expression;
+      argument = std::move(expression.value());
+    }
+    auto right = Expect(TokenType::RightParen, "聚合函数后的 ')'");
+    if (!right.ok()) return Result<CompileExprPtr>(right.status());
+    return Result<CompileExprPtr>(
+        MakeAggregate(*kind, star, std::move(argument)));
+  }
+
+  Result<CompileExprPtr> ParseSelectItem() {
+    if (IsAggregateCall()) return ParseAggregateExpr();
+    auto column = ExpectIdentifier("SELECT 后的列名或聚合函数");
+    if (!column.ok()) return Result<CompileExprPtr>(column.status());
+    return Result<CompileExprPtr>(MakeColumnExpr(std::move(column.value())));
+  }
+
   static bool IsComparisonType(TokenType type) {
     return type == TokenType::Equal || type == TokenType::NotEqual ||
            type == TokenType::Greater || type == TokenType::GreaterEqual ||
@@ -228,7 +326,8 @@ class ParserImpl {
   }
 
   Result<CompileExprPtr> ParseCompileComparison() {
-    // 当前比较运算只解析一次，不形成类似 a < b < c 的链式比较。
+    // 比较层同时处理普通比较符、BETWEEN、IN 和 LIKE。普通比较只解析一次，
+    // 不形成类似 a < b < c 的链式比较；BETWEEN/IN/LIKE 前可带 NOT。
     auto left = ParseCompileAdditive();
     if (!left.ok()) return left;
     if (IsComparisonType(Peek().type)) {
@@ -238,6 +337,51 @@ class ParserImpl {
       if (!right.ok()) return right;
       left.value() = MakeBinary(operation.value().lexeme, left.value(),
                                 right.value());
+    }
+
+    bool negated = false;
+    if (Peek().type == TokenType::Not &&
+        (Peek(1).type == TokenType::Between ||
+         Peek(1).type == TokenType::In ||
+         Peek(1).type == TokenType::Like)) {
+      ++index_;
+      negated = true;
+    }
+
+    if (Match(TokenType::Between)) {
+      auto lower = ParseCompileAdditive();
+      if (!lower.ok()) return lower;
+      auto and_token = Expect(TokenType::And, "BETWEEN 后的 AND");
+      if (!and_token.ok()) return Result<CompileExprPtr>(and_token.status());
+      auto upper = ParseCompileAdditive();
+      if (!upper.ok()) return upper;
+      return Result<CompileExprPtr>(MakeBetween(
+          negated, left.value(), lower.value(), upper.value()));
+    }
+
+    if (Match(TokenType::In)) {
+      auto left_paren = Expect(TokenType::LeftParen, "IN 后的 '('");
+      if (!left_paren.ok()) return Result<CompileExprPtr>(left_paren.status());
+      std::vector<CompileExprPtr> options;
+      while (true) {
+        auto option = ParseCompileExpr();
+        if (!option.ok()) return option;
+        options.push_back(std::move(option.value()));
+        if (!Match(TokenType::Comma)) break;
+      }
+      auto right_paren = Expect(TokenType::RightParen, "IN 列表后的 ')'");
+      if (!right_paren.ok()) {
+        return Result<CompileExprPtr>(right_paren.status());
+      }
+      return Result<CompileExprPtr>(
+          MakeIn(negated, left.value(), std::move(options)));
+    }
+
+    if (Match(TokenType::Like)) {
+      auto right = ParseCompileAdditive();
+      if (!right.ok()) return right;
+      return Result<CompileExprPtr>(MakeBinary(
+          negated ? "not like" : "like", left.value(), right.value()));
     }
     return left;
   }
@@ -310,6 +454,7 @@ class ParserImpl {
       return Result<CompileExprPtr>(MakeLiteralExpr(Value(number)));
     }
     if (Peek().type == TokenType::Identifier) {
+      if (IsAggregateCall()) return ParseAggregateExpr();
       auto name = ExpectIdentifier("表达式中的列名");
       if (!name.ok()) return Result<CompileExprPtr>(name.status());
       return Result<CompileExprPtr>(MakeColumnExpr(std::move(name.value())));
@@ -346,6 +491,17 @@ class ParserImpl {
     auto folded = FoldCompileExpr(expression.value());
     return Result<ParsedWhere>(
         ParsedWhere{folded, ExtractPredicate(folded)});
+  }
+
+  Result<Statement> ParseCreate() {
+    // CREATE 分支根据第二个关键字区分 TABLE 和 [UNIQUE] INDEX。
+    if (Peek(1).type == TokenType::Table) return ParseCreateTable();
+    if (Peek(1).type == TokenType::Index ||
+        (Peek(1).type == TokenType::Unique &&
+         Peek(2).type == TokenType::Index)) {
+      return ParseCreateIndex();
+    }
+    return Result<Statement>(Error("TABLE 或 INDEX after CREATE", Peek(1)));
   }
 
   Result<Statement> ParseCreateTable() {
@@ -401,52 +557,125 @@ class ParserImpl {
     return Result<Statement>(std::move(statement));
   }
 
+  Result<Statement> ParseCreateIndex() {
+    // 语法：
+    //   CREATE [UNIQUE] INDEX name ON table(column);
+    auto create = Expect(TokenType::Create, "CREATE");
+    if (!create.ok()) return Result<Statement>(create.status());
+    bool is_unique = Match(TokenType::Unique);
+    auto index = Expect(TokenType::Index, "INDEX");
+    if (!index.ok()) return Result<Statement>(index.status());
+    auto index_name = ExpectIdentifier("索引名");
+    if (!index_name.ok()) return Result<Statement>(index_name.status());
+    auto on = Expect(TokenType::On, "ON");
+    if (!on.ok()) return Result<Statement>(on.status());
+    auto table_name = ExpectIdentifier("ON 后的表名");
+    if (!table_name.ok()) return Result<Statement>(table_name.status());
+    auto left = Expect(TokenType::LeftParen, "'('");
+    if (!left.ok()) return Result<Statement>(left.status());
+    auto column_name = ExpectIdentifier("索引列名");
+    if (!column_name.ok()) return Result<Statement>(column_name.status());
+    auto right = Expect(TokenType::RightParen, "')'");
+    if (!right.ok()) return Result<Statement>(right.status());
+    auto semicolon = Expect(TokenType::Semicolon, "';'");
+    if (!semicolon.ok()) return Result<Statement>(semicolon.status());
+
+    CreateIndexStatement statement{std::move(index_name.value()),
+                                   std::move(table_name.value()),
+                                   std::move(column_name.value()),
+                                   is_unique};
+    statement.location = TokenPosition(create.value());
+    return Result<Statement>(std::move(statement));
+  }
+
   Result<Statement> ParseInsert() {
-    // 语法：INSERT INTO name VALUES (literal [, ...]);
-    // Parser 只负责收集字面量，列数、类型和 VARCHAR 长度由 Planner 校验。
+    // 语法：
+    //   INSERT INTO name [(column [, ...])]
+    //   VALUES (literal [, ...]) [, (...)]...;
+    // Parser 只负责收集目标列和多行字面量，列数、类型和 VARCHAR 长度由
+    // Planner 校验。空目标列和空 VALUES 行都由 Expect 报语法错误。
     auto insert = Expect(TokenType::Insert, "INSERT");
     if (!insert.ok()) return Result<Statement>(insert.status());
     auto into = Expect(TokenType::Into, "INTO");
     if (!into.ok()) return Result<Statement>(into.status());
     auto table_name = ExpectIdentifier("表名");
     if (!table_name.ok()) return Result<Statement>(table_name.status());
+
+    std::vector<std::string> columns;
+    if (Match(TokenType::LeftParen)) {
+      while (true) {
+        auto column = ExpectIdentifier("INSERT 目标列名");
+        if (!column.ok()) return Result<Statement>(column.status());
+        columns.push_back(std::move(column.value()));
+        if (!Match(TokenType::Comma)) break;
+      }
+      auto right_columns = Expect(TokenType::RightParen, "')'");
+      if (!right_columns.ok()) return Result<Statement>(right_columns.status());
+    }
+
     auto values = Expect(TokenType::Values, "VALUES");
     if (!values.ok()) return Result<Statement>(values.status());
-    auto left = Expect(TokenType::LeftParen, "'('");
-    if (!left.ok()) return Result<Statement>(left.status());
 
-    std::vector<Value> literals;
+    std::vector<std::vector<Value>> rows;
     while (true) {
-      auto literal = ParseLiteral();
-      if (!literal.ok()) return Result<Statement>(literal.status());
-      literals.push_back(std::move(literal.value()));
+      auto left = Expect(TokenType::LeftParen, "VALUES 后的 '('");
+      if (!left.ok()) return Result<Statement>(left.status());
+      std::vector<Value> row;
+      while (true) {
+        auto literal = ParseLiteral();
+        if (!literal.ok()) return Result<Statement>(literal.status());
+        row.push_back(std::move(literal.value()));
+        if (!Match(TokenType::Comma)) break;
+      }
+      auto right = Expect(TokenType::RightParen, "')'");
+      if (!right.ok()) return Result<Statement>(right.status());
+      rows.push_back(std::move(row));
       if (!Match(TokenType::Comma)) break;
     }
-    auto right = Expect(TokenType::RightParen, "')'");
-    if (!right.ok()) return Result<Statement>(right.status());
+
     auto semicolon = Expect(TokenType::Semicolon, "';'");
     if (!semicolon.ok()) return Result<Statement>(semicolon.status());
     InsertStatement statement{std::move(table_name.value()),
-                              std::move(literals)};
+                              std::move(columns), std::move(rows)};
     statement.location = TokenPosition(insert.value());
     return Result<Statement>(std::move(statement));
   }
 
   Result<Statement> ParseSelect() {
-    // 语法顺序固定为 SELECT 列表 -> FROM -> WHERE? -> GROUP BY? -> ORDER BY?。
+    // 语法顺序固定为 SELECT [DISTINCT] 列表 -> FROM [AS 表别名]
+    // -> WHERE? -> GROUP BY? -> HAVING? -> ORDER BY? -> LIMIT?。
     auto select = Expect(TokenType::Select, "SELECT");
     if (!select.ok()) return Result<Statement>(select.status());
     SelectStatement statement;
+    if (Match(TokenType::Distinct)) {
+      statement.distinct = true;
+    }
     if (Match(TokenType::Star)) {
       statement.select_all = true;
     } else {
-      auto first = ExpectIdentifier("SELECT 后的列名或 '*'");
+      auto first = ParseSelectItem();
       if (!first.ok()) return Result<Statement>(first.status());
-      statement.projection.push_back(std::move(first.value()));
+      statement.projection_expressions.push_back(first.value());
+      statement.projection.push_back(CompileExprText(first.value()));
+      if (Match(TokenType::As)) {
+        auto alias = ExpectIdentifier("AS 后的列别名");
+        if (!alias.ok()) return Result<Statement>(alias.status());
+        statement.projection_aliases.push_back(std::move(alias.value()));
+      } else {
+        statement.projection_aliases.emplace_back();
+      }
       while (Match(TokenType::Comma)) {
-        auto column = ExpectIdentifier("逗号后的列名");
-        if (!column.ok()) return Result<Statement>(column.status());
-        statement.projection.push_back(std::move(column.value()));
+        auto item = ParseSelectItem();
+        if (!item.ok()) return Result<Statement>(item.status());
+        statement.projection_expressions.push_back(item.value());
+        statement.projection.push_back(CompileExprText(item.value()));
+        if (Match(TokenType::As)) {
+          auto alias = ExpectIdentifier("AS 后的列别名");
+          if (!alias.ok()) return Result<Statement>(alias.status());
+          statement.projection_aliases.push_back(std::move(alias.value()));
+        } else {
+          statement.projection_aliases.emplace_back();
+        }
       }
     }
     auto from = Expect(TokenType::From, "FROM");
@@ -454,6 +683,11 @@ class ParserImpl {
     auto table_name = ExpectIdentifier("表名");
     if (!table_name.ok()) return Result<Statement>(table_name.status());
     statement.table_name = std::move(table_name.value());
+    if (Match(TokenType::As)) {
+      auto alias = ExpectIdentifier("AS 后的表别名");
+      if (!alias.ok()) return Result<Statement>(alias.status());
+      statement.table_alias = std::move(alias.value());
+    }
     statement.location = TokenPosition(select.value());
     if (Match(TokenType::Where)) {
       auto parsed_where = ParseWhere();
@@ -472,6 +706,11 @@ class ParserImpl {
         if (!Match(TokenType::Comma)) break;
       } while (true);
     }
+    if (Match(TokenType::Having)) {
+      auto expression = ParseCompileExpr();
+      if (!expression.ok()) return Result<Statement>(expression.status());
+      statement.having = FoldCompileExpr(expression.value());
+    }
     if (Match(TokenType::Order)) {
       auto by = Expect(TokenType::By, "BY after ORDER");
       if (!by.ok()) return Result<Statement>(by.status());
@@ -488,6 +727,28 @@ class ParserImpl {
         statement.order_by.push_back(std::move(key));
         if (!Match(TokenType::Comma)) break;
       } while (true);
+    }
+    if (Match(TokenType::Limit)) {
+      auto limit_token = Expect(TokenType::Integer, "LIMIT 后的非负整数");
+      if (!limit_token.ok()) return Result<Statement>(limit_token.status());
+      const auto &limit_text = limit_token.value().lexeme;
+      if (!limit_text.empty() && limit_text.front() == '-') {
+        return Result<Statement>(Status::InvalidArgument(
+            "LIMIT 必须是非负整数，位置 " +
+            std::to_string(limit_token.value().line) + ":" +
+            std::to_string(limit_token.value().column)));
+      }
+      std::size_t limit = 0;
+      const auto parsed = std::from_chars(
+          limit_text.data(), limit_text.data() + limit_text.size(), limit);
+      if (parsed.ec != std::errc{} ||
+          parsed.ptr != limit_text.data() + limit_text.size()) {
+        return Result<Statement>(Status::InvalidArgument(
+            "LIMIT 数值超出范围，位置 " +
+            std::to_string(limit_token.value().line) + ":" +
+            std::to_string(limit_token.value().column)));
+      }
+      statement.limit = limit;
     }
     auto semicolon = Expect(TokenType::Semicolon, "';'");
     if (!semicolon.ok()) return Result<Statement>(semicolon.status());
@@ -558,16 +819,61 @@ class ParserImpl {
     return Result<Statement>(std::move(statement));
   }
 
+  Result<Statement> ParseDrop() {
+    // 语法：DROP TABLE name; 或 DROP INDEX name;
+    auto drop = Expect(TokenType::Drop, "DROP");
+    if (!drop.ok()) return Result<Statement>(drop.status());
+
+    if (Match(TokenType::Table)) {
+      auto table_name = ExpectIdentifier("DROP TABLE 后的表名");
+      if (!table_name.ok()) return Result<Statement>(table_name.status());
+      auto semicolon = Expect(TokenType::Semicolon, "';'");
+      if (!semicolon.ok()) return Result<Statement>(semicolon.status());
+      DropTableStatement statement{std::move(table_name.value())};
+      statement.location = TokenPosition(drop.value());
+      return Result<Statement>(std::move(statement));
+    }
+
+    if (!Match(TokenType::Index)) {
+      return Result<Statement>(Error("TABLE 或 INDEX after DROP", Peek()));
+    }
+    auto index_name = ExpectIdentifier("DROP INDEX 后的索引名");
+    if (!index_name.ok()) return Result<Statement>(index_name.status());
+    auto semicolon = Expect(TokenType::Semicolon, "';'");
+    if (!semicolon.ok()) return Result<Statement>(semicolon.status());
+    DropIndexStatement statement{std::move(index_name.value())};
+    statement.location = TokenPosition(drop.value());
+    return Result<Statement>(std::move(statement));
+  }
+
+  Result<Statement> ParseExplain() {
+    auto explain = Expect(TokenType::Explain, "EXPLAIN");
+    if (!explain.ok()) return Result<Statement>(explain.status());
+    if (Peek().type != TokenType::Select) {
+      return Result<Statement>(Error("SELECT after EXPLAIN", Peek()));
+    }
+    auto inner = ParseSelect();
+    if (!inner.ok()) return inner;
+    ExplainStatement statement;
+    statement.select =
+        std::get<SelectStatement>(std::move(inner.value()));
+    statement.location = TokenPosition(explain.value());
+    return Result<Statement>(std::move(statement));
+  }
+
   Result<Statement> ParseStatement() {
     // 分派完全依据首个关键字 Token；不支持的关键字会给出预期的语句集合。
     switch (Peek().type) {
-      case TokenType::Create: return ParseCreateTable();
+      case TokenType::Create: return ParseCreate();
       case TokenType::Insert: return ParseInsert();
       case TokenType::Select: return ParseSelect();
+      case TokenType::Explain: return ParseExplain();
       case TokenType::Delete: return ParseDelete();
+      case TokenType::Drop: return ParseDrop();
       case TokenType::Update: return ParseUpdate();
       default: return Result<Statement>(
-          Error("CREATE、INSERT、SELECT、DELETE 或 UPDATE", Peek()));
+          Error("CREATE、INSERT、SELECT、EXPLAIN、DELETE、DROP 或 UPDATE",
+                Peek()));
     }
   }
 
@@ -595,14 +901,36 @@ std::string ToString(const Statement &statement) {
         if constexpr (std::is_same_v<Type, CreateTableStatement>) {
           return "CreateTableStatement(table=" + value.table_name + ",schema=" + SchemaText(value.schema) + ")";
         } else if constexpr (std::is_same_v<Type, InsertStatement>) {
-          std::string result = "InsertStatement(table=" + value.table_name + ",values=[";
-          for (std::size_t i = 0; i < value.values.size(); ++i) {
-            if (i != 0) result += ",";
-            result += QuoteValue(value.values[i]);
+          std::string result =
+              "InsertStatement(table=" + value.table_name + ",columns=";
+          if (value.columns.empty()) {
+            result += "*";
+          } else {
+            result += "[";
+            for (std::size_t i = 0; i < value.columns.size(); ++i) {
+              if (i != 0) result += ",";
+              result += value.columns[i];
+            }
+            result += "]";
+          }
+          result += ",rows=[";
+          for (std::size_t row_index = 0; row_index < value.rows.size();
+               ++row_index) {
+            if (row_index != 0) result += ",";
+            result += "[";
+            for (std::size_t i = 0; i < value.rows[row_index].size(); ++i) {
+              if (i != 0) result += ",";
+              result += QuoteValue(value.rows[row_index][i]);
+            }
+            result += "]";
           }
           return result + "])";
         } else if constexpr (std::is_same_v<Type, SelectStatement>) {
-          std::string result = "SelectStatement(table=" + value.table_name + ",projection=";
+          std::string result = "SelectStatement(table=" + value.table_name;
+          if (!value.table_alias.empty()) {
+            result += ",alias=" + value.table_alias;
+          }
+          result += ",projection=";
           if (value.select_all) {
             result += "*";
           } else {
@@ -625,6 +953,9 @@ std::string ToString(const Statement &statement) {
             }
             result += "]";
           }
+          if (value.having != nullptr) {
+            result += ",having=" + CompileExprText(value.having);
+          }
           if (!value.order_by.empty()) {
             result += ",order_by=[";
             for (std::size_t i = 0; i < value.order_by.size(); ++i) {
@@ -636,6 +967,27 @@ std::string ToString(const Statement &statement) {
             }
             result += "]";
           }
+          if (value.distinct) {
+            result += ",distinct=true";
+          }
+          if (value.limit.has_value()) {
+            result += ",limit=" + std::to_string(*value.limit);
+          }
+          bool has_alias = false;
+          for (const auto &alias : value.projection_aliases) {
+            if (!alias.empty()) {
+              has_alias = true;
+              break;
+            }
+          }
+          if (has_alias) {
+            result += ",aliases=[";
+            for (std::size_t i = 0; i < value.projection_aliases.size(); ++i) {
+              if (i != 0) result += ",";
+              result += value.projection_aliases[i];
+            }
+            result += "]";
+          }
           return result + ")";
         } else if constexpr (std::is_same_v<Type, DeleteStatement>) {
           std::string result = "DeleteStatement(table=" + value.table_name;
@@ -644,6 +996,17 @@ std::string ToString(const Statement &statement) {
             result += ",where_expr=" + CompileExprText(value.compile_where);
           }
           return result + ")";
+        } else if constexpr (std::is_same_v<Type, DropTableStatement>) {
+          return "DropTableStatement(table=" + value.table_name + ")";
+        } else if constexpr (std::is_same_v<Type, CreateIndexStatement>) {
+          return "CreateIndexStatement(index=" + value.index_name +
+                 ",table=" + value.table_name +
+                 ",column=" + value.column_name +
+                 ",unique=" + (value.is_unique ? "true" : "false") + ")";
+        } else if constexpr (std::is_same_v<Type, DropIndexStatement>) {
+          return "DropIndexStatement(index=" + value.index_name + ")";
+        } else if constexpr (std::is_same_v<Type, ExplainStatement>) {
+          return "ExplainStatement(select=" + ToString(value.select) + ")";
         } else {
           std::string result = "UpdateStatement(table=" + value.table_name +
                                ",assignments=[";

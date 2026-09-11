@@ -218,6 +218,285 @@ bool TestOrderGroupAndUpdate() {
                "UPDATE 求值失败时目标行应保持不变");
 }
 
+bool TestExtendedInsertCompileOnly() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 3);
+  if (!Check(engine.GetInitStatus().ok(), "扩展 INSERT 测试数据库打开应成功")) {
+    return false;
+  }
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE student(id INT, name VARCHAR);"
+      "INSERT INTO student VALUES(1, 'Alice');");
+  if (!Check(setup.ok(), "原有单行全列 INSERT 应继续可执行")) return false;
+
+  auto specified = engine.ExecuteSql(
+      "INSERT INTO student (name, id) VALUES('Bob', 2);");
+  if (!Check(!specified.ok() &&
+                 specified.status().code() == oursql::ErrorCode::NotImplemented &&
+                 specified.status().message().find("Execution") !=
+                     std::string::npos,
+             "指定列 INSERT 应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  auto multiple = engine.ExecuteSql(
+      "INSERT INTO student VALUES(2, 'Bob'), (3, 'Cara');");
+  if (!Check(!multiple.ok() &&
+                 multiple.status().code() == oursql::ErrorCode::NotImplemented &&
+                 multiple.status().message().find("Execution") !=
+                     std::string::npos,
+             "多行 INSERT 应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  auto rows = engine.ExecuteSql("SELECT * FROM student;");
+  return Check(rows.ok() && rows.value().rows.size() == 1 &&
+                   rows.value().rows[0][1].AsVarchar() == "Alice",
+               "未实现的扩展 INSERT 不得产生部分写入");
+}
+
+bool TestDistinctAndLimitCompileOnly() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 3);
+  if (!Check(engine.GetInitStatus().ok(), "DISTINCT/LIMIT 测试数据库打开应成功")) {
+    return false;
+  }
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE student(id INT, name VARCHAR);"
+      "INSERT INTO student VALUES(1, 'Alice');");
+  if (!Check(setup.ok(), "DISTINCT/LIMIT 测试初始化应成功")) return false;
+
+  auto distinct = engine.ExecuteSql("SELECT DISTINCT name FROM student;");
+  if (!Check(!distinct.ok() &&
+                 distinct.status().code() == oursql::ErrorCode::NotImplemented &&
+                 distinct.status().message().find("Execution") !=
+                     std::string::npos,
+             "DISTINCT 应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  auto limit = engine.ExecuteSql("SELECT * FROM student LIMIT 1;");
+  return Check(!limit.ok() &&
+                   limit.status().code() == oursql::ErrorCode::NotImplemented &&
+                   limit.status().message().find("Execution") !=
+                       std::string::npos,
+               "LIMIT 应完成编译后明确拒绝执行");
+}
+
+bool TestDropAndAliasCompileOnly() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 3);
+  if (!Check(engine.GetInitStatus().ok(), "DROP/AS 测试数据库打开应成功")) {
+    return false;
+  }
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE student(id INT, name VARCHAR);"
+      "INSERT INTO student VALUES(1, 'Alice');");
+  if (!Check(setup.ok(), "DROP/AS 测试初始化应成功")) return false;
+
+  auto column_alias =
+      engine.ExecuteSql("SELECT id AS user_id FROM student;");
+  if (!Check(!column_alias.ok() &&
+                 column_alias.status().code() ==
+                     oursql::ErrorCode::NotImplemented &&
+                 column_alias.status().message().find("Execution") !=
+                     std::string::npos,
+             "列别名应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  auto table_alias =
+      engine.ExecuteSql("SELECT id FROM student AS s;");
+  if (!Check(!table_alias.ok() &&
+                 table_alias.status().code() ==
+                     oursql::ErrorCode::NotImplemented,
+             "表别名应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  auto dropped = engine.ExecuteSql("DROP TABLE student;");
+  if (!Check(!dropped.ok() &&
+                 dropped.status().code() == oursql::ErrorCode::NotImplemented,
+             "DROP TABLE 应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  const auto tables = engine.ListTables();
+  bool student_exists = false;
+  for (const auto &table : tables) {
+    if (table.name == "student") student_exists = true;
+  }
+  auto rows = engine.ExecuteSql("SELECT * FROM student;");
+  return Check(student_exists && rows.ok() && rows.value().rows.size() == 1,
+               "未实现的 DROP TABLE 不得删除 Catalog 或数据");
+}
+
+bool TestAggregateAndHavingCompileOnly() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 3);
+  if (!Check(engine.GetInitStatus().ok(),
+             "聚合/HAVING 测试数据库打开应成功")) {
+    return false;
+  }
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE student(id INT, name VARCHAR);"
+      "INSERT INTO student VALUES(1, 'Alice');"
+      "INSERT INTO student VALUES(2, 'Alice');");
+  if (!Check(setup.ok(), "聚合/HAVING 测试初始化应成功")) return false;
+
+  auto aggregate = engine.ExecuteSql("SELECT COUNT(*) FROM student;");
+  if (!Check(!aggregate.ok() &&
+                 aggregate.status().code() ==
+                     oursql::ErrorCode::NotImplemented &&
+                 aggregate.status().message().find("Execution") !=
+                     std::string::npos,
+             "COUNT 应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  auto having = engine.ExecuteSql(
+      "SELECT name, COUNT(*) FROM student "
+      "GROUP BY name HAVING COUNT(*) >= 2;");
+  if (!Check(!having.ok() &&
+                 having.status().code() ==
+                     oursql::ErrorCode::NotImplemented &&
+                 having.status().message().find("Execution") !=
+                     std::string::npos,
+             "聚合 HAVING 应完成编译后明确拒绝执行")) {
+    return false;
+  }
+
+  auto rows = engine.ExecuteSql("SELECT * FROM student;");
+  return Check(rows.ok() && rows.value().rows.size() == 2,
+               "未实现的聚合查询不得影响原始数据");
+}
+
+bool TestIndexMaintenanceAndExplain() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 4);
+  if (!Check(engine.GetInitStatus().ok(), "索引测试数据库打开应成功")) {
+    return false;
+  }
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE student(id INT, name VARCHAR(16));"
+      "INSERT INTO student VALUES(1, 'Alice');"
+      "INSERT INTO student VALUES(2, 'Bob');");
+  if (!Check(setup.ok(), "索引测试数据创建应成功")) return false;
+
+  auto before = engine.ExecuteSql(
+      "EXPLAIN SELECT * FROM student WHERE id = 1;");
+  if (!Check(before.ok() && before.value().rows.size() == 1 &&
+                 before.value().rows[0][0].AsVarchar().find("SeqScanPlan") !=
+                     std::string::npos,
+             "无索引 EXPLAIN 应显示 SeqScanPlan")) {
+    return false;
+  }
+
+  auto created = engine.ExecuteSql(
+      "CREATE UNIQUE INDEX idx_student_id ON student(id);");
+  if (!Check(created.ok(), "CREATE UNIQUE INDEX 应执行成功")) return false;
+
+  auto indexed_explain = engine.ExecuteSql(
+      "EXPLAIN SELECT * FROM student WHERE id = 1;");
+  if (!Check(indexed_explain.ok() &&
+                 indexed_explain.value().rows[0][0].AsVarchar().find(
+                     "IndexScanPlan") != std::string::npos,
+             "有索引 EXPLAIN 应显示 IndexScanPlan")) {
+    return false;
+  }
+
+  auto found = engine.ExecuteSql("SELECT * FROM student WHERE id = 1;");
+  if (!Check(found.ok() && found.value().rows.size() == 1 &&
+                 found.value().rows[0][1].AsVarchar() == "Alice",
+             "IndexScan 点查应返回正确行")) {
+    return false;
+  }
+
+  auto inserted = engine.ExecuteSql(
+      "INSERT INTO student VALUES(3, 'Cara');");
+  if (!Check(inserted.ok(), "INSERT 后索引维护应成功")) return false;
+  auto inserted_lookup =
+      engine.ExecuteSql("SELECT * FROM student WHERE id = 3;");
+  if (!Check(inserted_lookup.ok() &&
+                 inserted_lookup.value().rows.size() == 1 &&
+                 inserted_lookup.value().rows[0][1].AsVarchar() == "Cara",
+             "INSERT 后新键应可通过索引查询")) {
+    return false;
+  }
+
+  auto updated = engine.ExecuteSql(
+      "UPDATE student SET id = 4 WHERE id = 3;");
+  if (!Check(updated.ok() && updated.value().affected_rows == 1,
+             "UPDATE 后索引维护应成功")) {
+    return false;
+  }
+  auto old_key = engine.ExecuteSql("SELECT * FROM student WHERE id = 3;");
+  auto new_key = engine.ExecuteSql("SELECT * FROM student WHERE id = 4;");
+  if (!Check(old_key.ok() && old_key.value().rows.empty() &&
+                 new_key.ok() && new_key.value().rows.size() == 1,
+             "UPDATE 后旧键应消失、新键应可查询")) {
+    return false;
+  }
+
+  auto deleted = engine.ExecuteSql("DELETE FROM student WHERE id = 4;");
+  if (!Check(deleted.ok() && deleted.value().affected_rows == 1,
+             "DELETE 后索引维护应成功")) {
+    return false;
+  }
+  auto deleted_lookup =
+      engine.ExecuteSql("SELECT * FROM student WHERE id = 4;");
+  if (!Check(deleted_lookup.ok() && deleted_lookup.value().rows.empty(),
+             "DELETE 后索引项应被移除")) {
+    return false;
+  }
+
+  auto duplicate = engine.ExecuteSql(
+      "INSERT INTO student VALUES(1, 'Duplicate');");
+  if (!Check(!duplicate.ok() &&
+                 duplicate.status().code() ==
+                     oursql::ErrorCode::AlreadyExists,
+             "唯一索引重复键应拒绝 INSERT")) {
+    return false;
+  }
+  auto after_duplicate =
+      engine.ExecuteSql("SELECT * FROM student WHERE id = 1;");
+  if (!Check(after_duplicate.ok() &&
+                 after_duplicate.value().rows.size() == 1 &&
+                 after_duplicate.value().rows[0][1].AsVarchar() == "Alice",
+             "唯一索引失败后不应残留表行或索引项")) {
+    return false;
+  }
+
+  auto update_conflict = engine.ExecuteSql(
+      "UPDATE student SET id = 1 WHERE id = 2;");
+  if (!Check(!update_conflict.ok() &&
+                 update_conflict.status().code() ==
+                     oursql::ErrorCode::AlreadyExists,
+             "UPDATE 产生唯一键冲突时应整体失败")) {
+    return false;
+  }
+  auto original_one =
+      engine.ExecuteSql("SELECT * FROM student WHERE id = 1;");
+  auto original_two =
+      engine.ExecuteSql("SELECT * FROM student WHERE id = 2;");
+  if (!Check(original_one.ok() && original_one.value().rows.size() == 1 &&
+                 original_two.ok() && original_two.value().rows.size() == 1 &&
+                 original_one.value().rows[0][1].AsVarchar() == "Alice" &&
+                 original_two.value().rows[0][1].AsVarchar() == "Bob",
+             "UPDATE 索引失败后应恢复旧行和旧索引")) {
+    return false;
+  }
+
+  auto dropped = engine.ExecuteSql("DROP INDEX idx_student_id;");
+  if (!Check(dropped.ok(), "DROP INDEX 应执行成功")) return false;
+  auto after_drop = engine.ExecuteSql(
+      "EXPLAIN SELECT * FROM student WHERE id = 1;");
+  return Check(after_drop.ok() && after_drop.value().rows.size() == 1 &&
+                   after_drop.value().rows[0][0].AsVarchar().find(
+                       "SeqScanPlan") != std::string::npos,
+               "DROP INDEX 后 EXPLAIN 应回退到 SeqScanPlan");
+}
+
 }  // namespace
 
 int main() {
@@ -233,6 +512,31 @@ int main() {
   }
   if (TestLargeTableAndRestart()) {
     std::cout << "[PASS] Large table and restart\n";
+  } else {
+    return 1;
+  }
+  if (TestExtendedInsertCompileOnly()) {
+    std::cout << "[PASS] Extended INSERT compile-only\n";
+  } else {
+    return 1;
+  }
+  if (TestDistinctAndLimitCompileOnly()) {
+    std::cout << "[PASS] DISTINCT and LIMIT compile-only\n";
+  } else {
+    return 1;
+  }
+  if (TestDropAndAliasCompileOnly()) {
+    std::cout << "[PASS] DROP TABLE and AS compile-only\n";
+  } else {
+    return 1;
+  }
+  if (TestAggregateAndHavingCompileOnly()) {
+    std::cout << "[PASS] Aggregate and HAVING compile-only\n";
+  } else {
+    return 1;
+  }
+  if (TestIndexMaintenanceAndExplain()) {
+    std::cout << "[PASS] Index maintenance and EXPLAIN\n";
   } else {
     return 1;
   }

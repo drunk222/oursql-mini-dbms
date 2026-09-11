@@ -173,6 +173,70 @@ bool TestDeleteRebalanceAndRootContraction() {
   return true;
 }
 
+bool TestDeleteReclaimsPagesAcrossRestart() {
+  TempDatabase temp;
+  oursql::page_id_t header = oursql::INVALID_PAGE_ID;
+  std::uintmax_t file_size_before_delete = 0;
+  std::uintmax_t logical_page_count = 0;
+  {
+    oursql::DiskManager disk;
+    if (!Check(disk.Open(temp.path).ok(), "Reclaim test database should open")) return false;
+    oursql::BufferPoolManager buffer_pool(4, &disk);
+    auto created = oursql::BPlusTree::CreatePersistent(&buffer_pool, 3, 3);
+    if (!Check(created.ok(), "Persistent reclaim test tree should be created")) return false;
+    auto &tree = *created.value();
+    header = tree.GetHeaderPageId();
+    for (std::int64_t key = 1; key <= 50; ++key) {
+      if (!Check(tree.Insert(key, oursql::RID{static_cast<oursql::page_id_t>(key), 1}).ok(),
+                 "Reclaim test insert should succeed")) return false;
+    }
+    if (!Check(buffer_pool.FlushAllPages().ok(), "Tree pages should flush before measuring")) {
+      return false;
+    }
+    file_size_before_delete = std::filesystem::file_size(temp.path);
+    logical_page_count = file_size_before_delete / oursql::Page::kSize;
+
+    for (std::int64_t key = 2; key <= 50; ++key) {
+      if (!Check(tree.Remove(key,
+                             oursql::RID{static_cast<oursql::page_id_t>(key), 1}).ok(),
+                 "Deleting keys 2 through 50 should rebalance the tree")) return false;
+    }
+    auto retained = tree.GetValue(1);
+    auto removed = tree.GetValue(50);
+    if (!Check(retained.ok() && retained.value().size() == 1,
+               "Key 1 should remain after merges and root contraction")) return false;
+    if (!Check(removed.ok() && removed.value().empty(),
+               "Deleted keys should not remain searchable")) return false;
+    if (!Check(buffer_pool.Close().ok() && disk.Close().ok(),
+               "Reclaim test first lifetime should close cleanly")) return false;
+  }
+  {
+    oursql::DiskManager disk;
+    if (!Check(disk.Open(temp.path).ok(), "Reclaim test database should reopen")) return false;
+    oursql::BufferPoolManager buffer_pool(4, &disk);
+    auto opened = oursql::BPlusTree::OpenPersistent(&buffer_pool, header);
+    if (!Check(opened.ok(), "Persistent tree should reopen from its header")) return false;
+    auto retained = opened.value()->GetValue(1);
+    auto removed = opened.value()->GetValue(2);
+    if (!Check(retained.ok() && retained.value().size() == 1 &&
+                   removed.ok() && removed.value().empty(),
+               "Reopened tree should preserve post-delete contents")) return false;
+
+    oursql::page_id_t reused_page = oursql::INVALID_PAGE_ID;
+    {
+      auto page = buffer_pool.NewPage();
+      if (!Check(page.ok(), "NewPage should reuse a merged B+ tree page")) return false;
+      reused_page = page.value().PageId();
+    }
+    if (!Check(reused_page < logical_page_count,
+               "Reallocated page should come from the pre-delete page range")) return false;
+    if (!Check(std::filesystem::file_size(temp.path) == file_size_before_delete,
+               "Reusing a merged page must not grow the database file")) return false;
+    return Check(buffer_pool.Close().ok() && disk.Close().ok(),
+                 "Reclaim test second lifetime should close cleanly");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -188,5 +252,6 @@ int main() {
   run("splits lookup and leaf chain", &TestSplitsLookupAndLeafChain);
   run("duplicate keys and reopen", &TestDuplicateKeysAndReopen);
   run("delete rebalance and root contraction", &TestDeleteRebalanceAndRootContraction);
+  run("delete reclaims pages across restart", &TestDeleteReclaimsPagesAcrossRestart);
   return failures == 0 ? 0 : 1;
 }

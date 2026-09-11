@@ -57,6 +57,8 @@ class HeapTable {
   [[nodiscard]] Status DeleteRow(const RID &rid);
   // 调用者：扫描执行器；作用：沿数据页链返回所有有效行；返回：RID 与行序列或错误。
   [[nodiscard]] Result<std::vector<RowEntry>> Scan();
+  // 调用者：DROP TABLE 编排层；作用：校验并释放整条数据页链；返回：成功或首个存储错误。
+  [[nodiscard]] Status Destroy();
 
  private:
   // 调用者：GetRow/DeleteRow；作用：确认 RID 页面属于当前表；返回：归属状态或链损坏错误。

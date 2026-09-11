@@ -315,6 +315,8 @@ class BufferPoolManager {
   [[nodiscard]] Status FlushAllPages();
   // 调用者：删除流程；作用：释放未 pin 页面并从缓冲池移除；返回：操作状态。
   [[nodiscard]] Status DeletePage(page_id_t page_id);
+  // 调用者：表或索引释放流程；作用：预检查后批量释放页面；返回：成功或错误状态。
+  [[nodiscard]] Status DeletePages(const std::vector<page_id_t> &page_ids);
   // 调用者：关闭流程；作用：刷新并关闭缓冲池；返回：操作状态。
   [[nodiscard]] Status Close();
   // 调用者：启动流程；作用：查询构造期间的配置状态；返回：成功或明确错误。
@@ -357,6 +359,7 @@ class BufferPoolManager {
   [[nodiscard]] Status ReleaseGuard(frame_id_t frame_id, page_id_t page_id, bool is_dirty) noexcept;
   [[nodiscard]] Status EnsureReadyUnlocked() const;
   [[nodiscard]] Status ValidateDataPageId(page_id_t page_id) const;
+  [[nodiscard]] Status DeletePageUnlocked(page_id_t page_id);
 
   std::size_t pool_size_{0};
   DiskManager *disk_manager_{nullptr};

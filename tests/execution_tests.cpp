@@ -497,6 +497,43 @@ bool TestIndexMaintenanceAndExplain() {
                "DROP INDEX 后 EXPLAIN 应回退到 SeqScanPlan");
 }
 
+bool TestStatisticsResetKeepsWarmPages() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 8);
+  if (!Check(engine.GetInitStatus().ok(), "Statistics test engine should open")) return false;
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE stats_table(id INT, name VARCHAR);"
+      "INSERT INTO stats_table VALUES(1, 'warm');"
+      "SELECT * FROM stats_table;");
+  if (!Check(setup.ok() && setup.value().rows.size() == 1,
+             "Statistics test should create and warm a table page")) return false;
+  const auto before = engine.GetStatistics();
+  if (!Check(before.buffer_accesses > 0 &&
+                 (before.disk_reads > 0 || before.disk_writes > 0),
+             "Storage counters should be nonzero before reset")) return false;
+
+  if (!Check(engine.ResetStatistics().ok(), "Unified statistics reset should succeed")) {
+    return false;
+  }
+  const auto reset = engine.GetStatistics();
+  if (!Check(reset.buffer_accesses == 0 && reset.buffer_hits == 0 &&
+                 reset.buffer_misses == 0 && reset.buffer_hit_rate == 0.0 &&
+                 reset.evictions == 0 && reset.disk_reads == 0 &&
+                 reset.disk_writes == 0,
+             "Unified reset should clear every cumulative counter")) return false;
+
+  auto warm_read = engine.ExecuteSql("SELECT * FROM stats_table;");
+  if (!Check(warm_read.ok() && warm_read.value().rows.size() == 1,
+             "The table should remain readable after resetting counters")) return false;
+  const auto after = engine.GetStatistics();
+  if (!Check(after.buffer_accesses > 0 && after.buffer_hits > 0 &&
+                 after.buffer_misses == 0 && after.disk_reads == 0,
+             "Reset should preserve warm BufferPool pages")) return false;
+  if (!Check(engine.Close().ok(), "Statistics test engine should close")) return false;
+  return Check(engine.ResetStatistics().code() == oursql::ErrorCode::InvalidArgument,
+               "ResetStatistics should reject a closed engine");
+}
+
 }  // namespace
 
 int main() {
@@ -537,6 +574,11 @@ int main() {
   }
   if (TestIndexMaintenanceAndExplain()) {
     std::cout << "[PASS] Index maintenance and EXPLAIN\n";
+  } else {
+    return 1;
+  }
+  if (TestStatisticsResetKeepsWarmPages()) {
+    std::cout << "[PASS] Statistics reset keeps warm pages\n";
   } else {
     return 1;
   }

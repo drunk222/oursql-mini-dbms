@@ -124,6 +124,19 @@ bool HandleMetaCommand(std::string_view line, oursql::DatabaseEngine *engine, bo
     return true;
   }
   if (command == ".stats") {
+    if (argument == "reset") {
+      auto status = engine->ResetStatistics();
+      if (!status.ok()) {
+        PrintCliError(status);
+        return false;
+      }
+      std::cout << "Statistics reset\n";
+      return true;
+    }
+    if (!argument.empty()) {
+      std::cout << "Usage: .stats [reset]\n" << std::flush;
+      return false;
+    }
     PrintStats(engine->GetStatistics());
     return true;
   }

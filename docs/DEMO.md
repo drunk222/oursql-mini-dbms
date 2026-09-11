@@ -128,11 +128,21 @@ ctest --test-dir build -C Debug --output-on-failure
 
 当前没有实现：JOIN、索引、事务、MVCC、完整 WAL、WriteThrough、ALTER/DROP、网络服务和 GUI。数据库仍是单数据库、单表查询教学实现；这些功能不能在演示中包装成已实现能力。
 
-编译层已能解析并生成对应 Plan 节点，但执行层没有对应算子的语法（`GROUP BY`、`ORDER BY`、`UPDATE`）在本项目中会**先完成表、列和类型语义检查，再由 ExecutionEngine 明确返回 `NotImplemented`**。复杂 WHERE 表达式目前仍由 Planner 在语义检查后返回 `NotImplemented`。整个链路不会让执行器静默忽略计划节点。演示时可以直接展示这一行为：
+编译层已能解析并生成对应 Plan 节点，但执行层没有对应算子的语法（`GROUP BY`、`ORDER BY`、`UPDATE`）在本项目中会**先完成表、列和类型语义检查，再由 ExecutionEngine 明确返回 `NotImplemented`**。指定列 INSERT 和多行 INSERT 也已生成 `InsertPlan`，但执行层当前只保留原有单行全列写入路径，其余形式明确返回 `NotImplemented`。复杂 WHERE 表达式目前仍由 Planner 在语义检查后返回 `NotImplemented`。整个链路不会让执行器静默忽略计划节点。演示时可以直接展示这一行为：
 
 ```sql
 SELECT * FROM student ORDER BY id DESC;   -- NotImplemented: Execution: ORDER BY 仅编译层支持，未接入数据库执行
 SELECT * FROM student GROUP BY name;      -- NotImplemented: Execution: GROUP BY 仅编译层支持，未接入数据库执行
 UPDATE student SET name = 'Zoe' WHERE id = 1;  -- NotImplemented: Execution: UPDATE 仅编译层支持，未接入数据库执行
+INSERT INTO student (name, id) VALUES('Zoe', 4); -- NotImplemented: Execution: 指定列或多行 INSERT 仅编译层支持，未接入数据库执行
+INSERT INTO student VALUES(5, 'Eve'), (6, 'Fox'); -- NotImplemented: Execution: 指定列或多行 INSERT 仅编译层支持，未接入数据库执行
+SELECT DISTINCT name FROM student;         -- NotImplemented: Execution: DISTINCT/LIMIT 仅编译层支持，未接入数据库执行
+SELECT * FROM student LIMIT 1;             -- NotImplemented: Execution: DISTINCT/LIMIT 仅编译层支持，未接入数据库执行
+SELECT * FROM student WHERE id BETWEEN 1 AND 3; -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
+SELECT * FROM student WHERE id IN (1, 2);   -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
+SELECT * FROM student WHERE name LIKE 'A%'; -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
+SELECT id AS user_id FROM student;         -- NotImplemented: Execution: 列别名仅编译层支持，未接入数据库执行
+SELECT id FROM student AS s;               -- NotImplemented: Execution: 表别名仅编译层支持，未接入数据库执行
+DROP TABLE student;                        -- NotImplemented: Execution: DROP TABLE 仅编译层支持，未接入数据库执行
 SELECT * FROM student WHERE id > 1;       -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
 ```

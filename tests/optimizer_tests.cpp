@@ -117,6 +117,103 @@ bool TestExplicitProjectionKept() {
                "显式投影列不应被优化器改写");
 }
 
+bool TestSelectModifiersPreserved() {
+  auto catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+  oursql::Optimizer optimizer;
+
+  auto parsed = parser.Parse(
+      "SELECT DISTINCT name AS display_name "
+      "FROM users AS u LIMIT 5;");
+  if (!Check(parsed.ok(), "DISTINCT/LIMIT SELECT 应解析成功")) return false;
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok(), "DISTINCT/LIMIT 计划应可构造")) {
+    return false;
+  }
+  auto optimized = optimizer.OptimizeWithStats(plan.value());
+  if (!Check(optimized.ok(), "DISTINCT/LIMIT 计划应可优化")) return false;
+  const auto &select =
+      std::get<oursql::SelectPlan>(optimized.value().plan);
+  return Check(select.distinct && select.limit.has_value() &&
+                   *select.limit == 5 && select.root != nullptr &&
+                   select.table_alias == "u" &&
+                   select.projection_aliases ==
+                       std::vector<std::string>{"display_name"},
+               "优化器应保留 DISTINCT/LIMIT 根计划修饰符");
+}
+
+bool TestAggregateAndHavingPreserved() {
+  auto catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+  oursql::Optimizer optimizer;
+
+  auto parsed = parser.Parse(
+      "SELECT name, COUNT(*) FROM users "
+      "GROUP BY name HAVING COUNT(*) >= 2;");
+  if (!Check(parsed.ok(), "聚合/HAVING SELECT 应解析成功")) return false;
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok(), "聚合/HAVING 计划应可构造")) return false;
+
+  auto optimized = optimizer.OptimizeWithStats(plan.value());
+  if (!Check(optimized.ok(), "聚合/HAVING 计划应可优化")) return false;
+  const auto &select =
+      std::get<oursql::SelectPlan>(optimized.value().plan);
+  return Check(select.has_aggregates && select.having != nullptr &&
+                   select.projection_expressions.size() == 2,
+               "优化器应保留聚合和 HAVING 元数据");
+}
+
+bool TestIndexScanSelection() {
+  oursql::Optimizer optimizer;
+  auto scan = std::make_shared<oursql::PlanNode>(
+      oursql::SeqScanPlan{"users"});
+  auto filter = std::make_shared<oursql::PlanNode>(
+      oursql::FilterPlan{scan, oursql::Predicate{"id", oursql::Value(7)}});
+  auto root = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{filter, {"id"}, false});
+  oursql::Plan plan = oursql::SelectPlan{"users", root};
+
+  std::vector<oursql::IndexMetadata> indexes{
+      oursql::IndexMetadata{"idx_users_id", "users", "id",
+                            oursql::INVALID_PAGE_ID, false}};
+  auto optimized = optimizer.OptimizeWithStats(plan, indexes);
+  if (!Check(optimized.ok(), "索引计划应优化成功")) return false;
+  const auto &select =
+      std::get<oursql::SelectPlan>(optimized.value().plan);
+  const auto &project =
+      std::get<oursql::ProjectPlan>(select.root->operation);
+  const auto &optimized_filter =
+      std::get<oursql::FilterPlan>(project.child->operation);
+  const auto *index_scan =
+      std::get_if<oursql::IndexScanPlan>(
+          &optimized_filter.child->operation);
+  if (!Check(index_scan != nullptr &&
+                 index_scan->index_name == "idx_users_id" &&
+                 index_scan->key.AsInt() == 7,
+             "匹配索引时 Filter 子节点应改为 IndexScan")) {
+    return false;
+  }
+  if (!Check(optimized.value().stats.rule_hits.at(
+                 "R2:等值谓词索引扫描") == 1,
+             "索引规则命中次数应为 1")) {
+    return false;
+  }
+
+  auto no_index = optimizer.OptimizeWithStats(plan, {});
+  if (!Check(no_index.ok(), "无索引计划应优化成功")) return false;
+  const auto &plain_select =
+      std::get<oursql::SelectPlan>(no_index.value().plan);
+  const auto &plain_project =
+      std::get<oursql::ProjectPlan>(plain_select.root->operation);
+  const auto &plain_filter =
+      std::get<oursql::FilterPlan>(plain_project.child->operation);
+  return Check(std::holds_alternative<oursql::SeqScanPlan>(
+                   plain_filter.child->operation),
+               "无匹配索引时必须保留 SeqScan");
+}
+
 bool TestNonConformingPlanRejected() {
   oursql::Optimizer optimizer;
 
@@ -164,7 +261,7 @@ bool TestNonSelectPlansUnchanged() {
   oursql::Plan create = oursql::CreateTablePlan{
       "t", oursql::Schema{{"id", oursql::DataType::Int}}};
   oursql::Plan insert = oursql::InsertPlan{
-      "t", std::vector<oursql::Value>{oursql::Value(1)}};
+      "t", {}, {{oursql::Value(1)}}};
   oursql::Plan remove = oursql::DeletePlan{"t", std::nullopt};
   const std::string create_text = oursql::ToString(create);
   const std::string insert_text = oursql::ToString(insert);
@@ -265,6 +362,9 @@ int main() {
   run("SELECT * keeps frozen shape", &TestSelectStarKeepsFrozenShape);
   run("SELECT WHERE keeps frozen shape", &TestSelectWhereKeepsFrozenShape);
   run("Explicit projection kept", &TestExplicitProjectionKept);
+  run("SELECT modifiers preserved", &TestSelectModifiersPreserved);
+  run("Aggregate and HAVING preserved", &TestAggregateAndHavingPreserved);
+  run("IndexScan selection", &TestIndexScanSelection);
   run("Non-conforming plan rejected", &TestNonConformingPlanRejected);
   run("Optimize is idempotent", &TestOptimizeIsIdempotent);
   run("Non-SELECT plans unchanged", &TestNonSelectPlansUnchanged);

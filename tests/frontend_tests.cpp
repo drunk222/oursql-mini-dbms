@@ -86,8 +86,11 @@ bool TestParserAndCaseInsensitiveMultiStatement() {
                              "CREATE AST 核心字段应正确") &&
                       Check(create.schema.At(0).name == "id" && create.schema.At(0).type == oursql::DataType::Int,
                             "CREATE INT 列应正确") &&
-                      Check(insert.table_name == "users" && insert.values.size() == 2 &&
-                                insert.values[1].AsVarchar() == "Alice",
+                      Check(insert.table_name == "users" &&
+                                insert.columns.empty() &&
+                                insert.rows.size() == 1 &&
+                                insert.rows[0].size() == 2 &&
+                                insert.rows[0][1].AsVarchar() == "Alice",
                             "INSERT AST 核心字段应正确") &&
                       Check(select.table_name == "users" && !select.select_all &&
                                 select.projection == std::vector<std::string>{"id", "name"} &&
@@ -117,6 +120,8 @@ bool TestParserErrorsHavePositions() {
       "CREATE TABLE t(id INT;",
       "SELECT id FROM t",
       "UPSERT INTO t VALUES(1);",
+      "INSERT INTO t (id name) VALUES(1, 'Alice');",
+      "INSERT INTO t (id, name) VALUES 1, 'Alice';",
   };
   for (const auto &sql : invalid_sql) {
     auto result = parser.Parse(sql);
@@ -136,6 +141,32 @@ oursql::Catalog MakeCatalog() {
       "users", oursql::Schema{{"id", oursql::DataType::Int}, {"name", oursql::DataType::Varchar, 5}}});
   return catalog;
 }
+
+class FixedCatalogReader final : public oursql::CatalogView {
+ public:
+  FixedCatalogReader(oursql::TableInfo table,
+                     std::vector<oursql::IndexMetadata> indexes)
+      : table_(std::move(table)), indexes_(std::move(indexes)) {}
+
+  oursql::Result<const oursql::TableInfo *> FindTable(
+      std::string_view table_name) const override {
+    if (table_name != table_.name) {
+      return oursql::Result<const oursql::TableInfo *>(
+          oursql::Status::NotFound("测试 Catalog 未找到表"));
+    }
+    return oursql::Result<const oursql::TableInfo *>(&table_);
+  }
+
+  std::vector<oursql::IndexMetadata> ListTableIndexes(
+      std::string_view table_name) const override {
+    if (table_name != table_.name) return {};
+    return indexes_;
+  }
+
+ private:
+  oursql::TableInfo table_;
+  std::vector<oursql::IndexMetadata> indexes_;
+};
 
 bool TestPlannerSemanticChecks() {
   oursql::Parser parser;
@@ -197,7 +228,12 @@ bool TestPlanTreeAndPrinting() {
 
   auto insert_statements = parser.Parse("INSERT INTO users VALUES(1, 'Alice');");
   auto insert_plan = planner.Build(insert_statements.value()[0], catalog);
-  if (!Check(insert_plan.ok() && std::get<oursql::InsertPlan>(insert_plan.value()).values.size() == 2,
+  if (!Check(insert_plan.ok(), "INSERT 应规划成功")) return false;
+  const auto &insert_plan_value =
+      std::get<oursql::InsertPlan>(insert_plan.value());
+  if (!Check(insert_plan_value.columns.empty() &&
+                 insert_plan_value.rows.size() == 1 &&
+                 insert_plan_value.rows[0].size() == 2,
              "INSERT 应生成正确的 InsertPlan")) {
     return false;
   }
@@ -213,6 +249,405 @@ bool TestPlanTreeAndPrinting() {
   const auto &select_all = std::get<oursql::SelectPlan>(select_all_plan.value());
   const auto &project_all = std::get<oursql::ProjectPlan>(select_all.root->operation);
   return Check(project_all.select_all && project_all.columns.empty(), "SELECT * 的 ProjectPlan 应保留全列标记");
+}
+
+bool TestInsertColumnListAndMultipleRows() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+
+  auto parsed = parser.Parse(
+      "INSERT INTO users (name, id) VALUES ('Alice', 1), ('Bob', 2);");
+  if (!Check(parsed.ok(), "指定列多行 INSERT 应解析成功")) return false;
+  const auto &insert =
+      std::get<oursql::InsertStatement>(parsed.value()[0]);
+  if (!Check(insert.table_name == "users" &&
+                 insert.columns == std::vector<std::string>{"name", "id"} &&
+                 insert.rows.size() == 2 &&
+                 insert.rows[0][0].AsVarchar() == "Alice" &&
+                 insert.rows[0][1].AsInt() == 1 &&
+                 insert.rows[1][0].AsVarchar() == "Bob" &&
+                 insert.rows[1][1].AsInt() == 2,
+             "指定列多行 INSERT 的 AST 字段应正确")) {
+    return false;
+  }
+
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok() &&
+                 std::holds_alternative<oursql::InsertPlan>(plan.value()),
+             "指定列多行 INSERT 应生成 InsertPlan")) {
+    return false;
+  }
+  const auto &insert_plan = std::get<oursql::InsertPlan>(plan.value());
+  if (!Check(insert_plan.columns ==
+                     std::vector<std::string>{"name", "id"} &&
+                 insert_plan.rows.size() == 2 &&
+                 insert_plan.rows[1][1].AsInt() == 2,
+             "指定列多行 INSERT 的 Plan 字段应正确")) {
+    return false;
+  }
+
+  auto full_rows = parser.Parse(
+      "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');");
+  if (!Check(full_rows.ok(), "全列多行 INSERT 应解析成功")) return false;
+  auto full_plan = planner.Build(full_rows.value()[0], catalog);
+  if (!Check(full_plan.ok(), "全列多行 INSERT 应规划成功")) {
+    return false;
+  }
+  const auto &full_insert_plan =
+      std::get<oursql::InsertPlan>(full_plan.value());
+  if (!Check(full_insert_plan.columns.empty() &&
+                 full_insert_plan.rows.size() == 2,
+             "未指定目标列时应保存全列顺序的多行值")) {
+    return false;
+  }
+
+  auto partial = parser.Parse(
+      "INSERT INTO users (name) VALUES ('Alice');");
+  if (!Check(partial.ok(), "指定部分列 INSERT 应解析成功")) return false;
+  auto partial_plan = planner.Build(partial.value()[0], catalog);
+  if (!Check(partial_plan.ok(), "指定部分列应完成编译层语义检查")) {
+    return false;
+  }
+  const auto &partial_insert_plan =
+      std::get<oursql::InsertPlan>(partial_plan.value());
+  if (!Check(partial_insert_plan.columns ==
+                     std::vector<std::string>{"name"} &&
+                 partial_insert_plan.rows.size() == 1,
+             "部分列值应按目标列顺序保留")) {
+    return false;
+  }
+
+  const std::vector<std::pair<std::string, oursql::ErrorCode>> invalid{
+      {"INSERT INTO users (id, id) VALUES(1, 2);",
+       oursql::ErrorCode::AlreadyExists},
+      {"INSERT INTO users (missing) VALUES(1);",
+       oursql::ErrorCode::NotFound},
+      {"INSERT INTO users (id) VALUES(1, 2);",
+       oursql::ErrorCode::InvalidArgument},
+      {"INSERT INTO users (id, name) VALUES('1', 'Alice');",
+       oursql::ErrorCode::TypeMismatch},
+      {"INSERT INTO users (name) VALUES('toolong');",
+       oursql::ErrorCode::InvalidArgument},
+  };
+  for (const auto &item : invalid) {
+    auto statements = parser.Parse(item.first);
+    if (!Check(statements.ok(), "INSERT 语义错误样例应先通过 Parser")) {
+      return false;
+    }
+    auto invalid_plan = planner.Build(statements.value()[0], catalog);
+    if (!Check(!invalid_plan.ok() &&
+                   invalid_plan.status().code() == item.second,
+               "INSERT 指定列和多行语义错误类型应准确")) {
+      return false;
+    }
+  }
+
+  return Check(
+      oursql::ToString(parsed.value()[0]) ==
+              "InsertStatement(table=users,columns=[name,id],"
+              "rows=[['Alice',1],['Bob',2]])" &&
+          oursql::ToString(plan.value()) ==
+              "InsertPlan(table=users,columns=[name,id],"
+              "rows=[['Alice',1],['Bob',2]])",
+      "INSERT AST 和 Plan 文本格式应稳定");
+}
+
+bool TestDistinctAndLimitCompileOnly() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+
+  auto parsed = parser.Parse(
+      "SELECT DISTINCT name FROM users LIMIT 0;");
+  if (!Check(parsed.ok(), "DISTINCT LIMIT SELECT 应解析成功")) return false;
+  const auto &select =
+      std::get<oursql::SelectStatement>(parsed.value()[0]);
+  if (!Check(select.distinct &&
+                 select.limit.has_value() &&
+                 *select.limit == 0,
+             "DISTINCT 和 LIMIT 的 AST 字段应正确")) {
+    return false;
+  }
+
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok() &&
+                 std::holds_alternative<oursql::SelectPlan>(plan.value()),
+             "DISTINCT LIMIT SELECT 应生成 SelectPlan")) {
+    return false;
+  }
+  const auto &select_plan = std::get<oursql::SelectPlan>(plan.value());
+  if (!Check(select_plan.distinct &&
+                 select_plan.limit.has_value() &&
+                 *select_plan.limit == 0 &&
+                 select_plan.root != nullptr,
+             "DISTINCT 和 LIMIT 应保留在 SelectPlan 中")) {
+    return false;
+  }
+
+  auto ordinary = parser.Parse(
+      "SELECT id FROM users LIMIT 12;");
+  if (!Check(ordinary.ok(), "普通 LIMIT SELECT 应解析成功")) return false;
+  const auto &ordinary_select =
+      std::get<oursql::SelectStatement>(ordinary.value()[0]);
+  if (!Check(!ordinary_select.distinct &&
+                 ordinary_select.limit.has_value() &&
+                 *ordinary_select.limit == 12,
+             "未使用 DISTINCT 时 AST 标记应为 false")) {
+    return false;
+  }
+
+  const std::vector<std::string> invalid{
+      "SELECT id FROM users LIMIT -1;",
+      "SELECT id FROM users LIMIT;",
+      "SELECT id FROM users LIMIT 1.5;",
+      "SELECT DISTINCT DISTINCT id FROM users;",
+  };
+  for (const auto &sql : invalid) {
+    auto result = parser.Parse(sql);
+    if (!Check(!result.ok(), "非法 DISTINCT/LIMIT 应返回错误")) return false;
+    if (!Check(result.status().message().find("位置") != std::string::npos,
+               "DISTINCT/LIMIT 错误应包含位置")) {
+      return false;
+    }
+  }
+
+  return Check(
+      oursql::ToString(parsed.value()[0]) ==
+              "SelectStatement(table=users,projection=[name],"
+              "distinct=true,limit=0)" &&
+          oursql::ToString(plan.value()) ==
+              "SelectPlan(table=users,root=ProjectPlan(columns=[name],"
+              "child=SeqScanPlan(table=users)),distinct=true,limit=0)",
+      "DISTINCT/LIMIT AST 和 Plan 文本格式应稳定");
+}
+
+bool TestDropTableAndAliasesCompileOnly() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+
+  auto dropped = parser.Parse("DROP TABLE users;");
+  if (!Check(dropped.ok(), "DROP TABLE 应解析成功")) return false;
+  const auto &drop =
+      std::get<oursql::DropTableStatement>(dropped.value()[0]);
+  if (!Check(drop.table_name == "users" && drop.location.line == 1 &&
+                 drop.location.column == 1,
+             "DROP TABLE AST 字段应正确")) {
+    return false;
+  }
+  auto drop_plan = planner.Build(dropped.value()[0], catalog);
+  if (!Check(drop_plan.ok() &&
+                 std::holds_alternative<oursql::DropTablePlan>(
+                     drop_plan.value()),
+             "DROP TABLE 应生成 DropTablePlan")) {
+    return false;
+  }
+  if (!Check(oursql::ToString(drop_plan.value()) ==
+                 "DropTablePlan(table=users)",
+             "DROP TABLE Plan 文本应稳定")) {
+    return false;
+  }
+
+  auto missing = parser.Parse("DROP TABLE missing;");
+  auto missing_plan = planner.Build(missing.value()[0], catalog);
+  if (!Check(missing.ok() && !missing_plan.ok() &&
+                 missing_plan.status().code() == oursql::ErrorCode::NotFound,
+             "DROP TABLE 不存在表应返回 NotFound")) {
+    return false;
+  }
+
+  const std::vector<std::string> invalid_drop{
+      "DROP users;",
+      "DROP TABLE;",
+      "DROP TABLE users",
+  };
+  for (const auto &sql : invalid_drop) {
+    auto parsed = parser.Parse(sql);
+    if (!Check(!parsed.ok(), "非法 DROP TABLE 应返回错误")) return false;
+    if (!Check(parsed.status().message().find("位置") != std::string::npos,
+               "DROP TABLE 错误应包含位置")) {
+      return false;
+    }
+  }
+
+  auto aliased = parser.Parse(
+      "SELECT id AS user_id, name AS user_name "
+      "FROM users AS u LIMIT 1;");
+  if (!Check(aliased.ok(), "列别名和表别名应解析成功")) return false;
+  const auto &select =
+      std::get<oursql::SelectStatement>(aliased.value()[0]);
+  if (!Check(select.table_alias == "u" &&
+                 select.projection_aliases ==
+                     std::vector<std::string>{"user_id", "user_name"} &&
+                 select.limit.has_value() && *select.limit == 1,
+             "AS 别名应保存到 SelectStatement")) {
+    return false;
+  }
+
+  auto alias_plan = planner.Build(aliased.value()[0], catalog);
+  if (!Check(alias_plan.ok() &&
+                 std::holds_alternative<oursql::SelectPlan>(
+                     alias_plan.value()),
+             "AS 别名应生成 SelectPlan")) {
+    return false;
+  }
+  const auto &select_plan = std::get<oursql::SelectPlan>(alias_plan.value());
+  if (!Check(select_plan.table_alias == "u" &&
+                 select_plan.projection_aliases ==
+                     std::vector<std::string>{"user_id", "user_name"},
+             "AS 别名应保留在 SelectPlan")) {
+    return false;
+  }
+  if (!Check(
+          oursql::ToString(aliased.value()[0]) ==
+                  "SelectStatement(table=users,alias=u,projection=[id,name],"
+                  "limit=1,aliases=[user_id,user_name])" &&
+              oursql::ToString(alias_plan.value()) ==
+                  "SelectPlan(table=users,root=ProjectPlan(columns=[id,name],"
+                  "child=SeqScanPlan(table=users)),alias=u,limit=1,"
+                  "aliases=[user_id,user_name])",
+          "AS 别名 AST 和 Plan 文本格式应稳定")) {
+    return false;
+  }
+
+  const std::vector<std::string> invalid_alias{
+      "SELECT * AS all_columns FROM users;",
+      "SELECT id AS FROM users;",
+      "SELECT id FROM users AS;",
+  };
+  for (const auto &sql : invalid_alias) {
+    auto parsed = parser.Parse(sql);
+    if (!Check(!parsed.ok(), "非法 AS 别名应返回错误")) return false;
+    if (!Check(parsed.status().message().find("位置") != std::string::npos,
+               "AS 别名错误应包含位置")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TestCreateDropIndexAndExplain() {
+  oursql::Parser parser;
+  oursql::Planner planner;
+  oursql::TableInfo table{
+      "users",
+      oursql::Schema{{"id", oursql::DataType::Int},
+                     {"name", oursql::DataType::Varchar, 8}},
+      oursql::INVALID_PAGE_ID};
+  FixedCatalogReader no_indexes(table, {});
+  FixedCatalogReader with_indexes(
+      table, {oursql::IndexMetadata{
+                 "idx_users_id", "users", "id", oursql::INVALID_PAGE_ID,
+                 true}});
+
+  auto create = parser.Parse("CREATE INDEX idx_users_id ON users(id);");
+  if (!Check(create.ok(), "CREATE INDEX 应解析成功")) return false;
+  const auto &create_statement =
+      std::get<oursql::CreateIndexStatement>(create.value()[0]);
+  if (!Check(create_statement.index_name == "idx_users_id" &&
+                 create_statement.table_name == "users" &&
+                 create_statement.column_name == "id" &&
+                 !create_statement.is_unique,
+             "CREATE INDEX AST 字段应正确")) {
+    return false;
+  }
+  auto create_plan = planner.Build(create.value()[0], no_indexes);
+  if (!Check(create_plan.ok() &&
+                 std::holds_alternative<oursql::CreateIndexPlan>(
+                     create_plan.value()),
+             "CREATE INDEX 应生成 CreateIndexPlan")) {
+    return false;
+  }
+
+  auto unique = parser.Parse(
+      "CREATE UNIQUE INDEX idx_users_id ON users(id);");
+  if (!Check(unique.ok(), "CREATE UNIQUE INDEX 应解析成功")) return false;
+  const auto &unique_statement =
+      std::get<oursql::CreateIndexStatement>(unique.value()[0]);
+  if (!Check(unique_statement.is_unique,
+             "CREATE UNIQUE INDEX 应保留 unique 标记")) {
+    return false;
+  }
+
+  auto missing_column =
+      parser.Parse("CREATE INDEX bad ON users(missing);");
+  if (!Check(missing_column.ok(), "索引缺列样例应通过 Parser")) {
+    return false;
+  }
+  auto missing_plan = planner.Build(missing_column.value()[0], no_indexes);
+  if (!Check(!missing_plan.ok() &&
+                 missing_plan.status().code() == oursql::ErrorCode::NotFound,
+             "CREATE INDEX 应检查列是否存在")) {
+    return false;
+  }
+
+  auto drop = parser.Parse("DROP INDEX idx_users_id;");
+  if (!Check(drop.ok(), "DROP INDEX 应解析成功")) return false;
+  const auto &drop_statement =
+      std::get<oursql::DropIndexStatement>(drop.value()[0]);
+  if (!Check(drop_statement.index_name == "idx_users_id",
+             "DROP INDEX AST 字段应正确")) {
+    return false;
+  }
+  auto drop_plan = planner.Build(drop.value()[0], no_indexes);
+  if (!Check(drop_plan.ok() &&
+                 std::holds_alternative<oursql::DropIndexPlan>(
+                     drop_plan.value()),
+             "DROP INDEX 应生成 DropIndexPlan")) {
+    return false;
+  }
+
+  auto explain = parser.Parse(
+      "EXPLAIN SELECT * FROM users WHERE id = 1;");
+  if (!Check(explain.ok(), "EXPLAIN SELECT 应解析成功")) return false;
+  auto seq_plan = planner.Build(explain.value()[0], no_indexes);
+  if (!Check(seq_plan.ok() &&
+                 std::holds_alternative<oursql::ExplainPlan>(
+                     seq_plan.value()),
+             "EXPLAIN 应生成 ExplainPlan")) {
+    return false;
+  }
+  const auto &seq_explain = std::get<oursql::ExplainPlan>(seq_plan.value());
+  const auto *seq_project =
+      std::get_if<oursql::ProjectPlan>(&seq_explain.select.root->operation);
+  const auto *seq_filter =
+      seq_project && seq_project->child
+          ? std::get_if<oursql::FilterPlan>(
+                &seq_project->child->operation)
+          : nullptr;
+  if (!Check(seq_filter != nullptr &&
+                 std::holds_alternative<oursql::SeqScanPlan>(
+                     seq_filter->child->operation),
+             "无索引 EXPLAIN 应显示 SeqScan")) {
+    return false;
+  }
+
+  auto indexed_plan = planner.Build(explain.value()[0], with_indexes);
+  if (!Check(indexed_plan.ok() &&
+                 std::holds_alternative<oursql::ExplainPlan>(
+                     indexed_plan.value()),
+             "有索引 EXPLAIN 应规划成功")) {
+    return false;
+  }
+  const auto &index_explain =
+      std::get<oursql::ExplainPlan>(indexed_plan.value());
+  const auto *index_project =
+      std::get_if<oursql::ProjectPlan>(&index_explain.select.root->operation);
+  const auto *index_filter =
+      index_project && index_project->child
+          ? std::get_if<oursql::FilterPlan>(
+                &index_project->child->operation)
+          : nullptr;
+  if (!Check(index_filter != nullptr &&
+                 std::holds_alternative<oursql::IndexScanPlan>(
+                     index_filter->child->operation),
+             "有索引 EXPLAIN 应显示 IndexScan")) {
+    return false;
+  }
+  return Check(oursql::ToString(indexed_plan.value()).find(
+                   "IndexScanPlan") != std::string::npos,
+               "EXPLAIN 文本应包含 IndexScanPlan");
 }
 
 bool TestUpdateCompileOnly() {
@@ -356,6 +791,302 @@ bool TestCompileExpressionParsing() {
                "复杂表达式也应执行列和类型语义检查");
 }
 
+bool TestBetweenInLikeParsing() {
+  oursql::Parser parser;
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Planner planner;
+
+  auto between = parser.Parse(
+      "SELECT * FROM users WHERE id BETWEEN 1 + 1 AND 2 + 1;");
+  if (!Check(between.ok(), "BETWEEN AND 应解析成功")) return false;
+  const auto &between_select =
+      std::get<oursql::SelectStatement>(between.value()[0]);
+  const auto *between_expr =
+      between_select.compile_where
+          ? std::get_if<oursql::CompileBetweenExpr>(
+                &between_select.compile_where->data)
+          : nullptr;
+  const auto *between_lower =
+      between_expr && between_expr->lower
+          ? std::get_if<oursql::CompileLiteralExpr>(
+                &between_expr->lower->data)
+          : nullptr;
+  const auto *between_upper =
+      between_expr && between_expr->upper
+          ? std::get_if<oursql::CompileLiteralExpr>(
+                &between_expr->upper->data)
+          : nullptr;
+  if (!Check(between_expr != nullptr && !between_expr->negated &&
+                 between_lower != nullptr &&
+                 between_lower->integer == 2 &&
+                 between_upper != nullptr &&
+                 between_upper->integer == 3,
+             "BETWEEN 的上下界应完成常量折叠")) {
+    return false;
+  }
+
+  auto not_between = parser.Parse(
+      "SELECT * FROM users WHERE id NOT BETWEEN 1 AND 3;");
+  if (!Check(not_between.ok(), "NOT BETWEEN 应解析成功")) return false;
+  const auto &not_between_select =
+      std::get<oursql::SelectStatement>(not_between.value()[0]);
+  const auto *not_between_expr =
+      not_between_select.compile_where
+          ? std::get_if<oursql::CompileBetweenExpr>(
+                &not_between_select.compile_where->data)
+          : nullptr;
+  if (!Check(not_between_expr != nullptr && not_between_expr->negated,
+             "NOT BETWEEN 应保留否定标记")) {
+    return false;
+  }
+
+  auto in = parser.Parse(
+      "SELECT * FROM users WHERE id NOT IN (1 + 1, 3, id);");
+  if (!Check(in.ok(), "NOT IN 应解析成功")) return false;
+  const auto &in_select =
+      std::get<oursql::SelectStatement>(in.value()[0]);
+  const auto *in_expr =
+      in_select.compile_where
+          ? std::get_if<oursql::CompileInExpr>(&in_select.compile_where->data)
+          : nullptr;
+  if (!Check(in_expr != nullptr && in_expr->negated &&
+                 in_expr->options.size() == 3 &&
+                 std::get_if<oursql::CompileColumnExpr>(
+                     &in_expr->options[2]->data) != nullptr,
+             "NOT IN 的列表表达式应被保留")) {
+    return false;
+  }
+
+  auto like = parser.Parse(
+      "SELECT * FROM users WHERE name LIKE 'A%';");
+  if (!Check(like.ok(), "LIKE 应解析成功")) return false;
+  const auto &like_select =
+      std::get<oursql::SelectStatement>(like.value()[0]);
+  const auto *like_expr =
+      like_select.compile_where
+          ? std::get_if<oursql::CompileBinaryExpr>(
+                &like_select.compile_where->data)
+          : nullptr;
+  if (!Check(like_expr != nullptr && like_expr->op == "like",
+             "LIKE 应表示为二元表达式")) {
+    return false;
+  }
+
+  auto not_like = parser.Parse(
+      "SELECT * FROM users WHERE name NOT LIKE 'A%';");
+  if (!Check(not_like.ok(), "NOT LIKE 应解析成功")) return false;
+  const auto &not_like_select =
+      std::get<oursql::SelectStatement>(not_like.value()[0]);
+  const auto *not_like_expr =
+      not_like_select.compile_where
+          ? std::get_if<oursql::CompileBinaryExpr>(
+                &not_like_select.compile_where->data)
+          : nullptr;
+  if (!Check(not_like_expr != nullptr &&
+                 not_like_expr->op == "not like",
+             "NOT LIKE 应保留否定标记")) {
+    return false;
+  }
+
+  auto constant_between = parser.Parse(
+      "SELECT * FROM users WHERE 2 BETWEEN 1 + 1 AND 3;");
+  if (!Check(constant_between.ok(), "常量 BETWEEN 应解析成功")) return false;
+  const auto &constant_between_select =
+      std::get<oursql::SelectStatement>(constant_between.value()[0]);
+  const auto *constant_between_literal =
+      constant_between_select.compile_where
+          ? std::get_if<oursql::CompileLiteralExpr>(
+                &constant_between_select.compile_where->data)
+          : nullptr;
+  if (!Check(constant_between_literal != nullptr &&
+                 constant_between_literal->kind ==
+                     oursql::CompileLiteralKind::Bool &&
+                 constant_between_literal->text == "true",
+             "纯常量 BETWEEN 应折叠为 TRUE")) {
+    return false;
+  }
+
+  auto constant_in = parser.Parse(
+      "SELECT * FROM users WHERE 2 IN (1 + 1, 3);");
+  if (!Check(constant_in.ok(), "常量 IN 应解析成功")) return false;
+  const auto &constant_in_select =
+      std::get<oursql::SelectStatement>(constant_in.value()[0]);
+  const auto *constant_in_literal =
+      constant_in_select.compile_where
+          ? std::get_if<oursql::CompileLiteralExpr>(
+                &constant_in_select.compile_where->data)
+          : nullptr;
+  if (!Check(constant_in_literal != nullptr &&
+                 constant_in_literal->kind ==
+                     oursql::CompileLiteralKind::Bool &&
+                 constant_in_literal->text == "true",
+             "纯常量 IN 应折叠为 TRUE")) {
+    return false;
+  }
+
+  const std::vector<std::string> valid{
+      "SELECT * FROM users WHERE id BETWEEN 1 AND 3;",
+      "SELECT * FROM users WHERE id IN (1, 2, 3);",
+      "SELECT * FROM users WHERE name LIKE 'A%';",
+  };
+  for (const auto &sql : valid) {
+    auto parsed = parser.Parse(sql);
+    if (!Check(parsed.ok(), "合法 BETWEEN/IN/LIKE 应可解析")) return false;
+    auto plan = planner.Build(parsed.value()[0], catalog);
+    if (!Check(!plan.ok() &&
+                   plan.status().code() == oursql::ErrorCode::NotImplemented,
+               "合法 BETWEEN/IN/LIKE 应完成语义检查后报告未实现")) {
+      return false;
+    }
+  }
+
+  const std::vector<std::pair<std::string, oursql::ErrorCode>> invalid{
+      {"SELECT * FROM users WHERE id BETWEEN 'a' AND 'b';",
+       oursql::ErrorCode::TypeMismatch},
+      {"SELECT * FROM users WHERE id IN (1, '2');",
+       oursql::ErrorCode::TypeMismatch},
+      {"SELECT * FROM users WHERE id LIKE '1%';",
+       oursql::ErrorCode::TypeMismatch},
+      {"SELECT * FROM users WHERE missing IN (1);",
+       oursql::ErrorCode::NotFound},
+  };
+  for (const auto &item : invalid) {
+    auto parsed = parser.Parse(item.first);
+    if (!Check(parsed.ok(), "BETWEEN/IN/LIKE 语义样例应先通过 Parser")) {
+      return false;
+    }
+    auto plan = planner.Build(parsed.value()[0], catalog);
+    if (!Check(!plan.ok() && plan.status().code() == item.second,
+               "BETWEEN/IN/LIKE 应返回准确语义错误")) {
+      return false;
+    }
+  }
+
+  const std::vector<std::string> malformed{
+      "SELECT * FROM users WHERE id IN ();",
+      "SELECT * FROM users WHERE id BETWEEN 1 OR 2;",
+      "SELECT * FROM users WHERE id BETWEEN 1 AND;",
+      "SELECT * FROM users WHERE name LIKE;",
+  };
+  for (const auto &sql : malformed) {
+    auto parsed = parser.Parse(sql);
+    if (!Check(!parsed.ok(), "非法 BETWEEN/IN/LIKE 应返回语法错误")) {
+      return false;
+    }
+    if (!Check(parsed.status().message().find("位置") != std::string::npos,
+               "BETWEEN/IN/LIKE 语法错误应包含位置")) {
+      return false;
+    }
+  }
+
+  const std::string text = oursql::ToString(between.value()[0]);
+  return Check(text.find("between") != std::string::npos &&
+                   text.find(" and ") != std::string::npos,
+               "BETWEEN 应进入稳定 AST 文本");
+}
+
+bool TestAggregateAndHavingCompileOnly() {
+  oursql::Parser parser;
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Planner planner;
+
+  const std::vector<std::pair<std::string, oursql::CompileAggregateKind>>
+      aggregates{
+          {"SELECT COUNT(*) FROM users;", oursql::CompileAggregateKind::Count},
+          {"SELECT SUM(id) FROM users;", oursql::CompileAggregateKind::Sum},
+          {"SELECT AVG(id) FROM users;", oursql::CompileAggregateKind::Avg},
+          {"SELECT MAX(id) FROM users;", oursql::CompileAggregateKind::Max},
+          {"SELECT MIN(id) FROM users;", oursql::CompileAggregateKind::Min},
+      };
+  for (const auto &item : aggregates) {
+    auto parsed = parser.Parse(item.first);
+    if (!Check(parsed.ok(), "聚合函数 SELECT 应解析成功")) return false;
+    const auto &select =
+        std::get<oursql::SelectStatement>(parsed.value()[0]);
+    const auto *aggregate =
+        select.projection_expressions.size() == 1
+            ? std::get_if<oursql::CompileAggregateExpr>(
+                  &select.projection_expressions[0]->data)
+            : nullptr;
+    if (!Check(aggregate != nullptr && aggregate->kind == item.second,
+               "聚合函数 AST 类型应正确")) {
+      return false;
+    }
+    auto plan = planner.Build(parsed.value()[0], catalog);
+    if (!Check(plan.ok() &&
+                   std::get<oursql::SelectPlan>(plan.value()).has_aggregates,
+               "聚合查询应生成带聚合标记的 SelectPlan")) {
+      return false;
+    }
+  }
+
+  auto grouped = parser.Parse(
+      "SELECT name, COUNT(*) FROM users "
+      "GROUP BY name HAVING COUNT(*) >= 2;");
+  if (!Check(grouped.ok(), "GROUP BY + 聚合 + HAVING 应解析成功")) {
+    return false;
+  }
+  const auto &grouped_select =
+      std::get<oursql::SelectStatement>(grouped.value()[0]);
+  const auto *having =
+      grouped_select.having
+          ? std::get_if<oursql::CompileBinaryExpr>(
+                &grouped_select.having->data)
+          : nullptr;
+  if (!Check(grouped_select.projection_expressions.size() == 2 &&
+                 having != nullptr && having->op == ">=",
+             "HAVING 应保存完整聚合比较表达式")) {
+    return false;
+  }
+  auto grouped_plan = planner.Build(grouped.value()[0], catalog);
+  if (!Check(grouped_plan.ok(), "GROUP BY + HAVING 应规划成功")) {
+    return false;
+  }
+  const auto &grouped_select_plan =
+      std::get<oursql::SelectPlan>(grouped_plan.value());
+  if (!Check(grouped_select_plan.has_aggregates &&
+                 grouped_select_plan.having != nullptr &&
+                 grouped_select_plan.projection_expressions.size() == 2,
+             "聚合和 HAVING 应保留在 SelectPlan")) {
+    return false;
+  }
+  const std::string grouped_text = oursql::ToString(grouped_plan.value());
+  if (!Check(grouped_text.find("aggregates=true") != std::string::npos &&
+                 grouped_text.find("having=") != std::string::npos,
+             "Plan 文本应包含聚合和 HAVING 信息")) {
+    return false;
+  }
+
+  const std::vector<std::pair<std::string, oursql::ErrorCode>> invalid{
+      {"SELECT name, COUNT(*) FROM users;",
+       oursql::ErrorCode::InvalidArgument},
+      {"SELECT id FROM users GROUP BY name;",
+       oursql::ErrorCode::InvalidArgument},
+      {"SELECT COUNT(*) FROM users HAVING COUNT(*) > 0;",
+       oursql::ErrorCode::InvalidArgument},
+      {"SELECT SUM(name) FROM users;",
+       oursql::ErrorCode::TypeMismatch},
+      {"SELECT COUNT(*) FROM users WHERE COUNT(*) > 0;",
+       oursql::ErrorCode::InvalidArgument},
+      {"SELECT SUM(COUNT(*)) FROM users;",
+       oursql::ErrorCode::InvalidArgument},
+      {"SELECT SUM(*) FROM users;",
+       oursql::ErrorCode::InvalidArgument},
+  };
+  for (const auto &item : invalid) {
+    auto parsed = parser.Parse(item.first);
+    if (!Check(parsed.ok(), "聚合语义错误样例应先通过 Parser")) {
+      return false;
+    }
+    auto plan = planner.Build(parsed.value()[0], catalog);
+    if (!Check(!plan.ok() && plan.status().code() == item.second,
+               "聚合/HAVING 语义错误类型应准确")) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool TestCompileConstantFolding() {
   oursql::Parser parser;
   auto parsed = parser.Parse(
@@ -415,9 +1146,18 @@ int main() {
   run("Parser errors and positions", &TestParserErrorsHavePositions);
   run("Planner semantic checks", &TestPlannerSemanticChecks);
   run("Plan tree and printing", &TestPlanTreeAndPrinting);
+  run("INSERT columns and multiple rows",
+      &TestInsertColumnListAndMultipleRows);
+  run("DISTINCT and LIMIT compile-only", &TestDistinctAndLimitCompileOnly);
+  run("DROP TABLE and AS compile-only",
+      &TestDropTableAndAliasesCompileOnly);
+  run("CREATE/DROP INDEX and EXPLAIN", &TestCreateDropIndexAndExplain);
   run("UPDATE compile-only", &TestUpdateCompileOnly);
   run("ORDER BY/GROUP BY compile-only", &TestOrderGroupCompileOnly);
   run("Compile expression parsing", &TestCompileExpressionParsing);
+  run("BETWEEN IN LIKE parsing", &TestBetweenInLikeParsing);
+  run("Aggregate and HAVING compile-only",
+      &TestAggregateAndHavingCompileOnly);
   run("Compile constant folding", &TestCompileConstantFolding);
   if (failures == 0) {
     std::cout << "All frontend tests passed\n";

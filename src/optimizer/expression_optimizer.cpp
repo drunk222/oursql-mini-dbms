@@ -34,6 +34,25 @@ CompileExprPtr MakeBool(bool value) {
       CompileExpr::Data(std::move(literal)));
 }
 
+CompileExprPtr MakeBetween(bool negated, CompileExprPtr operand,
+                           CompileExprPtr lower, CompileExprPtr upper) {
+  return std::make_shared<CompileExpr>(CompileExpr::Data(
+      CompileBetweenExpr{std::move(operand), std::move(lower),
+                         std::move(upper), negated}));
+}
+
+CompileExprPtr MakeIn(bool negated, CompileExprPtr operand,
+                      std::vector<CompileExprPtr> options) {
+  return std::make_shared<CompileExpr>(CompileExpr::Data(
+      CompileInExpr{std::move(operand), std::move(options), negated}));
+}
+
+CompileExprPtr MakeAggregate(CompileAggregateKind kind, bool star,
+                             CompileExprPtr argument) {
+  return std::make_shared<CompileExpr>(CompileExpr::Data(
+      CompileAggregateExpr{kind, star, std::move(argument)}));
+}
+
 // 以下类型判断只检查表达式是否为对应种类的字面量。列引用和仍含变量的表达式
 // 都不会被误判为常量。
 bool IsInt(const CompileExprPtr &expr) {
@@ -65,6 +84,13 @@ const CompileLiteralExpr &Literal(const CompileExprPtr &expr) {
 bool BoolValue(const CompileExprPtr &expr) {
   // 当前布尔字面量内部统一使用 "true"/"false" 文本表示。
   return Literal(expr).text == "true";
+}
+
+bool SameLiteralKind(const CompileExprPtr &left,
+                     const CompileExprPtr &right) {
+  return (IsInt(left) && IsInt(right)) ||
+         (IsString(left) && IsString(right)) ||
+         (IsBool(left) && IsBool(right));
 }
 
 // 有符号整数运算必须使用显式溢出检查。若直接执行 C++ 有符号溢出，行为未定义。
@@ -139,7 +165,8 @@ int CompareLiterals(const CompileExprPtr &left, const CompileExprPtr &right) {
 // 递归常量折叠：
 // 1. 先折叠左右子树/操作数；
 // 2. 对能安全求值的纯常量节点返回新字面量；
-// 3. 对包含列引用、除零、溢出或类型不匹配的节点保留原表达式。
+// 3. BETWEEN 和 IN 也会在全部子表达式为同类型常量时折叠；
+// 4. 对包含列引用、除零、溢出或类型不匹配的节点保留原表达式。
 CompileExprPtr FoldCompileExpr(const CompileExprPtr &expr) {
   if (expr == nullptr) return nullptr;
 
@@ -206,6 +233,51 @@ CompileExprPtr FoldCompileExpr(const CompileExprPtr &expr) {
     }
     return std::make_shared<CompileExpr>(
         CompileExpr::Data(CompileUnaryExpr{unary->op, operand}));
+  }
+
+  if (const auto *between = std::get_if<CompileBetweenExpr>(&expr->data)) {
+    CompileExprPtr operand = FoldCompileExpr(between->operand);
+    CompileExprPtr lower = FoldCompileExpr(between->lower);
+    CompileExprPtr upper = FoldCompileExpr(between->upper);
+    if (SameLiteralKind(operand, lower) &&
+        SameLiteralKind(operand, upper)) {
+      const bool in_range =
+          CompareLiterals(operand, lower) >= 0 &&
+          CompareLiterals(operand, upper) <= 0;
+      return MakeBool(between->negated ? !in_range : in_range);
+    }
+    return MakeBetween(between->negated, std::move(operand),
+                       std::move(lower), std::move(upper));
+  }
+
+  if (const auto *in = std::get_if<CompileInExpr>(&expr->data)) {
+    CompileExprPtr operand = FoldCompileExpr(in->operand);
+    std::vector<CompileExprPtr> options;
+    options.reserve(in->options.size());
+    bool all_constants = true;
+    for (const auto &option : in->options) {
+      CompileExprPtr folded = FoldCompileExpr(option);
+      if (!SameLiteralKind(operand, folded)) all_constants = false;
+      options.push_back(std::move(folded));
+    }
+    if (all_constants && !options.empty()) {
+      bool matched = false;
+      for (const auto &option : options) {
+        if (CompareLiterals(operand, option) == 0) {
+          matched = true;
+          break;
+        }
+      }
+      return MakeBool(in->negated ? !matched : matched);
+    }
+    return MakeIn(in->negated, std::move(operand), std::move(options));
+  }
+
+  if (const auto *aggregate =
+          std::get_if<CompileAggregateExpr>(&expr->data)) {
+    if (aggregate->star || aggregate->argument == nullptr) return expr;
+    return MakeAggregate(aggregate->kind, false,
+                         FoldCompileExpr(aggregate->argument));
   }
 
   return expr;

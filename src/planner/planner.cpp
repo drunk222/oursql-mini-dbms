@@ -79,22 +79,68 @@ Status WithLocation(Status status, const Position &position) {
   return Status::InternalError(message);
 }
 
-// 检查 INSERT 值列表。列数决定 VALUES 数量；每个位置都必须和对应列类型
-// 一致，且受 VARCHAR(n) 的字节长度限制。
-Status CheckValues(const std::vector<Value> &values, const Schema &schema) {
-  if (values.size() != schema.size()) {
-    return Status::InvalidArgument("VALUES 数量与列数量不符: 期望 " + std::to_string(schema.size()) +
-                                   "，实际 " + std::to_string(values.size()));
+// 检查单个 INSERT 值是否满足目标列的类型和 VARCHAR 长度约束。
+Status CheckInsertValue(const Value &value, const Column &column,
+                        const std::string &context) {
+  if (value.type() != column.type) {
+    return Status::TypeMismatch(context + "类型不匹配");
   }
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    const auto &column = schema.At(i);
-    if (values[i].type() != column.type) {
-      return Status::TypeMismatch("VALUES 第 " + std::to_string(i + 1) + " 项与列 " + column.name +
-                                  " 类型不匹配");
+  if (column.type == DataType::Varchar && column.length.has_value() &&
+      value.AsVarchar().size() > *column.length) {
+    return Status::InvalidArgument(context + "字符串超过列长度");
+  }
+  return Status::Ok();
+}
+
+// 检查 INSERT 的全部 VALUES 行：
+// - columns 为空时，每行按 Schema 定义顺序对应所有列；
+// - columns 非空时，目标列必须存在且不能重复；
+// - 每行值数量必须等于目标列数量，并按目标列顺序检查类型和长度。
+Status CheckInsertRows(const std::vector<std::vector<Value>> &rows,
+                       const std::vector<std::string> &columns,
+                       const Schema &schema) {
+  if (rows.empty()) {
+    return Status::InvalidArgument("INSERT 至少需要一行 VALUES");
+  }
+
+  std::vector<const Column *> target_columns;
+  if (columns.empty()) {
+    target_columns.reserve(schema.size());
+    for (const auto &column : schema.columns()) {
+      target_columns.push_back(&column);
     }
-    if (column.type == DataType::Varchar && column.length.has_value() &&
-        values[i].AsVarchar().size() > *column.length) {
-      return Status::InvalidArgument("VALUES 字符串超过列长度: " + column.name);
+  } else {
+    std::unordered_set<std::string> seen_columns;
+    target_columns.reserve(columns.size());
+    for (const auto &column_name : columns) {
+      if (!seen_columns.insert(column_name).second) {
+        return Status::AlreadyExists("INSERT 目标列重复: " + column_name);
+      }
+      auto column = schema.FindColumn(column_name);
+      if (!column.ok()) {
+        return Status::NotFound("INSERT 目标列不存在: " + column_name);
+      }
+      target_columns.push_back(column.value());
+    }
+  }
+
+  for (std::size_t row_index = 0; row_index < rows.size(); ++row_index) {
+    const auto &row = rows[row_index];
+    if (row.size() != target_columns.size()) {
+      return Status::InvalidArgument(
+          "INSERT 第 " + std::to_string(row_index + 1) +
+          " 行 VALUES 数量与目标列数量不符: 期望 " +
+          std::to_string(target_columns.size()) + "，实际 " +
+          std::to_string(row.size()));
+    }
+    for (std::size_t value_index = 0; value_index < row.size();
+         ++value_index) {
+      const auto &column = *target_columns[value_index];
+      const std::string context =
+          "INSERT 第 " + std::to_string(row_index + 1) + " 行第 " +
+          std::to_string(value_index + 1) + " 项与列 " + column.name + " ";
+      auto status = CheckInsertValue(row[value_index], column, context);
+      if (!status.ok()) return status;
     }
   }
   return Status::Ok();
@@ -125,8 +171,32 @@ std::string CompileExprText(const CompileExprPtr &expr) {
         } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
           return "(" + CompileExprText(value.left) + " " + value.op + " " +
                  CompileExprText(value.right) + ")";
-        } else {
+        } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
           return "(" + value.op + " " + CompileExprText(value.operand) + ")";
+        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
+          return "(" + CompileExprText(value.operand) + " " +
+                 (value.negated ? "not between " : "between ") +
+                 CompileExprText(value.lower) + " and " +
+                 CompileExprText(value.upper) + ")";
+        } else if constexpr (std::is_same_v<Type, CompileInExpr>) {
+          std::string result = "(" + CompileExprText(value.operand) + " " +
+                               (value.negated ? "not in (" : "in (");
+          for (std::size_t i = 0; i < value.options.size(); ++i) {
+            if (i != 0) result += ", ";
+            result += CompileExprText(value.options[i]);
+          }
+          return result + "))";
+        } else {
+          std::string result;
+          switch (value.kind) {
+            case CompileAggregateKind::Count: result = "count("; break;
+            case CompileAggregateKind::Sum: result = "sum("; break;
+            case CompileAggregateKind::Avg: result = "avg("; break;
+            case CompileAggregateKind::Max: result = "max("; break;
+            case CompileAggregateKind::Min: result = "min("; break;
+          }
+          result += value.star ? "*" : CompileExprText(value.argument);
+          return result + ")";
         }
       },
       expr->data);
@@ -140,6 +210,11 @@ std::string NodeText(const std::shared_ptr<const PlanNode> &node) {
         using Type = std::decay_t<decltype(operation)>;
         if constexpr (std::is_same_v<Type, SeqScanPlan>) {
           return "SeqScanPlan(table=" + operation.table_name + ")";
+        } else if constexpr (std::is_same_v<Type, IndexScanPlan>) {
+          return "IndexScanPlan(table=" + operation.table_name +
+                 ",index=" + operation.index_name +
+                 ",column=" + operation.column_name +
+                 ",key=" + operation.key.ToString() + ")";
         } else if constexpr (std::is_same_v<Type, FilterPlan>) {
           return "FilterPlan(predicate=" + PredicateText(operation.predicate) +
                  ",child=" + NodeText(operation.child) + ")";
@@ -197,7 +272,8 @@ std::string CompileTypeName(CompileType type) {
 // context 用于把错误定位到 WHERE、UPDATE SET 等具体语法位置。
 Result<CompileType> CheckCompileExpr(const CompileExprPtr &expr,
                                      const Schema &schema,
-                                     const std::string &context) {
+                                     const std::string &context,
+                                     bool allow_aggregates = false) {
   if (expr == nullptr) {
     return Result<CompileType>(
         Status::InvalidArgument(context + ": 表达式为空"));
@@ -226,7 +302,8 @@ Result<CompileType> CheckCompileExpr(const CompileExprPtr &expr,
           return Result<CompileType>(CompileType::Bool);
         } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
           // NOT 要求 BOOL 操作数，一元负号只允许 INT。
-          auto operand = CheckCompileExpr(value.operand, schema, context);
+          auto operand = CheckCompileExpr(value.operand, schema, context,
+                                          allow_aggregates);
           if (!operand.ok()) return operand;
           if (value.op == "not") {
             if (operand.value() != CompileType::Bool) {
@@ -246,11 +323,85 @@ Result<CompileType> CheckCompileExpr(const CompileExprPtr &expr,
           }
           return Result<CompileType>(
               Status::InvalidArgument(context + ": 未知一元运算符 " + value.op));
+        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
+          // BETWEEN 要求操作数、下界和上界可比较，当前实现要求三者类型一致。
+          auto operand = CheckCompileExpr(value.operand, schema, context,
+                                          allow_aggregates);
+          if (!operand.ok()) return operand;
+          auto lower = CheckCompileExpr(value.lower, schema, context,
+                                        allow_aggregates);
+          if (!lower.ok()) return lower;
+          auto upper = CheckCompileExpr(value.upper, schema, context,
+                                        allow_aggregates);
+          if (!upper.ok()) return upper;
+          if (operand.value() != lower.value() ||
+              operand.value() != upper.value()) {
+            return Result<CompileType>(Status::TypeMismatch(
+                context + ": BETWEEN 操作数类型不一致"));
+          }
+          return Result<CompileType>(CompileType::Bool);
+        } else if constexpr (std::is_same_v<Type, CompileInExpr>) {
+          // IN 列表至少一项；操作数与所有候选值的类型必须一致。
+          if (value.options.empty()) {
+            return Result<CompileType>(
+                Status::InvalidArgument(context + ": IN 列表不能为空"));
+          }
+          auto operand = CheckCompileExpr(value.operand, schema, context,
+                                          allow_aggregates);
+          if (!operand.ok()) return operand;
+          for (const auto &option : value.options) {
+            auto option_type =
+                CheckCompileExpr(option, schema, context, allow_aggregates);
+            if (!option_type.ok()) return option_type;
+            if (option_type.value() != operand.value()) {
+              return Result<CompileType>(Status::TypeMismatch(
+                  context + ": IN 操作数和候选值类型不一致"));
+            }
+          }
+          return Result<CompileType>(CompileType::Bool);
+        } else if constexpr (std::is_same_v<Type, CompileAggregateExpr>) {
+          if (!allow_aggregates) {
+            return Result<CompileType>(Status::InvalidArgument(
+                context + ": 聚合函数只能用于 SELECT 列表或 HAVING"));
+          }
+          if (value.star) {
+            if (value.kind != CompileAggregateKind::Count) {
+              return Result<CompileType>(Status::InvalidArgument(
+                  context + ": 只有 COUNT 支持 '*'"));
+            }
+            return Result<CompileType>(CompileType::Int);
+          }
+          if (value.argument == nullptr) {
+            return Result<CompileType>(
+                Status::InvalidArgument(context + ": 聚合函数缺少参数"));
+          }
+          // 聚合参数内部禁止再次出现聚合，避免 COUNT(SUM(x)) 这类嵌套。
+          auto argument =
+              CheckCompileExpr(value.argument, schema, context, false);
+          if (!argument.ok()) return argument;
+          if (value.kind == CompileAggregateKind::Count) {
+            return Result<CompileType>(CompileType::Int);
+          }
+          if (value.kind == CompileAggregateKind::Sum ||
+              value.kind == CompileAggregateKind::Avg) {
+            if (argument.value() != CompileType::Int) {
+              return Result<CompileType>(Status::TypeMismatch(
+                  context + ": SUM/AVG 只支持 INT"));
+            }
+            return Result<CompileType>(CompileType::Int);
+          }
+          if (argument.value() == CompileType::Bool) {
+            return Result<CompileType>(Status::TypeMismatch(
+                context + ": MIN/MAX 不支持 BOOL"));
+          }
+          return argument;
         } else {
           // 二元表达式先递归检查左右子树，再组合并检查结果类型。
-          auto left = CheckCompileExpr(value.left, schema, context);
+          auto left = CheckCompileExpr(value.left, schema, context,
+                                       allow_aggregates);
           if (!left.ok()) return left;
-          auto right = CheckCompileExpr(value.right, schema, context);
+          auto right = CheckCompileExpr(value.right, schema, context,
+                                        allow_aggregates);
           if (!right.ok()) return right;
           if (value.op == "and" || value.op == "or") {
             if (left.value() != CompileType::Bool ||
@@ -269,6 +420,14 @@ Result<CompileType> CheckCompileExpr(const CompileExprPtr &expr,
             }
             return Result<CompileType>(CompileType::Int);
           }
+          if (value.op == "like" || value.op == "not like") {
+            if (left.value() != CompileType::Varchar ||
+                right.value() != CompileType::Varchar) {
+              return Result<CompileType>(Status::TypeMismatch(
+                  context + ": LIKE 两侧必须是 VARCHAR"));
+            }
+            return Result<CompileType>(CompileType::Bool);
+          }
           if (value.op == ">" || value.op == ">=" || value.op == "<" ||
               value.op == "<=" || value.op == "=" || value.op == "!=" ||
               value.op == "<>") {
@@ -280,6 +439,87 @@ Result<CompileType> CheckCompileExpr(const CompileExprPtr &expr,
           }
           return Result<CompileType>(
               Status::InvalidArgument(context + ": 未知二元运算符 " + value.op));
+        }
+      },
+      expr->data);
+}
+
+// 递归判断表达式是否包含聚合函数。WHERE 和 UPDATE 不接受聚合；SELECT
+// 投影与 HAVING 则使用该结果决定是否需要执行 GROUP BY 分组规则检查。
+bool ContainsAggregate(const CompileExprPtr &expr) {
+  if (expr == nullptr) return false;
+  return std::visit(
+      [&](const auto &value) -> bool {
+        using Type = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Type, CompileAggregateExpr>) {
+          return true;
+        } else if constexpr (std::is_same_v<Type, CompileColumnExpr> ||
+                             std::is_same_v<Type, CompileLiteralExpr>) {
+          return false;
+        } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
+          return ContainsAggregate(value.operand);
+        } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
+          return ContainsAggregate(value.left) ||
+                 ContainsAggregate(value.right);
+        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
+          return ContainsAggregate(value.operand) ||
+                 ContainsAggregate(value.lower) ||
+                 ContainsAggregate(value.upper);
+        } else {
+          if (ContainsAggregate(value.operand)) return true;
+          for (const auto &option : value.options) {
+            if (ContainsAggregate(option)) return true;
+          }
+          return false;
+        }
+      },
+      expr->data);
+}
+
+// 检查非聚合列是否满足 GROUP BY 约束。聚合节点本身直接放行；其参数已经由
+// CheckCompileExpr 单独检查，不能在这里把参数列错误地要求出现在 GROUP BY。
+Status CheckGroupedExpr(const CompileExprPtr &expr,
+                        const std::unordered_set<std::string> &group_columns,
+                        const std::string &context) {
+  if (expr == nullptr) return Status::Ok();
+  return std::visit(
+      [&](const auto &value) -> Status {
+        using Type = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Type, CompileColumnExpr>) {
+          if (group_columns.find(value.name) == group_columns.end()) {
+            return Status::InvalidArgument(
+                context + ": 非聚合列必须出现在 GROUP BY 中: " + value.name);
+          }
+          return Status::Ok();
+        } else if constexpr (std::is_same_v<Type, CompileLiteralExpr>) {
+          return Status::Ok();
+        } else if constexpr (std::is_same_v<Type, CompileAggregateExpr>) {
+          return Status::Ok();
+        } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
+          return CheckGroupedExpr(value.operand, group_columns, context);
+        } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
+          auto left =
+              CheckGroupedExpr(value.left, group_columns, context);
+          if (!left.ok()) return left;
+          return CheckGroupedExpr(value.right, group_columns, context);
+        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
+          auto operand =
+              CheckGroupedExpr(value.operand, group_columns, context);
+          if (!operand.ok()) return operand;
+          auto lower =
+              CheckGroupedExpr(value.lower, group_columns, context);
+          if (!lower.ok()) return lower;
+          return CheckGroupedExpr(value.upper, group_columns, context);
+        } else {
+          auto operand =
+              CheckGroupedExpr(value.operand, group_columns, context);
+          if (!operand.ok()) return operand;
+          for (const auto &option : value.options) {
+            auto option_status =
+                CheckGroupedExpr(option, group_columns, context);
+            if (!option_status.ok()) return option_status;
+          }
+          return Status::Ok();
         }
       },
       expr->data);
@@ -308,15 +548,29 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           }
           return Result<Plan>(CreateTablePlan{value.table_name, value.schema});
         } else if constexpr (std::is_same_v<Type, InsertStatement>) {
-          // INSERT 必须绑定到已有 Schema，逐项检查数量和类型。
+          // INSERT 必须绑定到已有 Schema；显式列按目标列顺序检查，未指定列
+          // 时按 Schema 定义顺序检查，并验证所有 VALUES 行。
           auto table = RequireTable(catalog, value.table_name);
           if (!table.ok()) return fail_at(table.status());
-          auto values_status = CheckValues(value.values, table.value()->schema);
+          auto values_status = CheckInsertRows(
+              value.rows, value.columns, table.value()->schema);
           if (!values_status.ok()) return fail_at(values_status);
-          return Result<Plan>(InsertPlan{value.table_name, value.values});
+          return Result<Plan>(
+              InsertPlan{value.table_name, value.columns, value.rows});
         } else if constexpr (std::is_same_v<Type, SelectStatement>) {
           auto table = RequireTable(catalog, value.table_name);
           if (!table.ok()) return fail_at(table.status());
+          if (!value.projection_aliases.empty() &&
+              value.projection_aliases.size() != value.projection.size()) {
+            return fail_at(Status::InvalidArgument(
+                "SELECT 列别名数量与投影列数量不一致"));
+          }
+          if (!value.projection_expressions.empty() &&
+              value.projection_expressions.size() !=
+                  value.projection.size()) {
+            return fail_at(Status::InvalidArgument(
+                "SELECT 投影表达式数量与投影列数量不一致"));
+          }
           if (value.compile_where != nullptr) {
             // 先完成表达式列和类型检查，再判断执行层是否支持该形态。
             auto where_type =
@@ -335,16 +589,30 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                 "复杂 WHERE 表达式仅编译层支持，未接入数据库执行"));
           }
           std::unordered_set<std::string> projected;
-          // SELECT * 与显式列列表互斥；显式列不能重复且必须存在。
+          bool has_aggregates = false;
+          // SELECT * 与显式列列表互斥；显式列或聚合表达式不能重复。
           if (value.select_all && !value.projection.empty()) {
             return fail_at(Status::InvalidArgument("SELECT * 不能与列名混用"));
           }
-          for (const auto &column_name : value.projection) {
-            if (!projected.insert(column_name).second) {
-              return fail_at(Status::AlreadyExists("SELECT 重复列: " + column_name));
+          for (std::size_t i = 0; i < value.projection.size(); ++i) {
+            if (!projected.insert(value.projection[i]).second) {
+              return fail_at(Status::AlreadyExists(
+                  "SELECT 重复输出项: " + value.projection[i]));
             }
-            if (!table.value()->schema.FindColumn(column_name).ok()) {
-              return fail_at(Status::NotFound("SELECT 列不存在: " + column_name));
+            const CompileExprPtr &expression =
+                value.projection_expressions.empty()
+                    ? nullptr
+                    : value.projection_expressions[i];
+            if (expression == nullptr) {
+              return fail_at(Status::InvalidArgument(
+                  "SELECT 投影缺少表达式: " + value.projection[i]));
+            }
+            auto expression_type = CheckCompileExpr(
+                expression, table.value()->schema,
+                "SELECT " + value.projection[i], true);
+            if (!expression_type.ok()) return fail_at(expression_type.status());
+            if (ContainsAggregate(expression)) {
+              has_aggregates = true;
             }
           }
           for (const auto &column_name : value.group_by) {
@@ -364,6 +632,36 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
             auto predicate_status = CheckPredicate(*value.where, table.value()->schema);
             if (!predicate_status.ok()) return fail_at(predicate_status);
           }
+          if (value.having != nullptr) {
+            if (value.group_by.empty()) {
+              return fail_at(Status::InvalidArgument(
+                  "HAVING 必须与 GROUP BY 一起使用"));
+            }
+            auto having_type = CheckCompileExpr(
+                value.having, table.value()->schema, "HAVING", true);
+            if (!having_type.ok()) return fail_at(having_type.status());
+            if (having_type.value() != CompileType::Bool) {
+              return fail_at(Status::TypeMismatch(
+                  "HAVING 条件必须为 BOOL，实际 " +
+                  CompileTypeName(having_type.value())));
+            }
+            if (ContainsAggregate(value.having)) has_aggregates = true;
+          }
+          if (has_aggregates || !value.group_by.empty() ||
+              value.having != nullptr) {
+            std::unordered_set<std::string> grouped(
+                value.group_by.begin(), value.group_by.end());
+            for (const auto &expression : value.projection_expressions) {
+              auto grouped_status =
+                  CheckGroupedExpr(expression, grouped, "SELECT");
+              if (!grouped_status.ok()) return fail_at(grouped_status);
+            }
+            if (value.having != nullptr) {
+              auto grouped_status =
+                  CheckGroupedExpr(value.having, grouped, "HAVING");
+              if (!grouped_status.ok()) return fail_at(grouped_status);
+            }
+          }
           // 从叶子向根构造：SeqScan -> Filter? -> GroupBy? -> OrderBy?
           // -> Project。根 Project 永不省略，Executor 依赖它获得输出列。
           std::shared_ptr<const PlanNode> root = std::make_shared<PlanNode>(SeqScanPlan{value.table_name});
@@ -379,7 +677,12 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           // 冻结计划形态：SELECT 的根算子固定为 Project，无 WHERE 时省略 Filter。
           root = std::make_shared<PlanNode>(
               ProjectPlan{root, value.projection, value.select_all});
-          return Result<Plan>(SelectPlan{value.table_name, std::move(root)});
+          // DISTINCT、LIMIT 和 AS 别名都属于 SELECT 根计划元数据；当前只完成
+          // 编译层表达，执行器会在看到这些修饰符时明确返回 NotImplemented。
+          return Result<Plan>(SelectPlan{
+              value.table_name, std::move(root), value.distinct, value.limit,
+              value.projection_aliases, value.table_alias,
+              value.projection_expressions, value.having, has_aggregates});
         } else if constexpr (std::is_same_v<Type, DeleteStatement>) {
           auto table = RequireTable(catalog, value.table_name);
           if (!table.ok()) return fail_at(table.status());
@@ -404,6 +707,39 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
             if (!predicate_status.ok()) return fail_at(predicate_status);
           }
           return Result<Plan>(DeletePlan{value.table_name, value.where});
+        } else if constexpr (std::is_same_v<Type, DropTableStatement>) {
+          // DROP 只验证目标表存在并生成计划，不在 Planner 中修改 Catalog；
+          // 当前 Executor 尚未实现删除表，因此执行时会显式返回 NotImplemented。
+          auto table = RequireTable(catalog, value.table_name);
+          if (!table.ok()) return fail_at(table.status());
+          return Result<Plan>(DropTablePlan{value.table_name});
+        } else if constexpr (std::is_same_v<Type, CreateIndexStatement>) {
+          auto table = RequireTable(catalog, value.table_name);
+          if (!table.ok()) return fail_at(table.status());
+          auto column = table.value()->schema.FindColumn(value.column_name);
+          if (!column.ok()) {
+            return fail_at(Status::NotFound(
+                "索引列不存在: " + value.column_name));
+          }
+          if (column.value()->type != DataType::Int) {
+            return fail_at(Status::TypeMismatch(
+                "当前索引只支持 INT 列: " + value.column_name));
+          }
+          return Result<Plan>(CreateIndexPlan{
+              value.index_name, value.table_name, value.column_name,
+              value.is_unique});
+        } else if constexpr (std::is_same_v<Type, DropIndexStatement>) {
+          // 索引是否存在由执行阶段 IndexManager::DropIndex 统一检查。
+          return Result<Plan>(DropIndexPlan{value.index_name});
+        } else if constexpr (std::is_same_v<Type, ExplainStatement>) {
+          auto inner = Build(value.select, catalog);
+          if (!inner.ok()) return fail_at(inner.status());
+          auto *select = std::get_if<SelectPlan>(&inner.value());
+          if (select == nullptr) {
+            return fail_at(Status::InternalError(
+                "EXPLAIN 内部必须是 SELECT"));
+          }
+          return Result<Plan>(ExplainPlan{*select});
         } else {
           auto table = RequireTable(catalog, value.table_name);
           if (!table.ok()) return fail_at(table.status());
@@ -474,7 +810,12 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
       statement);
   if (!plan.ok()) return plan;
   // 编译层后处理：只允许不改变冻结计划形态的重写规则（见 optimizer.h）。
-  return Optimizer().Optimize(std::move(plan.value()));
+  // SELECT 计划额外携带目标表索引元数据，供索引扫描选择使用。
+  std::vector<IndexMetadata> indexes;
+  if (auto *select = std::get_if<SelectPlan>(&plan.value())) {
+    indexes = catalog.ListTableIndexes(select->table_name);
+  }
+  return Optimizer().Optimize(std::move(plan.value()), indexes);
 }
 
 // 逻辑计划的稳定文本输出，只服务调试和测试，不作为 Executor 的输入格式。
@@ -492,19 +833,78 @@ std::string ToString(const Plan &plan) {
           }
           return result + "])";
         } else if constexpr (std::is_same_v<Type, InsertPlan>) {
-          std::string result = "InsertPlan(table=" + value.table_name + ",values=[";
-          for (std::size_t i = 0; i < value.values.size(); ++i) {
-            if (i != 0) result += ",";
-            result += value.values[i].IsInt() ? value.values[i].ToString()
-                                              : "'" + value.values[i].AsVarchar() + "'";
+          std::string result =
+              "InsertPlan(table=" + value.table_name + ",columns=";
+          if (value.columns.empty()) {
+            result += "*";
+          } else {
+            result += "[";
+            for (std::size_t i = 0; i < value.columns.size(); ++i) {
+              if (i != 0) result += ",";
+              result += value.columns[i];
+            }
+            result += "]";
+          }
+          result += ",rows=[";
+          for (std::size_t row_index = 0; row_index < value.rows.size();
+               ++row_index) {
+            if (row_index != 0) result += ",";
+            result += "[";
+            for (std::size_t i = 0; i < value.rows[row_index].size(); ++i) {
+              if (i != 0) result += ",";
+              result += value.rows[row_index][i].IsInt()
+                            ? value.rows[row_index][i].ToString()
+                            : "'" + value.rows[row_index][i].AsVarchar() + "'";
+            }
+            result += "]";
           }
           return result + "])";
         } else if constexpr (std::is_same_v<Type, SelectPlan>) {
-          return "SelectPlan(table=" + value.table_name + ",root=" + NodeText(value.root) + ")";
+          std::string result =
+              "SelectPlan(table=" + value.table_name +
+              ",root=" + NodeText(value.root);
+          if (!value.table_alias.empty()) {
+            result += ",alias=" + value.table_alias;
+          }
+          if (value.distinct) result += ",distinct=true";
+          if (value.limit.has_value()) {
+            result += ",limit=" + std::to_string(*value.limit);
+          }
+          bool has_alias = false;
+          for (const auto &alias : value.projection_aliases) {
+            if (!alias.empty()) {
+              has_alias = true;
+              break;
+            }
+          }
+          if (has_alias) {
+            result += ",aliases=[";
+            for (std::size_t i = 0; i < value.projection_aliases.size(); ++i) {
+              if (i != 0) result += ",";
+              result += value.projection_aliases[i];
+            }
+            result += "]";
+          }
+          if (value.has_aggregates) result += ",aggregates=true";
+          if (value.having != nullptr) {
+            result += ",having=" + CompileExprText(value.having);
+          }
+          return result + ")";
         } else if constexpr (std::is_same_v<Type, DeletePlan>) {
           std::string result = "DeletePlan(table=" + value.table_name;
           if (value.where.has_value()) result += ",where=" + PredicateText(*value.where);
           return result + ")";
+        } else if constexpr (std::is_same_v<Type, DropTablePlan>) {
+          return "DropTablePlan(table=" + value.table_name + ")";
+        } else if constexpr (std::is_same_v<Type, CreateIndexPlan>) {
+          return "CreateIndexPlan(index=" + value.index_name +
+                 ",table=" + value.table_name +
+                 ",column=" + value.column_name +
+                 ",unique=" + (value.is_unique ? "true" : "false") + ")";
+        } else if constexpr (std::is_same_v<Type, DropIndexPlan>) {
+          return "DropIndexPlan(index=" + value.index_name + ")";
+        } else if constexpr (std::is_same_v<Type, ExplainPlan>) {
+          return "ExplainPlan(select=" + ToString(value.select) + ")";
         } else {
           std::string result = "UpdatePlan(table=" + value.table_name +
                                ",assignments=[";

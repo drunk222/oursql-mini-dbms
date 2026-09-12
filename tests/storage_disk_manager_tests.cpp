@@ -827,7 +827,7 @@ bool TestFrameSnapshots() {
   oursql::BufferPoolManager bpm(2, &dm);
   auto initial = bpm.GetFrameSnapshots();
   if (!Check(initial.size() == 2 && !initial[0].page_id.has_value() &&
-                 !initial[0].is_evictable,
+                 !initial[0].is_evictable && initial[0].state == oursql::FrameState::Empty,
              "空 frame 快照应没有 page_id 且不可淘汰")) {
     CloseDb(dm);
     return false;
@@ -847,6 +847,16 @@ bool TestFrameSnapshots() {
   auto pinned = bpm.GetFrameSnapshots();
   if (!Check(bpm.GetAccessCount() == accesses_before + 1,
              "读取 frame 快照不应增加 Fetch 访问统计")) {
+    CloseDb(dm);
+    return false;
+  }
+  bool loading_state_cleared = false;
+  for (const auto &snapshot : pinned) {
+    if (snapshot.page_id == pages[0]) {
+      loading_state_cleared = snapshot.state == oursql::FrameState::Valid;
+    }
+  }
+  if (!Check(loading_state_cleared, "缺页完成后 frame 状态应为 Valid")) {
     CloseDb(dm);
     return false;
   }
@@ -1203,6 +1213,118 @@ bool TestBufferPoolDeletePersistsFreeListAcrossRestart() {
   }
 }
 
+bool TestConcurrentSamePageLoadUsesOneRead() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  auto allocated = dm.AllocatePage();
+  if (!Check(allocated.ok(), "并发缺页测试页面分配应成功")) return false;
+  oursql::Page page;
+  page.Data()[0] = std::byte{0x4D};
+  if (!Check(dm.WritePage(allocated.value(), page).ok(), "并发缺页测试初始化应成功")) return false;
+  dm.ResetIoStatistics();
+
+  oursql::BufferPoolManager bpm(2, &dm);
+  std::mutex mutex;
+  std::condition_variable condition;
+  int ready = 0;
+  bool go = false;
+  bool first_ok = false;
+  bool second_ok = false;
+  auto worker = [&](bool *ok) {
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      ++ready;
+      condition.notify_all();
+      condition.wait(lock, [&] { return go; });
+    }
+    auto result = bpm.FetchPage(allocated.value());
+    if (!result.ok()) return;
+    auto guard = std::move(result.value());
+    *ok = guard.Data()[0] == std::byte{0x4D};
+  };
+  std::thread first(worker, &first_ok);
+  std::thread second(worker, &second_ok);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    condition.wait(lock, [&] { return ready == 2; });
+    go = true;
+  }
+  condition.notify_all();
+  first.join();
+  second.join();
+  const bool ok = Check(first_ok && second_ok, "并发同页 Fetch 应返回同一份有效内容") &&
+                  Check(dm.GetReadCount() == 1, "并发同页缺页只能产生一次磁盘读取");
+  return Check(bpm.Close().ok() && dm.Close().ok(), "并发同页 Fetch 测试应正常关闭") && ok;
+}
+
+bool TestLoadingFailureRestoresFrame() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  oursql::BufferPoolManager bpm(1, &dm);
+  const auto missing_page = static_cast<oursql::page_id_t>(99);
+  auto failed = bpm.FetchPage(missing_page);
+  if (!Check(!failed.ok(), "不存在页面的缺页读取应失败")) return false;
+  auto allocated = dm.AllocatePage();
+  if (!Check(allocated.ok(), "失败后页面分配应成功")) return false;
+  auto fetched = bpm.FetchPage(allocated.value());
+  const bool ok = Check(fetched.ok(), "缺页失败后 frame 应能重新使用");
+  if (fetched.ok()) {
+    auto guard = std::move(fetched.value());
+  }
+  return Check(bpm.Close().ok() && dm.Close().ok(), "缺页失败恢复测试应正常关闭") && ok;
+}
+
+bool TestDeletePendingBlocksFetchAndReusesPage() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  oursql::BufferPoolManager bpm(2, &dm);
+  auto created = bpm.NewPage();
+  if (!Check(created.ok(), "删除预留测试 NewPage 应成功")) return false;
+  const auto page_id = created.value().PageId();
+  (void)created.value().Release();
+  if (!Check(bpm.BeginPageDeletion(page_id).ok(), "删除预留应成功")) return false;
+  auto blocked = bpm.FetchPage(page_id);
+  if (!Check(!blocked.ok() && blocked.status().code() == oursql::ErrorCode::NotFound,
+             "DeletePending 页面不应产生新的 Fetch guard")) return false;
+  if (!Check(bpm.FinalizePageDeletion(page_id).ok(), "删除预留完成应成功")) return false;
+  auto reused = bpm.NewPage();
+  const bool ok = Check(reused.ok() && reused.value().PageId() == page_id,
+                        "完成删除后 page id 应进入 Free List 并复用");
+  return Check(bpm.Close().ok() && dm.Close().ok(), "删除预留测试应正常关闭") && ok;
+}
+
+bool TestCloseIsIdempotentAndRejectsPendingDeletion() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  oursql::BufferPoolManager bpm(1, &dm);
+  auto created = bpm.NewPage();
+  if (!Check(created.ok(), "Close test should allocate a page")) return false;
+  const auto page_id = created.value().PageId();
+  if (!Check(created.value().Release().ok(), "Close test should release its page guard")) {
+    return false;
+  }
+  if (!Check(bpm.BeginPageDeletion(page_id).ok(), "Close test should reserve deletion")) {
+    return false;
+  }
+  const auto rejected = bpm.Close();
+  if (!Check(!rejected.ok() && rejected.code() == oursql::ErrorCode::InvalidArgument,
+             "Close should report an unfinished page deletion")) {
+    return false;
+  }
+  if (!Check(bpm.CancelPageDeletion(page_id).ok(), "Close test should cancel the reservation")) {
+    return false;
+  }
+  if (!Check(bpm.Close().ok(), "Close should succeed after the reservation is cleared")) {
+    return false;
+  }
+  return Check(bpm.Close().ok() && dm.Close().ok(),
+               "Close should be idempotent for an already closed buffer pool");
+}
+
 }  // namespace
 
 int main() {
@@ -1235,6 +1357,10 @@ int main() {
       &TestPinnedDeletePreservesPageAndAllowsReuse);
   run("Buffer pool delete persists free list across restart",
       &TestBufferPoolDeletePersistsFreeListAcrossRestart);
+  run("Concurrent same-page load uses one read", &TestConcurrentSamePageLoadUsesOneRead);
+  run("Loading failure restores frame", &TestLoadingFailureRestoresFrame);
+  run("DeletePending blocks fetch and reuses page", &TestDeletePendingBlocksFetchAndReusesPage);
+  run("Close deletion contract and idempotence", &TestCloseIsIdempotentAndRejectsPendingDeletion);
 
   if (failures == 0) {
     std::cout << "All storage tests passed\n";

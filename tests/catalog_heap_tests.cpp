@@ -12,6 +12,7 @@
 #include <map>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -986,6 +987,107 @@ bool TestDropIndexReusesAllPagesAcrossRestart() {
                "Drop-index reclaim second lifetime should close cleanly");
 }
 
+bool TestConcurrentHeapScansUseCoupledPageHandoff() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "并发 HeapTable 测试数据库打开应成功")) return false;
+  oursql::BufferPoolManager pool(3, &disk);
+  oursql::Catalog catalog(&pool, &disk);
+  if (!Check(catalog.Open().ok(), "并发 HeapTable Catalog 打开应成功")) return false;
+  if (!Check(catalog.CreateTable(oursql::TableMetadata{"concurrent", UserSchema(),
+                                                        oursql::INVALID_PAGE_ID})
+                 .ok(),
+             "并发 HeapTable 建表应成功")) return false;
+  auto metadata = catalog.GetTableMetadata("concurrent");
+  if (!Check(metadata.ok(), "并发 HeapTable 元数据应存在")) return false;
+  oursql::HeapTable table(&pool, *metadata.value());
+  for (int i = 0; i < 180; ++i) {
+    auto inserted = table.InsertRow(
+        {oursql::Value(static_cast<std::int64_t>(i)), oursql::Value(std::string(60, 'x'))});
+    if (!Check(inserted.ok(), "并发 HeapTable 测试行插入应成功")) return false;
+  }
+
+  std::size_t first_count = 0;
+  std::size_t second_count = 0;
+  bool first_ok = true;
+  bool second_ok = true;
+  auto scan_worker = [&](std::size_t *count, bool *ok) {
+    auto cursor = table.BeginScan();
+    if (!cursor.ok()) {
+      *ok = false;
+      return;
+    }
+    while (true) {
+      auto row = cursor.value().Next();
+      if (!row.ok()) {
+        *ok = false;
+        return;
+      }
+      if (!row.value().has_value()) break;
+      ++*count;
+    }
+  };
+  std::thread first(scan_worker, &first_count, &first_ok);
+  std::thread second(scan_worker, &second_count, &second_ok);
+  first.join();
+  second.join();
+  const bool counts_ok = Check(first_ok && second_ok && first_count == 180 && second_count == 180,
+                               "并发扫描应完整返回每一页的有效行");
+  bool pins_zero = true;
+  for (const auto &snapshot : pool.GetFrameSnapshots()) {
+    if (snapshot.pin_count != 0) pins_zero = false;
+  }
+  const bool close_ok = Check(pins_zero, "并发扫描结束后所有 frame pin_count 应归零") &&
+                        Check(pool.Close().ok() && disk.Close().ok(),
+                              "并发 HeapTable 测试应正常关闭");
+  return counts_ok && close_ok;
+}
+
+bool TestHeapTableSingleFrameHandoffFailsClearly() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "单 frame 页链测试数据库打开应成功")) return false;
+  oursql::BufferPoolManager pool(1, &disk);
+  oursql::page_id_t first = oursql::INVALID_PAGE_ID;
+  oursql::page_id_t second = oursql::INVALID_PAGE_ID;
+  {
+    auto page = pool.NewPage();
+    if (!Check(page.ok(), "单 frame 测试首数据页创建应成功")) return false;
+    first = page.value().PageId();
+    if (!Check(oursql::SlottedPage::Initialize(page.value()).ok(), "首数据页初始化应成功")) {
+      return false;
+    }
+  }
+  {
+    auto page = pool.NewPage();
+    if (!Check(page.ok(), "单 frame 测试后继数据页创建应成功")) return false;
+    second = page.value().PageId();
+    if (!Check(oursql::SlottedPage::Initialize(page.value()).ok(), "后继数据页初始化应成功")) {
+      return false;
+    }
+  }
+  {
+    auto page = pool.FetchPageWrite(first);
+    if (!Check(page.ok(), "单 frame 测试首数据页读取应成功")) return false;
+    if (!Check(oursql::SlottedPage::SetNextPageId(page.value(), second).ok(),
+               "单 frame 测试链表连接应成功")) return false;
+  }
+
+  bool got_clear_failure = false;
+  {
+    oursql::HeapTable table(&pool, oursql::TableMetadata{"single_frame", UserSchema(), first});
+    auto cursor = table.BeginScan();
+    if (!Check(cursor.ok(), "单 frame 测试扫描游标创建应成功")) return false;
+    auto next = cursor.value().Next();
+    got_clear_failure = !next.ok() && next.status().code() == oursql::ErrorCode::NotFound;
+  }
+  const bool close_ok = Check(got_clear_failure,
+                              "单 frame 跨页交接应明确报告无法同时 pin 两页") &&
+                        Check(pool.Close().ok() && disk.Close().ok(),
+                              "单 frame 页链测试应正常关闭");
+  return close_ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1013,6 +1115,10 @@ int main() {
   run("HeapTable large persistence and reclaim", &TestHeapTableLargePersistenceAndReclaim);
   run("DropIndex reuses all pages across restart",
       &TestDropIndexReusesAllPagesAcrossRestart);
+  run("Concurrent HeapTable scans use coupled page handoff",
+      &TestConcurrentHeapScansUseCoupledPageHandoff);
+  run("HeapTable single-frame handoff fails clearly",
+      &TestHeapTableSingleFrameHandoffFailsClearly);
   if (failures == 0) {
     std::cout << "All catalog and heap tests passed\n";
     return 0;

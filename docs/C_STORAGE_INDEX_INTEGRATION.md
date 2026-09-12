@@ -97,8 +97,9 @@ oursql.exe --pool-size 3 --policy fifo demo.oursql
 .stats
 ```
 
-`.buffer` 显示 frame、page、pin、dirty 和 evictable；`.evictions` 显示实际被淘汰的
-page ID，而不是 frame ID。淘汰日志最多保留最近 1024 条，日志只用于观测，不参与恢复。
+`.buffer` 显示 frame、page、pin、dirty 和 evictable；底层 `FrameSnapshot` 另外提供
+`FrameState`，供测试和监控读取。`.evictions` 显示实际被淘汰的 page ID，而不是 frame ID。
+淘汰日志最多保留最近 1024 条，日志只用于观测，不参与恢复。
 
 `oursql_benchmark` 使用固定种子 `20260908`、相同的 4-frame 缓冲池和 WriteBack，分别测量
 顺序、随机、热点三种请求模式下的 FIFO/LRU/CLOCK。每个冷缓存实验都会重新建立同样的
@@ -109,10 +110,17 @@ page ID，而不是 frame ID。淘汰日志最多保留最近 1024 条，日志�
 ### 空数据页回收
 
 `HeapTable::DeleteRow()` 先把 slot 标为 deleted。若删除后目标页没有任何有效记录，且它不是
-`TableMetadata.first_data_page_id`，则前驱页会跳过目标页，之后调用
-`BufferPoolManager::DeletePage()` 将目标页放回 DiskManager 的 Free List。首页是表的稳定入口，
-即使变空也不回收；这样 Catalog 中的入口不会失效。删除部分记录但仍有有效记录的页面也不会
-回收，后续插入可以复用其中的 slot 和空间。
+`TableMetadata.first_data_page_id`，则先按“前驱页 -> 目标页”的顺序重新获取写 Guard，重新确认
+前驱链接和目标页为空，再调用 `BeginPageDeletion(page_id, expected_pins=1)` 进入
+`DeletePending`。此状态禁止新的 Fetch，前驱跳过目标页后释放 Guard，最后调用
+`FinalizePageDeletion()` 将目标页放回 DiskManager 的 Free List。首页是表的稳定入口，即使变空
+也不回收；这样 Catalog 中的入口不会失效。删除部分记录但仍有有效记录的页面也不会回收，
+后续插入可以复用其中的 slot 和空间。
+
+扫描和插入遍历页面链时也使用锁耦合：先在当前页 Guard 仍有效时 Fetch 下一页，取得下一页
+Guard 后才释放当前页。这样交接期间下一页不会被淘汰或回收，也不会在尾部追加时产生两个
+并发后继。多页锁耦合至少需要两个可用 frame；pool size 为 1 时，无法同时 pin 当前页和下一页，
+操作会返回明确的 BufferPool 无可淘汰 frame 错误，不会退回不安全的“先释放再 Fetch”。
 
 这段链表修改没有 WAL 或事务保护。如果在“前驱改链”和“释放目标页”之间发生进程崩溃，当前
 版本不能保证操作原子提交；I/O 错误会向上返回，但可能需要人工检查数据库文件。该边界不应
@@ -130,11 +138,54 @@ WriteThrough 只描述页面写回时机，不提供 WAL、事务原子性或崩
 先记录在 guard 内部，guard 释放前 frame 快照仍可能显示 clean，这是为了让 guard 在离开
 作用域时一次性提交 pin 和 dirty 状态。
 
+### 并发状态和锁顺序
+
+每个 Frame 具有以下状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `Empty` | 没有有效页面，可回收到 Free Frame |
+| `Loading` | 已预留给一次缺页读取，其他线程只能等待 |
+| `Valid` | 页面可正常 Fetch |
+| `Flushing` | 暂时禁止新的 Fetch，等待现有 Guard 结束后写回 |
+| `Evicting` | 已从 Replacer 取出，正在写回旧页并装载新页 |
+| `DeletePending` | 已预留删除，新的 Fetch 被拒绝，等待链修改和物理回收 |
+
+锁和状态的职责如下：
+
+- `BufferPoolManager::mutex_` 保护 Page Table、Frame 元数据、pin、Free Frame、状态和 Replacer 协调。
+- `Frame::latch` 保护该 frame 中的 Page 字节；读 Guard 使用共享锁，写 Guard 使用独占锁。
+- Replacer 自己的 mutex 只保护 FIFO/LRU/CLOCK 的候选状态。
+- `DiskManager::mutex_` 保护文件流、Superblock、Free List 和磁盘统计。
+
+约束是：BufferPool 全局锁不等待 Frame latch，也不执行磁盘 I/O；磁盘 I/O 前 frame 已被
+预留并且不可淘汰；状态变化后用 `condition_variable` 唤醒等待者；Replacer 不反向调用
+BufferPool。Guard 析构时先释放页锁，再减少 pin，避免形成 Frame latch -> BufferPool mutex
+的反向死锁。
+
+缺页流程是：先登记 `Loading` 和 page 映射，再释放 BufferPool 锁读盘；同一 page 的其他请求
+等待该状态，因此只会有一个真实 `DiskManager::ReadPage()`。失败时删除临时映射、归还空 frame、
+恢复 Replacer 并唤醒等待者，失败状态会返回给等待线程，不留下永久 Loading。
+
+脏页淘汰流程是：Replacer 选出 frame 后进入 `Evicting`，释放 BufferPool 锁，在 Frame latch
+下写旧 page，再读取新 page；两次 I/O 都成功后才发布新映射。`FlushPage()` 和 `FlushAllPages()`
+同样先做短暂状态登记，然后在全局锁外等待页锁和执行写盘；成功清除 dirty，失败保留 dirty、
+恢复 `Valid` 并返回错误。当前没有 WAL，因此没有跨页崩溃原子性。
+
+空页回收失败时会保留 `DeletePending` 记录，页面链不会指向已进入 Free List 的页面；调用方可
+在修复 I/O 或结构条件后重试 `FinalizePageDeletion()`，也可调用 `CancelPageDeletion()` 恢复可访问状态。
+当前没有后台回收线程，失败可能暂时占用空间，但不应伪装为成功。
+
 ### 当前边界
 
 - 文件 I/O 仍只允许出现在 `DiskManager`；HeapTable、Catalog、索引和执行层通过 Guard 与
   BufferPoolManager 访问页面。
 - 当前没有事务、MVCC、WAL、后台刷脏线程、并发表级修改和完整 B+ 树算法扩展。
+- B+ 树父子节点、兄弟节点的锁耦合、分裂、合并和根收缩不属于本轮，仍由索引模块负责；本轮只
+  对 HeapTable 数据页链实现锁耦合。
+- 当前没有跨页操作的崩溃原子性；将来接入 WAL 时，淘汰、Flush、WriteThrough 和 Close 都必须
+  遵守日志先于数据页的顺序。
+- 没有后台异步 I/O 线程池；DiskManager 仍以自身 mutex 串行保护同一数据库文件的访问。
 - 页级读写锁保护单个 frame 的字节访问；它与 `pin_count` 是两件事：锁防止同时读写，pin
   防止页面在使用期间被替换。
 - BufferPool 的并发测试使用条件变量协调两个读 guard 和读写等待，不依赖随意 sleep；多个

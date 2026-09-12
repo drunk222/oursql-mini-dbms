@@ -1125,6 +1125,28 @@ Result<std::vector<std::byte>> SlottedPage::GetRecord(const ReadPageGuard &page,
   return Result<std::vector<std::byte>>(std::move(record));
 }
 
+Result<std::vector<std::byte>> SlottedPage::GetRecord(const WritePageGuard &page,
+                                                       slot_id_t slot_id) {
+  if (!page.IsValid()) {
+    return Result<std::vector<std::byte>>(Status::InvalidArgument("读取需要有效的 WritePageGuard"));
+  }
+  auto valid = ValidateBytes(page.Data());
+  if (!valid.ok()) return Result<std::vector<std::byte>>(valid);
+  const auto slot_count = LoadU32LittleEndian(page.Data(), kSlotCountOffset);
+  if (slot_id >= slot_count) {
+    return Result<std::vector<std::byte>>(Status::NotFound("slot_id 不存在: " + std::to_string(slot_id)));
+  }
+  const auto *data = page.Data();
+  if (SlotField(data, slot_id, 8) != kUsedSlot) {
+    return Result<std::vector<std::byte>>(Status::NotFound("slot_id 已删除: " + std::to_string(slot_id)));
+  }
+  const auto offset = SlotField(data, slot_id, 0);
+  const auto length = SlotField(data, slot_id, 4);
+  std::vector<std::byte> record(length);
+  if (length != 0) std::memcpy(record.data(), data + offset, length);
+  return Result<std::vector<std::byte>>(std::move(record));
+}
+
 Status SlottedPage::DeleteRecord(WritePageGuard &page, slot_id_t slot_id) {
   if (!page.IsValid()) {
     return Status::InvalidArgument("删除需要有效的 WritePageGuard");
@@ -1189,6 +1211,15 @@ Result<std::uint32_t> SlottedPage::SlotCount(const ReadPageGuard &page) {
   if (!valid.ok()) {
     return Result<std::uint32_t>(valid);
   }
+  return Result<std::uint32_t>(LoadU32LittleEndian(page.Data(), kSlotCountOffset));
+}
+
+Result<std::uint32_t> SlottedPage::SlotCount(const WritePageGuard &page) {
+  if (!page.IsValid()) {
+    return Result<std::uint32_t>(Status::InvalidArgument("读取 slot_count 需要有效的 WritePageGuard"));
+  }
+  auto valid = ValidateBytes(page.Data());
+  if (!valid.ok()) return Result<std::uint32_t>(valid);
   return Result<std::uint32_t>(LoadU32LittleEndian(page.Data(), kSlotCountOffset));
 }
 
@@ -1281,6 +1312,7 @@ Result<BufferPoolManager::FrameSelection> BufferPoolManager::SelectFrameUnlocked
     if (frame_id >= frames_.size() || frames_[frame_id].page_id != INVALID_PAGE_ID) {
       return Result<FrameSelection>(Status::InternalError("BufferPool 空闲 frame 状态损坏"));
     }
+    frames_[frame_id].state = FrameState::Loading;
     return Result<FrameSelection>(FrameSelection{frame_id, true});
   }
 
@@ -1291,30 +1323,35 @@ Result<BufferPoolManager::FrameSelection> BufferPoolManager::SelectFrameUnlocked
 
   const frame_id_t frame_id = victim.value();
   Frame &frame = frames_[frame_id];
-  if (frame.pin_count != 0 || frame.page_id == INVALID_PAGE_ID) {
+  if (frame.pin_count != 0 || frame.page_id == INVALID_PAGE_ID ||
+      frame.state != FrameState::Valid) {
     return Result<FrameSelection>(Status::InternalError("替换器返回了无效的 frame"));
   }
 
-  if (frame.is_dirty) {
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    const auto write_status = disk_manager_->WritePage(frame.page_id, frame.page);
-    if (!write_status.ok()) {
-      (void)replacer_->Unpin(frame_id);
-      return Result<FrameSelection>(write_status);
-    }
-    frame.is_dirty = false;
-  }
+  frame.state = FrameState::Evicting;
+  ++frame.pin_count;
   return Result<FrameSelection>(FrameSelection{frame_id, false});
 }
 
 void BufferPoolManager::RestoreSelectionUnlocked(const FrameSelection &selection) {
   if (selection.from_free_list) {
+    if (selection.frame_id < frames_.size()) {
+      frames_[selection.frame_id].state = FrameState::Empty;
+    }
     (void)ReturnFreeFrameUnlocked(selection.frame_id);
     return;
   }
   if (selection.frame_id < frames_.size() && frames_[selection.frame_id].page_id != INVALID_PAGE_ID &&
       frames_[selection.frame_id].pin_count == 0) {
     (void)replacer_->Unpin(selection.frame_id);
+  }
+  if (selection.frame_id < frames_.size()) {
+    Frame &frame = frames_[selection.frame_id];
+    if (frame.state == FrameState::Evicting) {
+      frame.state = FrameState::Valid;
+      if (frame.pin_count != 0) --frame.pin_count;
+      (void)replacer_->Unpin(selection.frame_id);
+    }
   }
 }
 
@@ -1332,9 +1369,11 @@ Status BufferPoolManager::ReturnFreeFrameUnlocked(frame_id_t frame_id) {
   return Status::Ok();
 }
 
+void BufferPoolManager::NotifyStateChange() noexcept { state_changed_.notify_all(); }
+
 Status BufferPoolManager::ReleaseGuard(frame_id_t frame_id, page_id_t page_id,
                                        bool is_dirty) noexcept {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   if (frame_id >= frames_.size() || frames_[frame_id].page_id != page_id) {
     return Status::InternalError("PageGuard 对应的 frame 已失效");
   }
@@ -1344,379 +1383,644 @@ Status BufferPoolManager::ReleaseGuard(frame_id_t frame_id, page_id_t page_id,
   }
   frame.is_dirty = frame.is_dirty || is_dirty;
 
-  Status flush_status = Status::Ok();
-  if (flush_policy_ == FlushPolicy::WriteThrough && frame.is_dirty) {
-    // WriteThrough 在最后一个 guard/unpin 释放脏状态时立即写回；失败时保留 dirty，
-    // 使后续显式 Flush 或正常关闭仍有机会重试。
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    flush_status = disk_manager_->WritePage(page_id, frame.page);
-    if (flush_status.ok()) {
-      frame.is_dirty = false;
+  // WriteThrough 只在最后一个 guard 释放后刷盘，避免复制不稳定内容。
+  if (frame.state == FrameState::Valid && flush_policy_ == FlushPolicy::WriteThrough &&
+      frame.is_dirty && frame.pin_count == 1) {
+    --frame.pin_count;
+    frame.state = FrameState::Flushing;
+    ++frame.pin_count;
+    lock.unlock();
+    Status flush_status = Status::Ok();
+    {
+      std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+      flush_status = disk_manager_->WritePage(page_id, frame.page);
     }
+    lock.lock();
+    if (flush_status.ok()) frame.is_dirty = false;
+    frame.state = FrameState::Valid;
+    --frame.pin_count;
+    if (frame.pin_count == 0) (void)replacer_->Unpin(frame_id);
+    NotifyStateChange();
+    return flush_status;
   }
 
   --frame.pin_count;
   if (frame.pin_count == 0) {
-    const auto unpin_status = replacer_->Unpin(frame_id);
-    if (!flush_status.ok()) return flush_status;
+    const auto unpin_status = frame.state == FrameState::DeletePending
+                                  ? Status::Ok()
+                                  : replacer_->Unpin(frame_id);
+    NotifyStateChange();
     return unpin_status;
   }
-  return flush_status;
+  NotifyStateChange();
+  return Status::Ok();
 }
 
 Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return Result<ReadPageGuard>(ready);
-  }
+  if (!ready.ok()) return Result<ReadPageGuard>(ready);
   auto valid = ValidateDataPageId(page_id);
-  if (!valid.ok()) {
-    return Result<ReadPageGuard>(valid);
-  }
+  if (!valid.ok()) return Result<ReadPageGuard>(valid);
   ++access_count_;
 
-  const auto found = page_table_.find(page_id);
-  if (found != page_table_.end()) {
-    Frame &frame = frames_[found->second];
-    const auto access_status = replacer_->RecordAccess(found->second);
-    if (!access_status.ok()) return Result<ReadPageGuard>(access_status);
-    ++frame.pin_count;
-    const auto pin_status = replacer_->Pin(found->second);
-    if (!pin_status.ok()) {
-      --frame.pin_count;
-      return Result<ReadPageGuard>(pin_status);
+  for (;;) {
+    if (delete_pending_pages_.find(page_id) != delete_pending_pages_.end()) {
+      return Result<ReadPageGuard>(Status::NotFound("页面正在删除: " + std::to_string(page_id)));
     }
-    ++hit_count_;
+    const auto found = page_table_.find(page_id);
+    if (found != page_table_.end()) {
+      const frame_id_t frame_id = found->second;
+      Frame &frame = frames_[frame_id];
+      if (frame.state == FrameState::Valid) {
+        const auto pin_status = replacer_->Pin(frame_id);
+        if (!pin_status.ok()) return Result<ReadPageGuard>(pin_status);
+        ++frame.pin_count;
+        const auto access_status = replacer_->RecordAccess(frame_id);
+        if (!access_status.ok()) {
+          --frame.pin_count;
+          (void)replacer_->Unpin(frame_id);
+          return Result<ReadPageGuard>(access_status);
+        }
+        ++hit_count_;
+        lock.unlock();
+        return Result<ReadPageGuard>(ReadPageGuard(this, frame_id, page_id, &frame.latch));
+      }
+      if (frame.state == FrameState::DeletePending) {
+        return Result<ReadPageGuard>(Status::NotFound("页面正在删除: " + std::to_string(page_id)));
+      }
+      ++loading_waiters_[page_id];
+      state_changed_.wait(lock, [&] {
+        const auto current = page_table_.find(page_id);
+        return current == page_table_.end() || frames_[current->second].state == FrameState::Valid ||
+               frames_[current->second].state == FrameState::DeletePending;
+      });
+      auto failure = load_failures_.find(page_id);
+      if (failure != load_failures_.end()) {
+        const Status status = failure->second;
+        auto waiters = loading_waiters_.find(page_id);
+        if (waiters != loading_waiters_.end() && --waiters->second == 0) {
+          loading_waiters_.erase(waiters);
+          load_failures_.erase(failure);
+        }
+        return Result<ReadPageGuard>(status);
+      }
+      auto waiters = loading_waiters_.find(page_id);
+      if (waiters != loading_waiters_.end() && waiters->second != 0) --waiters->second;
+      continue;
+    }
+
+    auto failure = load_failures_.find(page_id);
+    if (failure != load_failures_.end()) {
+      const Status status = failure->second;
+      if (loading_waiters_.find(page_id) == loading_waiters_.end()) load_failures_.erase(failure);
+      return Result<ReadPageGuard>(status);
+    }
+
+    ++miss_count_;
+    auto selected = SelectFrameUnlocked();
+    if (!selected.ok()) return Result<ReadPageGuard>(selected.status());
+    const FrameSelection selection = selected.value();
+    const frame_id_t frame_id = selection.frame_id;
+    Frame &frame = frames_[frame_id];
+    const page_id_t old_page_id = frame.page_id;
+    if (selection.from_free_list) {
+      frame.page_id = page_id;
+      frame.pin_count = 1;
+    } else {
+      page_table_[page_id] = frame_id;
+    }
+    if (selection.from_free_list) page_table_[page_id] = frame_id;
     lock.unlock();
-    return Result<ReadPageGuard>(ReadPageGuard(this, found->second, page_id, &frame.latch));
-  }
 
-  ++miss_count_;
-  auto selected = SelectFrameUnlocked();
-  if (!selected.ok()) {
-    return Result<ReadPageGuard>(selected.status());
-  }
-  const auto selection = selected.value();
-  const frame_id_t frame_id = selection.frame_id;
-  Frame &frame = frames_[frame_id];
-  const page_id_t old_page_id = frame.page_id;
-  auto page = disk_manager_->ReadPage(page_id);
-  if (!page.ok()) {
-    RestoreSelectionUnlocked(selection);
-    return Result<ReadPageGuard>(page.status());
-  }
+    Result<Page> loaded(Status::IOError("页面读取未完成"));
+    Status write_status = Status::Ok();
+    {
+      std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+      if (!selection.from_free_list && frame.is_dirty) {
+        write_status = disk_manager_->WritePage(old_page_id, frame.page);
+      }
+      if (write_status.ok()) loaded = disk_manager_->ReadPage(page_id);
+      if (loaded.ok()) {
+        frame.page = std::move(loaded.value());
+      } else if (selection.from_free_list) {
+        frame.page = Page{};
+      }
+    }
 
-  if (old_page_id != INVALID_PAGE_ID) {
-    page_table_.erase(old_page_id);
-  }
-  frame.page = std::move(page.value());
-  frame.page_id = page_id;
-  frame.pin_count = 1;
-  frame.is_dirty = false;
-  page_table_[page_id] = frame_id;
-  (void)replacer_->Remove(frame_id);
-  (void)replacer_->RecordAccess(frame_id);
-  if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
-    ++eviction_count_;
-    if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
-    eviction_log_.push_back(old_page_id);
-  }
-  lock.unlock();
-  return Result<ReadPageGuard>(ReadPageGuard(this, frame_id, page_id, &frame.latch));
-}
+    lock.lock();
+    if (!write_status.ok() || !loaded.ok()) {
+      const Status status = !write_status.ok() ? write_status : loaded.status();
+      page_table_.erase(page_id);
+      if (selection.from_free_list) {
+        frame.page = Page{};
+        frame.page_id = INVALID_PAGE_ID;
+        frame.pin_count = 0;
+        frame.is_dirty = false;
+        frame.state = FrameState::Empty;
+        (void)ReturnFreeFrameUnlocked(frame_id);
+      } else {
+        frame.pin_count = 0;
+        frame.state = FrameState::Valid;
+        (void)replacer_->Unpin(frame_id);
+      }
+      load_failures_[page_id] = status;
+      NotifyStateChange();
+      return Result<ReadPageGuard>(status);
+    }
 
+    if (!selection.from_free_list) {
+      page_table_.erase(old_page_id);
+      if (old_page_id != INVALID_PAGE_ID) {
+        ++eviction_count_;
+        if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
+        eviction_log_.push_back(old_page_id);
+      }
+    }
+    frame.page_id = page_id;
+    frame.pin_count = 1;
+    frame.is_dirty = false;
+    frame.state = FrameState::Valid;
+    (void)replacer_->Remove(frame_id);
+    (void)replacer_->RecordAccess(frame_id);
+    NotifyStateChange();
+    lock.unlock();
+    return Result<ReadPageGuard>(ReadPageGuard(this, frame_id, page_id, &frame.latch));
+  }
+  }
 Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return Result<WritePageGuard>(ready);
-  }
+  if (!ready.ok()) return Result<WritePageGuard>(ready);
   auto valid = ValidateDataPageId(page_id);
-  if (!valid.ok()) {
-    return Result<WritePageGuard>(valid);
-  }
+  if (!valid.ok()) return Result<WritePageGuard>(valid);
   ++access_count_;
 
-  const auto found = page_table_.find(page_id);
-  if (found != page_table_.end()) {
-    Frame &frame = frames_[found->second];
-    const auto access_status = replacer_->RecordAccess(found->second);
-    if (!access_status.ok()) return Result<WritePageGuard>(access_status);
-    ++frame.pin_count;
-    const auto pin_status = replacer_->Pin(found->second);
-    if (!pin_status.ok()) {
-      --frame.pin_count;
-      return Result<WritePageGuard>(pin_status);
+  for (;;) {
+    if (delete_pending_pages_.find(page_id) != delete_pending_pages_.end()) {
+      return Result<WritePageGuard>(Status::NotFound("页面正在删除: " + std::to_string(page_id)));
     }
-    ++hit_count_;
+    const auto found = page_table_.find(page_id);
+    if (found != page_table_.end()) {
+      const frame_id_t frame_id = found->second;
+      Frame &frame = frames_[frame_id];
+      if (frame.state == FrameState::Valid) {
+        const auto pin_status = replacer_->Pin(frame_id);
+        if (!pin_status.ok()) return Result<WritePageGuard>(pin_status);
+        ++frame.pin_count;
+        const auto access_status = replacer_->RecordAccess(frame_id);
+        if (!access_status.ok()) {
+          --frame.pin_count;
+          (void)replacer_->Unpin(frame_id);
+          return Result<WritePageGuard>(access_status);
+        }
+        ++hit_count_;
+        lock.unlock();
+        return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch));
+      }
+      if (frame.state == FrameState::DeletePending) {
+        return Result<WritePageGuard>(Status::NotFound("页面正在删除: " + std::to_string(page_id)));
+      }
+      ++loading_waiters_[page_id];
+      state_changed_.wait(lock, [&] {
+        const auto current = page_table_.find(page_id);
+        return current == page_table_.end() || frames_[current->second].state == FrameState::Valid ||
+               frames_[current->second].state == FrameState::DeletePending;
+      });
+      auto failure = load_failures_.find(page_id);
+      if (failure != load_failures_.end()) {
+        const Status status = failure->second;
+        auto waiters = loading_waiters_.find(page_id);
+        if (waiters != loading_waiters_.end() && --waiters->second == 0) {
+          loading_waiters_.erase(waiters);
+          load_failures_.erase(failure);
+        }
+        return Result<WritePageGuard>(status);
+      }
+      auto waiters = loading_waiters_.find(page_id);
+      if (waiters != loading_waiters_.end() && waiters->second != 0) --waiters->second;
+      continue;
+    }
+    auto failure = load_failures_.find(page_id);
+    if (failure != load_failures_.end()) {
+      const Status status = failure->second;
+      if (loading_waiters_.find(page_id) == loading_waiters_.end()) load_failures_.erase(failure);
+      return Result<WritePageGuard>(status);
+    }
+
+    ++miss_count_;
+    auto selected = SelectFrameUnlocked();
+    if (!selected.ok()) return Result<WritePageGuard>(selected.status());
+    const FrameSelection selection = selected.value();
+    const frame_id_t frame_id = selection.frame_id;
+    Frame &frame = frames_[frame_id];
+    const page_id_t old_page_id = frame.page_id;
+    if (selection.from_free_list) {
+      frame.page_id = page_id;
+      frame.pin_count = 1;
+    }
+    page_table_[page_id] = frame_id;
     lock.unlock();
-    return Result<WritePageGuard>(WritePageGuard(this, found->second, page_id, &frame.latch));
-  }
 
-  ++miss_count_;
-  auto selected = SelectFrameUnlocked();
-  if (!selected.ok()) {
-    return Result<WritePageGuard>(selected.status());
+    Result<Page> loaded(Status::IOError("页面读取未完成"));
+    Status write_status = Status::Ok();
+    {
+      std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+      if (!selection.from_free_list && frame.is_dirty) {
+        write_status = disk_manager_->WritePage(old_page_id, frame.page);
+      }
+      if (write_status.ok()) loaded = disk_manager_->ReadPage(page_id);
+      if (loaded.ok()) {
+        frame.page = std::move(loaded.value());
+      } else if (selection.from_free_list) {
+        frame.page = Page{};
+      }
+    }
+    lock.lock();
+    if (!write_status.ok() || !loaded.ok()) {
+      const Status status = !write_status.ok() ? write_status : loaded.status();
+      page_table_.erase(page_id);
+      if (selection.from_free_list) {
+        frame.page = Page{};
+        frame.page_id = INVALID_PAGE_ID;
+        frame.pin_count = 0;
+        frame.is_dirty = false;
+        frame.state = FrameState::Empty;
+        (void)ReturnFreeFrameUnlocked(frame_id);
+      } else {
+        frame.pin_count = 0;
+        frame.state = FrameState::Valid;
+        (void)replacer_->Unpin(frame_id);
+      }
+      load_failures_[page_id] = status;
+      NotifyStateChange();
+      return Result<WritePageGuard>(status);
+    }
+    if (!selection.from_free_list) {
+      page_table_.erase(old_page_id);
+      if (old_page_id != INVALID_PAGE_ID) {
+        ++eviction_count_;
+        if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
+        eviction_log_.push_back(old_page_id);
+      }
+    }
+    frame.page_id = page_id;
+    frame.pin_count = 1;
+    frame.is_dirty = false;
+    frame.state = FrameState::Valid;
+    (void)replacer_->Remove(frame_id);
+    (void)replacer_->RecordAccess(frame_id);
+    NotifyStateChange();
+    lock.unlock();
+    return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch));
   }
-  const auto selection = selected.value();
-  const frame_id_t frame_id = selection.frame_id;
-  Frame &frame = frames_[frame_id];
-  const page_id_t old_page_id = frame.page_id;
-  auto page = disk_manager_->ReadPage(page_id);
-  if (!page.ok()) {
-    RestoreSelectionUnlocked(selection);
-    return Result<WritePageGuard>(page.status());
   }
-
-  if (old_page_id != INVALID_PAGE_ID) {
-    page_table_.erase(old_page_id);
-  }
-  frame.page = std::move(page.value());
-  frame.page_id = page_id;
-  frame.pin_count = 1;
-  frame.is_dirty = false;
-  page_table_[page_id] = frame_id;
-  (void)replacer_->Remove(frame_id);
-  (void)replacer_->RecordAccess(frame_id);
-  if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
-    ++eviction_count_;
-    if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
-    eviction_log_.push_back(old_page_id);
-  }
-  lock.unlock();
-  return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch));
-}
-
 Result<WritePageGuard> BufferPoolManager::NewPage() {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return Result<WritePageGuard>(ready);
-  }
-
+  if (!ready.ok()) return Result<WritePageGuard>(ready);
   auto selected = SelectFrameUnlocked();
-  if (!selected.ok()) {
-    return Result<WritePageGuard>(selected.status());
-  }
-  const auto selection = selected.value();
+  if (!selected.ok()) return Result<WritePageGuard>(selected.status());
+  const FrameSelection selection = selected.value();
   const frame_id_t frame_id = selection.frame_id;
   Frame &frame = frames_[frame_id];
   const page_id_t old_page_id = frame.page_id;
-  auto allocated = disk_manager_->AllocatePage();
-  if (!allocated.ok()) {
-    RestoreSelectionUnlocked(selection);
-    return Result<WritePageGuard>(allocated.status());
+  if (selection.from_free_list) frame.pin_count = 1;
+  lock.unlock();
+
+  Status write_status = Status::Ok();
+  {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    if (!selection.from_free_list && frame.is_dirty) {
+      write_status = disk_manager_->WritePage(old_page_id, frame.page);
+    }
+  }
+  Result<page_id_t> allocated(Status::IOError("页面分配未完成"));
+  if (write_status.ok()) allocated = disk_manager_->AllocatePage();
+
+  if (write_status.ok() && allocated.ok()) {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    frame.page = Page{};
+  } else if (selection.from_free_list) {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    frame.page = Page{};
   }
 
-  if (old_page_id != INVALID_PAGE_ID) {
-    page_table_.erase(old_page_id);
+  lock.lock();
+  if (!write_status.ok() || !allocated.ok()) {
+    const Status status = !write_status.ok() ? write_status : allocated.status();
+    if (selection.from_free_list) {
+      frame.page_id = INVALID_PAGE_ID;
+      frame.pin_count = 0;
+      frame.is_dirty = false;
+      frame.state = FrameState::Empty;
+      (void)ReturnFreeFrameUnlocked(frame_id);
+    } else {
+      frame.pin_count = 0;
+      frame.state = FrameState::Valid;
+      (void)replacer_->Unpin(frame_id);
+    }
+    NotifyStateChange();
+    return Result<WritePageGuard>(status);
   }
-  frame.page = Page{};
-  frame.page_id = allocated.value();
-  frame.pin_count = 1;
-  frame.is_dirty = false;
-  page_table_[allocated.value()] = frame_id;
-  (void)replacer_->Remove(frame_id);
-  (void)replacer_->RecordAccess(frame_id);
-  if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
+
+  if (!selection.from_free_list) {
+    page_table_.erase(old_page_id);
     ++eviction_count_;
     if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
     eviction_log_.push_back(old_page_id);
   }
+  frame.page_id = allocated.value();
+  frame.pin_count = 1;
+  frame.is_dirty = false;
+  frame.state = FrameState::Valid;
+  page_table_[frame.page_id] = frame_id;
+  (void)replacer_->Remove(frame_id);
+  (void)replacer_->RecordAccess(frame_id);
+  NotifyStateChange();
   lock.unlock();
-  return Result<WritePageGuard>(WritePageGuard(this, frame_id, allocated.value(), &frame.latch));
-}
-
-Status BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return ready;
+  return Result<WritePageGuard>(WritePageGuard(this, frame_id, frame.page_id, &frame.latch));
   }
+Status BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  auto ready = EnsureReadyUnlocked();
+  if (!ready.ok()) return ready;
   const auto found = page_table_.find(page_id);
   if (found == page_table_.end()) {
-    return Status::NotFound("页面不在缓冲池中: " + std::to_string(page_id));
+    return Status::NotFound("页面不在 BufferPool 中: " + std::to_string(page_id));
   }
-  Frame &frame = frames_[found->second];
+  const frame_id_t frame_id = found->second;
+  Frame &frame = frames_[frame_id];
   if (frame.pin_count == 0) {
     return Status::InvalidArgument("页面不能重复 Unpin: " + std::to_string(page_id));
   }
   frame.is_dirty = frame.is_dirty || is_dirty;
-
-  Status flush_status = Status::Ok();
-  if (flush_policy_ == FlushPolicy::WriteThrough && frame.is_dirty) {
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    flush_status = disk_manager_->WritePage(page_id, frame.page);
-    if (flush_status.ok()) {
-      frame.is_dirty = false;
+  if (frame.state == FrameState::Valid && flush_policy_ == FlushPolicy::WriteThrough &&
+      frame.is_dirty && frame.pin_count == 1) {
+    --frame.pin_count;
+    frame.state = FrameState::Flushing;
+    ++frame.pin_count;
+    lock.unlock();
+    Status flush_status = Status::Ok();
+    {
+      std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+      flush_status = disk_manager_->WritePage(page_id, frame.page);
     }
+    lock.lock();
+    if (flush_status.ok()) frame.is_dirty = false;
+    frame.state = FrameState::Valid;
+    --frame.pin_count;
+    if (frame.pin_count == 0) (void)replacer_->Unpin(frame_id);
+    NotifyStateChange();
+    return flush_status;
   }
-
   --frame.pin_count;
   if (frame.pin_count == 0) {
-    const auto unpin_status = replacer_->Unpin(found->second);
-    if (!flush_status.ok()) return flush_status;
+    const auto unpin_status = frame.state == FrameState::DeletePending
+                                  ? Status::Ok()
+                                  : replacer_->Unpin(frame_id);
+    NotifyStateChange();
     return unpin_status;
   }
-  return flush_status;
-}
-
-Status BufferPoolManager::FlushPage(page_id_t page_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return ready;
+  NotifyStateChange();
+  return Status::Ok();
   }
+Status BufferPoolManager::FlushPage(page_id_t page_id) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  auto ready = EnsureReadyUnlocked();
+  if (!ready.ok()) return ready;
   const auto found = page_table_.find(page_id);
   if (found == page_table_.end()) {
-    return Status::NotFound("页面不在缓冲池中，无法 Flush: " + std::to_string(page_id));
+    return Status::NotFound("页面不在 BufferPool 中，无法 Flush: " + std::to_string(page_id));
   }
-  Frame &frame = frames_[found->second];
-  std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-  if (!frame.is_dirty) {
+  const frame_id_t frame_id = found->second;
+  Frame &frame = frames_[frame_id];
+  if (frame.state == FrameState::DeletePending) {
+    return Status::NotFound("页面正在删除，无法 Flush: " + std::to_string(page_id));
+  }
+  while (frame.state != FrameState::Valid) {
+    state_changed_.wait(lock, [&] {
+      const auto current = page_table_.find(page_id);
+      return current == page_table_.end() || frame.state == FrameState::Valid ||
+             frame.state == FrameState::DeletePending;
+    });
+    if (page_table_.find(page_id) == page_table_.end()) {
+      return Status::NotFound("页面加载失败，无法 Flush: " + std::to_string(page_id));
+    }
+    if (frame.state == FrameState::DeletePending) {
+      return Status::NotFound("页面正在删除，无法 Flush: " + std::to_string(page_id));
+    }
+  }
+  const bool was_unpinned = frame.pin_count == 0;
+  if (was_unpinned) {
+    const auto pin_status = replacer_->Pin(frame_id);
+    if (!pin_status.ok()) return pin_status;
+  }
+  frame.state = FrameState::Flushing;
+  ++frame.pin_count;
+  if (!frame.is_dirty && frame.pin_count > 1) {
+    frame.state = FrameState::Valid;
+    --frame.pin_count;
+    NotifyStateChange();
     return Status::Ok();
   }
-  const auto write_status = disk_manager_->WritePage(page_id, frame.page);
-  if (write_status.ok()) {
-    frame.is_dirty = false;
+  state_changed_.wait(lock, [&] {
+    return frame.state != FrameState::Flushing || frame.pin_count == 1;
+  });
+  if (frame.state != FrameState::Flushing) {
+    return Status::InvalidArgument("页面 Flush 状态已改变: " + std::to_string(page_id));
   }
+  lock.unlock();
+  Status write_status = Status::Ok();
+  {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    if (frame.is_dirty) write_status = disk_manager_->WritePage(page_id, frame.page);
+  }
+  lock.lock();
+  if (write_status.ok()) frame.is_dirty = false;
+  frame.state = FrameState::Valid;
+  --frame.pin_count;
+  if (frame.pin_count == 0) (void)replacer_->Unpin(frame_id);
+  NotifyStateChange();
   return write_status;
+  }
+Status BufferPoolManager::FlushAllPages() {
+  std::vector<page_id_t> pages;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto ready = EnsureReadyUnlocked();
+    if (!ready.ok()) return ready;
+    pages.reserve(frames_.size());
+    for (const auto &frame : frames_) {
+      if (frame.page_id != INVALID_PAGE_ID && frame.state != FrameState::Empty) {
+        pages.push_back(frame.page_id);
+      }
+    }
+  }
+  for (const auto page_id : pages) {
+    const auto status = FlushPage(page_id);
+    if (!status.ok() && status.code() != ErrorCode::NotFound) return status;
+  }
+  return Status::Ok();
+  }
+Status BufferPoolManager::DeletePage(page_id_t page_id) {
+  const auto begin = BeginPageDeletion(page_id);
+  if (!begin.ok()) return begin;
+  return FinalizePageDeletion(page_id);
+  }
+
+Status BufferPoolManager::BeginPageDeletion(page_id_t page_id) {
+  return BeginPageDeletion(page_id, 0);
 }
 
-Status BufferPoolManager::FlushAllPages() {
+Status BufferPoolManager::BeginPageDeletion(page_id_t page_id, std::uint32_t expected_pins) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return ready;
+  if (!ready.ok()) return ready;
+  auto valid = ValidateDataPageId(page_id);
+  if (!valid.ok()) return valid;
+  if (!delete_pending_pages_.insert(page_id).second) {
+    return Status::AlreadyExists("页面已经处于删除预留状态: " + std::to_string(page_id));
   }
-  for (auto &frame : frames_) {
-    if (frame.page_id == INVALID_PAGE_ID || !frame.is_dirty) {
-      continue;
+  const auto found = page_table_.find(page_id);
+  if (found != page_table_.end()) {
+    Frame &frame = frames_[found->second];
+    if (frame.state != FrameState::Valid || frame.pin_count != expected_pins) {
+      delete_pending_pages_.erase(page_id);
+      return Status::InvalidArgument("被 pin 的页面不能删除: " + std::to_string(page_id));
     }
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    const auto write_status = disk_manager_->WritePage(frame.page_id, frame.page);
-    if (!write_status.ok()) {
-      return write_status;
+    const auto pin_status = replacer_->Pin(found->second);
+    if (!pin_status.ok()) {
+      delete_pending_pages_.erase(page_id);
+      return pin_status;
     }
-    frame.is_dirty = false;
+    frame.state = FrameState::DeletePending;
   }
+  NotifyStateChange();
   return Status::Ok();
 }
 
-Status BufferPoolManager::DeletePage(page_id_t page_id) {
+Status BufferPoolManager::CancelPageDeletion(page_id_t page_id) {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return ready;
+  if (delete_pending_pages_.find(page_id) == delete_pending_pages_.end()) {
+    return Status::NotFound("页面没有删除预留: " + std::to_string(page_id));
   }
-  return DeletePageUnlocked(page_id);
+  const auto found = page_table_.find(page_id);
+  if (found != page_table_.end()) {
+    Frame &frame = frames_[found->second];
+    if (frame.state != FrameState::DeletePending || frame.pin_count != 0) {
+      return Status::InvalidArgument("页面删除预留正在使用: " + std::to_string(page_id));
+    }
+    frame.state = FrameState::Valid;
+    (void)replacer_->Unpin(found->second);
+  }
+  delete_pending_pages_.erase(page_id);
+  NotifyStateChange();
+  return Status::Ok();
+}
+
+Status BufferPoolManager::FinalizePageDeletion(page_id_t page_id) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  auto ready = EnsureReadyUnlocked();
+  if (!ready.ok()) return ready;
+  if (delete_pending_pages_.find(page_id) == delete_pending_pages_.end()) {
+    return Status::NotFound("页面没有删除预留: " + std::to_string(page_id));
+  }
+  const auto found = page_table_.find(page_id);
+  if (found == page_table_.end()) {
+    lock.unlock();
+    const auto status = disk_manager_->DeallocatePage(page_id);
+    lock.lock();
+    if (status.ok()) delete_pending_pages_.erase(page_id);
+    NotifyStateChange();
+    return status;
+  }
+
+  const frame_id_t frame_id = found->second;
+  Frame &frame = frames_[frame_id];
+  if (frame.state != FrameState::DeletePending || frame.pin_count != 0) {
+    return Status::InvalidArgument("页面删除预留仍有引用: " + std::to_string(page_id));
+  }
+  frame.pin_count = 1;
+  lock.unlock();
+
+  Status write_status = Status::Ok();
+  {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    if (frame.is_dirty) write_status = disk_manager_->WritePage(page_id, frame.page);
+  }
+  Status delete_status = write_status;
+  if (delete_status.ok()) delete_status = disk_manager_->DeallocatePage(page_id);
+  if (delete_status.ok()) {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    frame.page = Page{};
+  }
+
+  lock.lock();
+  if (!delete_status.ok()) {
+    frame.pin_count = 0;
+    frame.state = FrameState::DeletePending;
+    NotifyStateChange();
+    return delete_status;
+  }
+  page_table_.erase(found);
+  frame.page_id = INVALID_PAGE_ID;
+  frame.pin_count = 0;
+  frame.is_dirty = false;
+  frame.state = FrameState::Empty;
+  delete_pending_pages_.erase(page_id);
+  (void)replacer_->Remove(frame_id);
+  const auto free_status = ReturnFreeFrameUnlocked(frame_id);
+  NotifyStateChange();
+  return free_status;
 }
 
 Status BufferPoolManager::DeletePages(const std::vector<page_id_t> &page_ids) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return ready;
-  }
-
   std::unordered_set<page_id_t> seen;
-  seen.reserve(page_ids.size());
   for (const auto page_id : page_ids) {
     auto valid = ValidateDataPageId(page_id);
-    if (!valid.ok()) {
-      return valid;
-    }
+    if (!valid.ok()) return valid;
     if (!seen.insert(page_id).second) {
       return Status::InvalidArgument("批量删除列表包含重复页面: " + std::to_string(page_id));
     }
-    const auto found = page_table_.find(page_id);
-    if (found != page_table_.end() && frames_[found->second].pin_count != 0) {
-      return Status::InvalidArgument("被 pin 的页面不能删除: " + std::to_string(page_id));
-    }
   }
-
-  // Without WAL, a later I/O failure may leave an earlier page already released.
+  std::vector<page_id_t> reserved;
+  reserved.reserve(page_ids.size());
   for (const auto page_id : page_ids) {
-    auto status = DeletePageUnlocked(page_id);
+    const auto status = BeginPageDeletion(page_id);
     if (!status.ok()) {
+      for (const auto reserved_id : reserved) (void)CancelPageDeletion(reserved_id);
+      return status;
+    }
+    reserved.push_back(page_id);
+  }
+  for (std::size_t i = 0; i < reserved.size(); ++i) {
+    const auto status = FinalizePageDeletion(reserved[i]);
+    if (!status.ok()) {
+      for (std::size_t j = i + 1; j < reserved.size(); ++j) {
+        (void)CancelPageDeletion(reserved[j]);
+      }
       return status;
     }
   }
   return Status::Ok();
-}
-
-Status BufferPoolManager::DeletePageUnlocked(page_id_t page_id) {
-  auto valid = ValidateDataPageId(page_id);
-  if (!valid.ok()) {
-    return valid;
   }
-
-  const auto found = page_table_.find(page_id);
-  if (found == page_table_.end()) {
-    return disk_manager_->DeallocatePage(page_id);
-  }
-  const frame_id_t frame_id = found->second;
-  Frame &frame = frames_[frame_id];
-  if (frame.pin_count != 0) {
-    return Status::InvalidArgument("被 pin 的页面不能删除: " + std::to_string(page_id));
-  }
-  const auto pin_status = replacer_->Pin(frame_id);
-  if (!pin_status.ok()) {
-    return pin_status;
-  }
-  if (frame.is_dirty) {
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    const auto write_status = disk_manager_->WritePage(page_id, frame.page);
-    if (!write_status.ok()) {
-      (void)replacer_->Unpin(frame_id);
-      return write_status;
-    }
-  }
-  const auto deallocate_status = disk_manager_->DeallocatePage(page_id);
-  if (!deallocate_status.ok()) {
-    (void)replacer_->Unpin(frame_id);
-    return deallocate_status;
-  }
-  page_table_.erase(found);
-  {
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    frame.page = Page{};
-    frame.page_id = INVALID_PAGE_ID;
-    frame.pin_count = 0;
-    frame.is_dirty = false;
-  }
-  (void)replacer_->Remove(frame_id);
-  if (const auto free_status = ReturnFreeFrameUnlocked(frame_id); !free_status.ok()) {
-    return free_status;
-  }
-  return Status::Ok();
-}
-
 Status BufferPoolManager::Close() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) return Status::Ok();
+  }
+  const auto flush_status = FlushAllPages();
+  if (!flush_status.ok()) return flush_status;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (closed_) {
-    return Status::Ok();
-  }
-  auto ready = EnsureReadyUnlocked();
-  if (!ready.ok()) {
-    return ready;
-  }
-  for (auto &frame : frames_) {
-    if (frame.page_id == INVALID_PAGE_ID || !frame.is_dirty) {
-      continue;
-    }
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    const auto write_status = disk_manager_->WritePage(frame.page_id, frame.page);
-    if (!write_status.ok()) {
-      return write_status;
-    }
-    frame.is_dirty = false;
+  if (closed_) return Status::Ok();
+  if (!delete_pending_pages_.empty()) {
+    return Status::InvalidArgument("BufferPool 仍有待完成的页面删除");
   }
   closed_ = true;
+  NotifyStateChange();
   return Status::Ok();
-}
-
+  }
 const Status &BufferPoolManager::GetInitStatus() const noexcept { return init_status_; }
 
 std::uint64_t BufferPoolManager::GetAccessCount() const {
@@ -1769,6 +2073,7 @@ std::vector<FrameSnapshot> BufferPoolManager::GetFrameSnapshots() const {
     if (frame.page_id != INVALID_PAGE_ID) snapshot.page_id = frame.page_id;
     snapshot.pin_count = frame.pin_count;
     snapshot.is_dirty = frame.is_dirty;
+    snapshot.state = frame.state;
     snapshot.is_evictable = frame.page_id != INVALID_PAGE_ID &&
                             frame.pin_count == 0 && replacer_->IsEvictable(frame_id);
     snapshots.push_back(snapshot);

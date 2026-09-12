@@ -43,6 +43,21 @@ Result<std::optional<RowEntry>> HeapTable::ScanCursor::Next() {
       page_loaded_ = true;
     }
 
+    if (page_guard_.has_value() && !page_loaded_) {
+      auto valid = SlottedPage::Validate(*page_guard_);
+      if (!valid.ok()) {
+        page_guard_.reset();
+        return Result<std::optional<RowEntry>>(valid);
+      }
+      auto count = SlottedPage::SlotCount(*page_guard_);
+      if (!count.ok()) {
+        page_guard_.reset();
+        return Result<std::optional<RowEntry>>(count.status());
+      }
+      slot_count_ = count.value();
+      page_loaded_ = true;
+    }
+
     while (next_slot_ < slot_count_) {
       const auto slot_id = static_cast<slot_id_t>(next_slot_++);
       auto record = SlottedPage::GetRecord(*page_guard_, slot_id);
@@ -65,8 +80,17 @@ Result<std::optional<RowEntry>> HeapTable::ScanCursor::Next() {
 
     // 当前页耗尽后沿 next_page_id 前进，并从新页的 slot 0 重新开始。
     auto next = SlottedPage::NextPageId(*page_guard_);
-    page_guard_.reset();
     if (!next.ok()) return Result<std::optional<RowEntry>>(next.status());
+    if (next.value() != INVALID_PAGE_ID) {
+      // 先 pin 下一页，再释放当前页，防止链交接期间目标页被淘汰或回收。
+      auto next_result = buffer_pool_->FetchPage(next.value());
+      if (!next_result.ok()) return Result<std::optional<RowEntry>>(next_result.status());
+      auto next_guard = std::move(next_result.value());
+      page_guard_.reset();
+      page_guard_.emplace(std::move(next_guard));
+    } else {
+      page_guard_.reset();
+    }
     current_page_ = next.value();
     page_loaded_ = false;
     next_slot_ = 0;
@@ -88,7 +112,6 @@ Result<RID> HeapTable::InsertRow(const Row &row) {
   if (metadata_.first_data_page_id == INVALID_PAGE_ID || metadata_.first_data_page_id == 0) {
     return Result<RID>(Status::InvalidArgument("HeapTable 缺少首数据页"));
   }
-  // 先完成类型/长度校验和序列化，失败时不会触碰任何数据页。
   auto encoded = RowCodec::Encode(metadata_.schema, row);
   if (!encoded.ok()) return Result<RID>(encoded.status());
   if (encoded.value().size() > SlottedPage::kMaxRecordSize) {
@@ -98,70 +121,66 @@ Result<RID> HeapTable::InsertRow(const Row &row) {
 
   page_id_t current = metadata_.first_data_page_id;
   std::unordered_set<page_id_t> visited;
-  // 采用 first-fit：从首页起寻找第一个能容纳记录的页面。
+  std::optional<WritePageGuard> current_guard;
   while (true) {
     if (current == 0 || current == INVALID_PAGE_ID || !visited.insert(current).second) {
       return Result<RID>(Status::InvalidArgument("数据页链表损坏或成环"));
     }
-    auto page_result = buffer_pool_->FetchPageWrite(current);
-    if (!page_result.ok()) return Result<RID>(page_result.status());
-    page_id_t next = INVALID_PAGE_ID;
-    bool inserted = false;
-    slot_id_t slot_id = 0;
-    {
-      auto page = std::move(page_result.value());
-      auto slot = SlottedPage::InsertRecord(page, encoded.value());
-      if (slot.ok()) {
-        inserted = true;
-        slot_id = slot.value();
-      } else if (slot.status().code() != ErrorCode::OutOfSpace) {
-        return Result<RID>(slot.status());
-      } else {
-        // 页满不是错误：若已有后继页则继续尝试，否则在链尾扩容。
-        auto next_result = SlottedPage::NextPageId(page);
-        if (!next_result.ok()) return Result<RID>(next_result.status());
-        next = next_result.value();
-      }
+    if (!current_guard.has_value()) {
+      auto page_result = buffer_pool_->FetchPageWrite(current);
+      if (!page_result.ok()) return Result<RID>(page_result.status());
+      current_guard.emplace(std::move(page_result.value()));
     }
-    if (inserted) return Result<RID>(RID{current, slot_id});
+
+    auto slot = SlottedPage::InsertRecord(*current_guard, encoded.value());
+    if (slot.ok()) return Result<RID>(RID{current, slot.value()});
+    if (slot.status().code() != ErrorCode::OutOfSpace) {
+      return Result<RID>(slot.status());
+    }
+    auto next_result = SlottedPage::NextPageId(*current_guard);
+    if (!next_result.ok()) return Result<RID>(next_result.status());
+    const page_id_t next = next_result.value();
     if (next != INVALID_PAGE_ID) {
+      auto next_page_result = buffer_pool_->FetchPageWrite(next);
+      if (!next_page_result.ok()) return Result<RID>(next_page_result.status());
+      auto next_guard = std::move(next_page_result.value());
+      const auto release_status = current_guard->Release();
+      current_guard.reset();
+      if (!release_status.ok()) return Result<RID>(release_status);
+      current_guard.emplace(std::move(next_guard));
       current = next;
       continue;
     }
 
-    // 链尾无空间：先创建并初始化新页，再把旧尾页指向它。
+    // 尾页仍由当前 WriteGuard 保护，创建和链接新页期间不会出现两个后继。
     auto new_page_result = buffer_pool_->NewPageGuarded();
     if (!new_page_result.ok()) return Result<RID>(new_page_result.status());
-    page_id_t new_page_id = INVALID_PAGE_ID;
-    Status init_status = Status::Ok();
-    {
-      auto new_page = std::move(new_page_result.value());
-      new_page_id = new_page.PageId();
-      init_status = SlottedPage::Initialize(new_page);
-    }
+    auto new_page = std::move(new_page_result.value());
+    const page_id_t new_page_id = new_page.PageId();
+    auto init_status = SlottedPage::Initialize(new_page);
     if (!init_status.ok()) {
+      (void)new_page.Release();
       (void)buffer_pool_->DeletePage(new_page_id);
       return Result<RID>(init_status);
     }
-
-    auto link_result = buffer_pool_->FetchPageWrite(current);
-    if (!link_result.ok()) {
+    auto new_slot = SlottedPage::InsertRecord(new_page, encoded.value());
+    if (!new_slot.ok()) {
+      (void)new_page.Release();
       (void)buffer_pool_->DeletePage(new_page_id);
-      return Result<RID>(link_result.status());
+      return Result<RID>(new_slot.status());
     }
-    {
-      auto link_page = std::move(link_result.value());
-      auto link_status = SlottedPage::SetNextPageId(link_page, new_page_id);
-      if (!link_status.ok()) {
-        (void)buffer_pool_->DeletePage(new_page_id);
-        return Result<RID>(link_status);
-      }
+    auto link_status = SlottedPage::SetNextPageId(*current_guard, new_page_id);
+    if (!link_status.ok()) {
+      (void)new_page.Release();
+      (void)buffer_pool_->DeletePage(new_page_id);
+      return Result<RID>(link_status);
     }
-    // 下一轮会在刚创建的空页执行正常插入，统一 RID 的生成路径。
-    current = new_page_id;
+    const auto release_status = current_guard->Release();
+    current_guard.reset();
+    if (!release_status.ok()) return Result<RID>(release_status);
+    return Result<RID>(RID{new_page_id, new_slot.value()});
   }
-}
-
+  }
 Status HeapTable::ValidateRidPage(page_id_t page_id) {
   if (page_id == 0 || page_id == INVALID_PAGE_ID) {
     return Status::NotFound("RID 页面编号非法: " + std::to_string(page_id));
@@ -173,18 +192,30 @@ Status HeapTable::ValidateRidPage(page_id_t page_id) {
   // page_id 全局存在并不代表属于本表；沿本表页链验证所有权，防止跨表 RID 访问。
   page_id_t current = metadata_.first_data_page_id;
   std::unordered_set<page_id_t> visited;
+  std::optional<ReadPageGuard> page_guard;
   while (current != INVALID_PAGE_ID) {
     if (current == 0 || !visited.insert(current).second) {
       return Status::InvalidArgument("数据页链表损坏或成环");
     }
-    auto page_result = buffer_pool_->FetchPage(current);
-    if (!page_result.ok()) return page_result.status();
-    auto page = std::move(page_result.value());
-    auto valid = SlottedPage::Validate(page);
+    if (!page_guard.has_value()) {
+      auto page_result = buffer_pool_->FetchPage(current);
+      if (!page_result.ok()) return page_result.status();
+      page_guard.emplace(std::move(page_result.value()));
+    }
+    auto valid = SlottedPage::Validate(*page_guard);
     if (!valid.ok()) return valid;
-    auto next = SlottedPage::NextPageId(page);
+    auto next = SlottedPage::NextPageId(*page_guard);
     if (!next.ok()) return next.status();
     if (current == page_id) return Status::Ok();
+    if (next.value() != INVALID_PAGE_ID) {
+      auto next_result = buffer_pool_->FetchPage(next.value());
+      if (!next_result.ok()) return next_result.status();
+      auto next_guard = std::move(next_result.value());
+      page_guard.reset();
+      page_guard.emplace(std::move(next_guard));
+    } else {
+      page_guard.reset();
+    }
     current = next.value();
   }
   return Status::NotFound("RID 页面不属于当前表: " + std::to_string(page_id));
@@ -208,83 +239,91 @@ Status HeapTable::DeleteRow(const RID &rid) {
   auto ownership = ValidateRidPage(rid.page_id);
   if (!ownership.ok()) return ownership;
 
-  page_id_t target_next = INVALID_PAGE_ID;
-  {
-    auto page_result = buffer_pool_->FetchPageWrite(rid.page_id);
-    if (!page_result.ok()) return page_result.status();
-    auto page = std::move(page_result.value());
-    auto next_result = SlottedPage::NextPageId(page);
-    if (!next_result.ok()) return next_result.status();
-    target_next = next_result.value();
-    auto delete_status = SlottedPage::DeleteRecord(page, rid.slot_id);
-    if (!delete_status.ok()) return delete_status;
-    // 显式释放，使 WriteThrough 的 I/O 错误能够返回给调用者。
-    auto release_status = page.Release();
-    if (!release_status.ok()) return release_status;
-  }
+  auto target_result = buffer_pool_->FetchPageWrite(rid.page_id);
+  if (!target_result.ok()) return target_result.status();
+  auto target_page = std::move(target_result.value());
+  auto next_result = SlottedPage::NextPageId(target_page);
+  if (!next_result.ok()) return next_result.status();
+  auto delete_status = SlottedPage::DeleteRecord(target_page, rid.slot_id);
+  if (!delete_status.ok()) return delete_status;
+  const auto release_status = target_page.Release();
+  if (!release_status.ok()) return release_status;
 
-  // 首数据页是 TableMetadata 的稳定入口，即使为空也必须保留。
   if (rid.page_id == metadata_.first_data_page_id) return Status::Ok();
 
-  bool page_empty = true;
-  {
-    auto page_result = buffer_pool_->FetchPage(rid.page_id);
-    if (!page_result.ok()) return page_result.status();
-    auto page = std::move(page_result.value());
-    auto count_result = SlottedPage::SlotCount(page);
-    if (!count_result.ok()) return count_result.status();
-    for (std::uint32_t slot = 0; slot < count_result.value(); ++slot) {
-      auto record = SlottedPage::GetRecord(page, static_cast<slot_id_t>(slot));
-      if (record.ok()) {
-        page_empty = false;
-        break;
-      }
-      if (record.status().code() != ErrorCode::NotFound) return record.status();
-    }
-  }
-  if (!page_empty) return Status::Ok();
-
-  // 找到前驱后跳过空页，再把它交给 BufferPoolManager 回收到磁盘空闲链表。
+  // 先按链顺序找到前驱；跨页交接时先 pin 下一页，再释放当前页。
   page_id_t predecessor = INVALID_PAGE_ID;
   page_id_t current = metadata_.first_data_page_id;
   std::unordered_set<page_id_t> visited;
+  std::optional<ReadPageGuard> cursor;
   while (current != INVALID_PAGE_ID && current != rid.page_id) {
     if (current == 0 || !visited.insert(current).second) {
       return Status::InvalidArgument("数据页链表损坏或成环");
     }
-    auto page_result = buffer_pool_->FetchPage(current);
-    if (!page_result.ok()) return page_result.status();
-    auto page = std::move(page_result.value());
-    auto next_result = SlottedPage::NextPageId(page);
-    if (!next_result.ok()) return next_result.status();
-    if (next_result.value() == rid.page_id) {
+    if (!cursor.has_value()) {
+      auto page_result = buffer_pool_->FetchPage(current);
+      if (!page_result.ok()) return page_result.status();
+      cursor.emplace(std::move(page_result.value()));
+    }
+    auto next = SlottedPage::NextPageId(*cursor);
+    if (!next.ok()) return next.status();
+    if (next.value() == rid.page_id) {
       predecessor = current;
       break;
     }
-    current = next_result.value();
+    if (next.value() == INVALID_PAGE_ID) break;
+    auto next_result_for_cursor = buffer_pool_->FetchPage(next.value());
+    if (!next_result_for_cursor.ok()) return next_result_for_cursor.status();
+    auto next_cursor = std::move(next_result_for_cursor.value());
+    cursor.reset();
+    cursor.emplace(std::move(next_cursor));
+    current = next.value();
   }
+  cursor.reset();
   if (predecessor == INVALID_PAGE_ID) {
     return Status::InternalError("已确认归属的数据页找不到前驱: " + std::to_string(rid.page_id));
   }
 
-  {
-    auto predecessor_result = buffer_pool_->FetchPageWrite(predecessor);
-    if (!predecessor_result.ok()) return predecessor_result.status();
-    auto predecessor_page = std::move(predecessor_result.value());
-    auto next_result = SlottedPage::NextPageId(predecessor_page);
-    if (!next_result.ok()) return next_result.status();
-    if (next_result.value() != rid.page_id) {
-      return Status::InvalidArgument("删除空数据页时发现链表发生变化");
-    }
-    auto link_status = SlottedPage::SetNextPageId(predecessor_page, target_next);
-    if (!link_status.ok()) return link_status;
-    auto release_status = predecessor_page.Release();
-    if (!release_status.ok()) return release_status;
+  auto predecessor_result = buffer_pool_->FetchPageWrite(predecessor);
+  if (!predecessor_result.ok()) return predecessor_result.status();
+  auto predecessor_page = std::move(predecessor_result.value());
+  auto predecessor_next = SlottedPage::NextPageId(predecessor_page);
+  if (!predecessor_next.ok()) return predecessor_next.status();
+  if (predecessor_next.value() != rid.page_id) {
+    return Status::InvalidArgument("删除空数据页时发现链表已变化");
   }
 
-  return buffer_pool_->DeletePage(rid.page_id);
-}
+  auto target_again_result = buffer_pool_->FetchPageWrite(rid.page_id);
+  if (!target_again_result.ok()) return target_again_result.status();
+  auto target_again = std::move(target_again_result.value());
+  auto target_next_again = SlottedPage::NextPageId(target_again);
+  if (!target_next_again.ok()) return target_next_again.status();
+  auto target_count = SlottedPage::SlotCount(target_again);
+  if (!target_count.ok()) return target_count.status();
+  for (std::uint32_t slot = 0; slot < target_count.value(); ++slot) {
+    auto record = SlottedPage::GetRecord(target_again, static_cast<slot_id_t>(slot));
+    if (record.ok()) {
+      return Status::Ok();
+    }
+    if (record.status().code() != ErrorCode::NotFound) return record.status();
+  }
 
+  auto reserve_status = buffer_pool_->BeginPageDeletion(rid.page_id, 1);
+  if (!reserve_status.ok()) return reserve_status;
+  auto link_status = SlottedPage::SetNextPageId(predecessor_page, target_next_again.value());
+  if (!link_status.ok()) {
+    (void)target_again.Release();
+    (void)predecessor_page.Release();
+    (void)buffer_pool_->CancelPageDeletion(rid.page_id);
+    return link_status;
+  }
+  const auto target_release = target_again.Release();
+  const auto predecessor_release = predecessor_page.Release();
+  if (!target_release.ok() || !predecessor_release.ok()) {
+    return !target_release.ok() ? target_release : predecessor_release;
+  }
+  return buffer_pool_->FinalizePageDeletion(rid.page_id);
+}
 Result<std::vector<RowEntry>> HeapTable::Scan() {
   // 便利接口：消费惰性游标并物化整表；执行 SELECT 时优先直接使用 BeginScan。
   std::vector<RowEntry> rows;
@@ -312,22 +351,31 @@ Status HeapTable::Destroy() {
   std::vector<page_id_t> pages;
   std::unordered_set<page_id_t> visited;
   page_id_t current = metadata_.first_data_page_id;
+  std::optional<ReadPageGuard> page_guard;
   while (current != INVALID_PAGE_ID) {
     if (current == 0 || !visited.insert(current).second) {
       return Status::InvalidArgument("HeapTable data page chain is invalid or cyclic");
     }
-    auto page_result = buffer_pool_->FetchPage(current);
-    if (!page_result.ok()) return page_result.status();
-    page_id_t next = INVALID_PAGE_ID;
-    {
-      auto page = std::move(page_result.value());
-      auto valid = SlottedPage::Validate(page);
-      if (!valid.ok()) return valid;
-      auto next_result = SlottedPage::NextPageId(page);
-      if (!next_result.ok()) return next_result.status();
-      next = next_result.value();
+    if (!page_guard.has_value()) {
+      auto page_result = buffer_pool_->FetchPage(current);
+      if (!page_result.ok()) return page_result.status();
+      page_guard.emplace(std::move(page_result.value()));
     }
+    auto valid = SlottedPage::Validate(*page_guard);
+    if (!valid.ok()) return valid;
+    auto next_result = SlottedPage::NextPageId(*page_guard);
+    if (!next_result.ok()) return next_result.status();
+    const page_id_t next = next_result.value();
     pages.push_back(current);
+    if (next != INVALID_PAGE_ID) {
+      auto next_page_result = buffer_pool_->FetchPage(next);
+      if (!next_page_result.ok()) return next_page_result.status();
+      auto next_guard = std::move(next_page_result.value());
+      page_guard.reset();
+      page_guard.emplace(std::move(next_guard));
+    } else {
+      page_guard.reset();
+    }
     current = next;
   }
 

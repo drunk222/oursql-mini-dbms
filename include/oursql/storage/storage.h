@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -122,6 +123,16 @@ enum class ReplacementPolicy {
 enum class FlushPolicy {
   WriteBack,
   WriteThrough,
+};
+
+// BufferPool 内部状态由全局 mutex 保护，页面字节由 Frame latch 保护。
+enum class FrameState {
+  Empty,
+  Loading,
+  Valid,
+  Flushing,
+  Evicting,
+  DeletePending,
 };
 
 // 调用者：BufferPoolManager；作用：管理可淘汰的未 pin frame；返回：替换操作状态。
@@ -296,12 +307,15 @@ class SlottedPage {
   // 调用者：扫描或读取流程；作用：读取有效槽中的原始记录；返回：记录字节或错误。
   [[nodiscard]] static Result<std::vector<std::byte>> GetRecord(const ReadPageGuard &page,
                                                                   slot_id_t slot_id);
+  [[nodiscard]] static Result<std::vector<std::byte>> GetRecord(const WritePageGuard &page,
+                                                                  slot_id_t slot_id);
   // 调用者：删除流程；作用：将槽标记为 deleted 并释放其逻辑空间；返回：操作状态。
   [[nodiscard]] static Status DeleteRecord(WritePageGuard &page, slot_id_t slot_id);
   // 调用者：页面维护流程；作用：整理有效记录并保持 slot_id 不变；返回：操作状态。
   [[nodiscard]] static Status Compact(WritePageGuard &page);
   // 调用者：页面元数据读取流程；作用：读取槽数量；返回：数量或格式错误。
   [[nodiscard]] static Result<std::uint32_t> SlotCount(const ReadPageGuard &page);
+  [[nodiscard]] static Result<std::uint32_t> SlotCount(const WritePageGuard &page);
   // 调用者：页面链表读取流程；作用：读取下一页编号；返回：编号或格式错误。
   [[nodiscard]] static Result<page_id_t> NextPageId(const ReadPageGuard &page);
   // 调用者：页面链表修改流程；作用：从写 guard 读取下一页编号；返回：编号或格式错误。
@@ -319,10 +333,19 @@ struct FrameSnapshot {
   std::uint32_t pin_count{0};
   bool is_dirty{false};
   bool is_evictable{false};
+  FrameState state{FrameState::Empty};
 };
 
 class BufferPoolManager {
  public:
+  // 调用者：HeapTable 回收空数据页；作用：原子预留未被引用的页面，禁止新的 Fetch；返回：预留状态。
+  [[nodiscard]] Status BeginPageDeletion(page_id_t page_id);
+  // 调用者：持有目标页唯一 WriteGuard 的 HeapTable；作用：把该 guard 作为唯一允许的预留引用；返回：预留状态。
+  [[nodiscard]] Status BeginPageDeletion(page_id_t page_id, std::uint32_t expected_pins);
+  // 调用者：HeapTable 摘链失败路径；作用：取消删除预留并恢复页面；返回：恢复状态。
+  [[nodiscard]] Status CancelPageDeletion(page_id_t page_id);
+  // 调用者：HeapTable 摘链成功路径；作用：完成删除预留并释放磁盘页；返回：释放状态。
+  [[nodiscard]] Status FinalizePageDeletion(page_id_t page_id);
   // 调用者：上层数据库；作用：创建缓冲池管理器；返回：持有容量和磁盘句柄的对象。
   explicit BufferPoolManager(std::size_t pool_size, DiskManager *disk_manager,
                              ReplacementPolicy replacement_policy = ReplacementPolicy::FIFO,
@@ -380,10 +403,12 @@ class BufferPoolManager {
   friend class WritePageGuard;
 
   struct Frame {
+    // mutex_ 保护下修改元数据；latch 只保护 page 字节，磁盘 I/O 不持有 mutex_。
     Page page;
     page_id_t page_id{INVALID_PAGE_ID};
     std::uint32_t pin_count{0};
     bool is_dirty{false};
+    FrameState state{FrameState::Empty};
     mutable std::shared_mutex latch;
   };
 
@@ -398,7 +423,7 @@ class BufferPoolManager {
   [[nodiscard]] Status ReleaseGuard(frame_id_t frame_id, page_id_t page_id, bool is_dirty) noexcept;
   [[nodiscard]] Status EnsureReadyUnlocked() const;
   [[nodiscard]] Status ValidateDataPageId(page_id_t page_id) const;
-  [[nodiscard]] Status DeletePageUnlocked(page_id_t page_id);
+  void NotifyStateChange() noexcept;
 
   std::size_t pool_size_{0};
   DiskManager *disk_manager_{nullptr};
@@ -406,10 +431,14 @@ class BufferPoolManager {
   FlushPolicy flush_policy_{FlushPolicy::WriteBack};
   Status init_status_;
   mutable std::mutex mutex_;
+  std::condition_variable state_changed_;
   std::vector<Frame> frames_;
   std::deque<frame_id_t> free_frames_;
   std::unordered_set<frame_id_t> free_frame_set_;
   std::unordered_map<page_id_t, frame_id_t> page_table_;
+  std::unordered_map<page_id_t, Status> load_failures_;
+  std::unordered_map<page_id_t, std::size_t> loading_waiters_;
+  std::unordered_set<page_id_t> delete_pending_pages_;
   std::unique_ptr<Replacer> replacer_;
   std::uint64_t access_count_{0};
   std::uint64_t hit_count_{0};

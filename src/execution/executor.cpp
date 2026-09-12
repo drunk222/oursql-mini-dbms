@@ -707,6 +707,9 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
             return Result<SourcePlan>(SourcePlan{
                 std::move(source.value()),
                 std::move(child.value().column_names)});
+          } else if constexpr (std::is_same_v<Type, JoinPlan>) {
+            return Result<SourcePlan>(Status::NotImplemented(
+                "JOIN 当前仅完成编译层计划生成，执行器尚未接入"));
           } else {
             auto child = build_node(operation.child);
             if (!child.ok()) return Result<SourcePlan>(child.status());
@@ -804,6 +807,12 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
           return Result<ExecutionResult>(std::move(result));
         } else if constexpr (std::is_same_v<Type, UpdatePlan>) {
           return UpdateExecutor(catalog_, buffer_pool_).Execute(operation);
+        } else if constexpr (std::is_same_v<Type, AlterTablePlan>) {
+          return Result<ExecutionResult>(Status::NotImplemented(
+              "ALTER TABLE 当前仅完成编译层计划生成，执行器尚未接入"));
+        } else if constexpr (std::is_same_v<Type, TransactionPlan>) {
+          return Result<ExecutionResult>(Status::NotImplemented(
+              "事务控制当前仅完成编译层计划生成，执行器尚未接入"));
         } else {
           return DeleteExecutor(catalog_, buffer_pool_).Execute(operation);
         }

@@ -214,6 +214,60 @@ bool TestIndexScanSelection() {
                "无匹配索引时必须保留 SeqScan");
 }
 
+bool TestJoinPlanPreserved() {
+  oursql::Optimizer optimizer;
+  auto left = std::make_shared<oursql::PlanNode>(
+      oursql::SeqScanPlan{"student"});
+  auto right = std::make_shared<oursql::PlanNode>(
+      oursql::SeqScanPlan{"score"});
+  auto join = std::make_shared<oursql::PlanNode>(oursql::JoinPlan{
+      left, right, oursql::JoinType::Inner, "student", "id", "score",
+      "student_id"});
+  auto project = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{join, {"name", "grade"}, false, {1, 3}});
+  oursql::Plan plan = oursql::SelectPlan{"student", project};
+
+  auto optimized = optimizer.OptimizeWithStats(plan);
+  if (!Check(optimized.ok(), "JOIN 计划应通过优化器形态检查")) return false;
+  const auto &select =
+      std::get<oursql::SelectPlan>(optimized.value().plan);
+  const auto &root =
+      std::get<oursql::ProjectPlan>(select.root->operation);
+  if (!Check(std::holds_alternative<oursql::JoinPlan>(
+                 root.child->operation) &&
+                 root.input_indexes ==
+                     std::vector<std::size_t>{1, 3},
+             "优化器应保留 JOIN 和投影下标")) {
+    return false;
+  }
+
+  auto course = std::make_shared<oursql::PlanNode>(
+      oursql::SeqScanPlan{"course"});
+  auto nested_join = std::make_shared<oursql::PlanNode>(oursql::JoinPlan{
+      join, course, oursql::JoinType::Inner, "score", "student_id", "course",
+      "student_id", 0, 0});
+  auto nested_project = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{nested_join, {"name", "grade", "title"}, false,
+                          {1, 3, 5}});
+  oursql::Plan nested_plan =
+      oursql::SelectPlan{"student", nested_project};
+  auto nested_optimized = optimizer.OptimizeWithStats(nested_plan);
+  if (!Check(nested_optimized.ok(),
+             "多表左深 JOIN 计划应通过优化器形态检查")) {
+    return false;
+  }
+  const auto &nested_select =
+      std::get<oursql::SelectPlan>(nested_optimized.value().plan);
+  const auto &nested_root =
+      std::get<oursql::ProjectPlan>(nested_select.root->operation);
+  const auto *nested =
+      std::get_if<oursql::JoinPlan>(&nested_root.child->operation);
+  return Check(nested != nullptr && nested->left != nullptr &&
+                   std::holds_alternative<oursql::JoinPlan>(
+                       nested->left->operation),
+               "优化器应保留多表左深 JOIN 树");
+}
+
 bool TestNonConformingPlanRejected() {
   oursql::Optimizer optimizer;
 
@@ -365,6 +419,7 @@ int main() {
   run("SELECT modifiers preserved", &TestSelectModifiersPreserved);
   run("Aggregate and HAVING preserved", &TestAggregateAndHavingPreserved);
   run("IndexScan selection", &TestIndexScanSelection);
+  run("JOIN plan preserved", &TestJoinPlanPreserved);
   run("Non-conforming plan rejected", &TestNonConformingPlanRejected);
   run("Optimize is idempotent", &TestOptimizeIsIdempotent);
   run("Non-SELECT plans unchanged", &TestNonSelectPlansUnchanged);

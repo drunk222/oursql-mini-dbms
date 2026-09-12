@@ -13,6 +13,7 @@ namespace {
 // 以下格式化函数只用于 AST 的稳定文本输出。它们不解析 SQL、不访问数据库，
 // 测试和答辩展示可以依赖其格式，但执行链路不能依赖文本结果。
 std::string QuoteValue(const Value &value) {
+  if (value.IsNull()) return "NULL";
   if (value.IsInt()) return value.ToString();
   return "'" + value.AsVarchar() + "'";
 }
@@ -29,6 +30,12 @@ std::string SchemaText(const Schema &schema) {
 }
 
 std::string PredicateText(const Predicate &predicate) {
+  if (predicate.kind == PredicateKind::IsNull) {
+    return predicate.column + " is null";
+  }
+  if (predicate.kind == PredicateKind::IsNotNull) {
+    return predicate.column + " is not null";
+  }
   return predicate.column + "=" + QuoteValue(predicate.value);
 }
 
@@ -39,6 +46,16 @@ std::string AggregateName(CompileAggregateKind kind) {
     case CompileAggregateKind::Avg: return "avg";
     case CompileAggregateKind::Max: return "max";
     case CompileAggregateKind::Min: return "min";
+  }
+  return "unknown";
+}
+
+std::string JoinTypeName(JoinType type) {
+  switch (type) {
+    case JoinType::Inner: return "inner";
+    case JoinType::Left: return "left";
+    case JoinType::Right: return "right";
+    case JoinType::Full: return "full";
   }
   return "unknown";
 }
@@ -59,7 +76,9 @@ std::string CompileExprText(const CompileExprPtr &expr) {
       [&](const auto &value) -> std::string {
         using Type = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<Type, CompileColumnExpr>) {
-          return value.name;
+          return value.table_name.empty()
+                     ? value.name
+                     : value.table_name + "." + value.name;
         } else if constexpr (std::is_same_v<Type, CompileLiteralExpr>) {
           if (value.kind == CompileLiteralKind::Int) {
             return std::to_string(value.integer);
@@ -67,12 +86,16 @@ std::string CompileExprText(const CompileExprPtr &expr) {
           if (value.kind == CompileLiteralKind::String) {
             return "'" + value.text + "'";
           }
+          if (value.kind == CompileLiteralKind::Null) return "NULL";
           return value.text;
         } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
           return "(" + CompileExprText(value.left) + " " + value.op + " " +
                  CompileExprText(value.right) + ")";
         } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
           return "(" + value.op + " " + CompileExprText(value.operand) + ")";
+        } else if constexpr (std::is_same_v<Type, CompileIsNullExpr>) {
+          return "(" + CompileExprText(value.operand) +
+                 (value.negated ? " is not null)" : " is null)");
         } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
           return "(" + CompileExprText(value.operand) + " " +
                  (value.negated ? "not between " : "between ") +
@@ -86,6 +109,16 @@ std::string CompileExprText(const CompileExprPtr &expr) {
             result += CompileExprText(value.options[i]);
           }
           return result + "))";
+        } else if constexpr (std::is_same_v<Type, CompileSubqueryExpr>) {
+          if (value.kind == CompileSubqueryKind::Exists) {
+            return "(exists (select ...))";
+          }
+          if (value.kind == CompileSubqueryKind::In) {
+            return "(" + CompileExprText(value.operand) +
+                   (value.negated ? " not in (select ...))"
+                                  : " in (select ...))");
+          }
+          return "(select ...)";
         } else {
           std::string result = AggregateName(value.kind) + "(";
           result += value.star ? "*" : CompileExprText(value.argument);
@@ -163,6 +196,7 @@ class ParserImpl {
   // INSERT 值只允许整数或字符串字面量；布尔值、列引用和表达式不属于当前
   // INSERT 语法。整数使用 from_chars 检查完整消费和 int64 溢出。
   Result<Value> ParseLiteral() {
+    if (Match(TokenType::Null)) return Result<Value>(Value());
     if (Match(TokenType::String)) return Result<Value>(Value(Previous().lexeme));
     if (Match(TokenType::Integer)) {
       const auto &text = Previous().lexeme;
@@ -175,19 +209,34 @@ class ParserImpl {
       }
       return Result<Value>(Value(value));
     }
-    return Result<Value>(Error("整数或单引号字符串", Peek()));
+    return Result<Value>(Error("整数、单引号字符串或 NULL", Peek()));
   }
 
   // 构造 CompileExpr 节点的小型工厂。表达式树使用 shared_ptr<const>，
   // 构造完成后不会在 Parser 内继续修改节点内容。
-  CompileExprPtr MakeColumnExpr(std::string name) {
+  CompileExprPtr MakeColumnExpr(std::string table_name, std::string name) {
     return std::make_shared<CompileExpr>(
-        CompileExpr::Data(CompileColumnExpr{std::move(name)}));
+        CompileExpr::Data(
+            CompileColumnExpr{std::move(table_name), std::move(name)}));
+  }
+
+  Result<CompileExprPtr> ParseColumnRef(std::string expected) {
+    auto first = ExpectIdentifier(std::move(expected));
+    if (!first.ok()) return Result<CompileExprPtr>(first.status());
+    if (!Match(TokenType::Dot)) {
+      return Result<CompileExprPtr>(MakeColumnExpr("", std::move(first.value())));
+    }
+    auto column = ExpectIdentifier("'.' 后的列名");
+    if (!column.ok()) return Result<CompileExprPtr>(column.status());
+    return Result<CompileExprPtr>(
+        MakeColumnExpr(std::move(first.value()), std::move(column.value())));
   }
 
   CompileExprPtr MakeLiteralExpr(const Value &value) {
     CompileLiteralExpr literal;
-    if (value.IsInt()) {
+    if (value.IsNull()) {
+      literal.kind = CompileLiteralKind::Null;
+    } else if (value.IsInt()) {
       literal.kind = CompileLiteralKind::Int;
       literal.integer = value.AsInt();
     } else {
@@ -230,6 +279,20 @@ class ParserImpl {
         CompileInExpr{std::move(operand), std::move(options), negated}));
   }
 
+  CompileExprPtr MakeIsNull(CompileExprPtr operand, bool negated) {
+    return std::make_shared<CompileExpr>(CompileExpr::Data(
+        CompileIsNullExpr{std::move(operand), negated}));
+  }
+
+  CompileExprPtr MakeSubquery(
+      CompileSubqueryKind kind,
+      std::shared_ptr<const SelectStatement> query,
+      CompileExprPtr operand = nullptr, bool negated = false) {
+    return std::make_shared<CompileExpr>(CompileExpr::Data(
+        CompileSubqueryExpr{kind, std::move(query), std::move(operand),
+                            negated}));
+  }
+
   CompileExprPtr MakeAggregate(CompileAggregateKind kind, bool star,
                                CompileExprPtr argument) {
     return std::make_shared<CompileExpr>(CompileExpr::Data(
@@ -270,9 +333,31 @@ class ParserImpl {
 
   Result<CompileExprPtr> ParseSelectItem() {
     if (IsAggregateCall()) return ParseAggregateExpr();
-    auto column = ExpectIdentifier("SELECT 后的列名或聚合函数");
-    if (!column.ok()) return Result<CompileExprPtr>(column.status());
-    return Result<CompileExprPtr>(MakeColumnExpr(std::move(column.value())));
+    if (Peek().type == TokenType::LeftParen ||
+        Peek().type == TokenType::Exists) {
+      return ParseCompileExpr();
+    }
+    return ParseColumnRef("SELECT 后的列名或聚合函数");
+  }
+
+  // 子查询复用完整 SELECT 递归下降逻辑；能否执行由 Planner 决定。调用前
+  // 当前 Token 必须是 SELECT，解析后停在右括号或外层子句起始处。
+  Result<std::shared_ptr<const SelectStatement>> ParseSubquery() {
+    if (Peek().type != TokenType::Select) {
+      return Result<std::shared_ptr<const SelectStatement>>(
+          Error("SELECT", Peek()));
+    }
+    auto parsed = ParseSelect(false);
+    if (!parsed.ok()) {
+      return Result<std::shared_ptr<const SelectStatement>>(parsed.status());
+    }
+    auto *select = std::get_if<SelectStatement>(&parsed.value());
+    if (select == nullptr) {
+      return Result<std::shared_ptr<const SelectStatement>>(
+          Status::InternalError("子查询解析结果不是 SELECT"));
+    }
+    return Result<std::shared_ptr<const SelectStatement>>(
+        std::make_shared<SelectStatement>(std::move(*select)));
   }
 
   static bool IsComparisonType(TokenType type) {
@@ -338,6 +423,15 @@ class ParserImpl {
       left.value() = MakeBinary(operation.value().lexeme, left.value(),
                                 right.value());
     }
+    if (Match(TokenType::Is)) {
+      const bool negated = Match(TokenType::Not);
+      auto null_token = Expect(TokenType::Null, "IS 后的 NULL");
+      if (!null_token.ok()) {
+        return Result<CompileExprPtr>(null_token.status());
+      }
+      return Result<CompileExprPtr>(
+          MakeIsNull(left.value(), negated));
+    }
 
     bool negated = false;
     if (Peek().type == TokenType::Not &&
@@ -362,6 +456,18 @@ class ParserImpl {
     if (Match(TokenType::In)) {
       auto left_paren = Expect(TokenType::LeftParen, "IN 后的 '('");
       if (!left_paren.ok()) return Result<CompileExprPtr>(left_paren.status());
+      if (Peek().type == TokenType::Select) {
+        auto subquery = ParseSubquery();
+        if (!subquery.ok()) return Result<CompileExprPtr>(subquery.status());
+        auto right_paren =
+            Expect(TokenType::RightParen, "IN 子查询后的 ')'");
+        if (!right_paren.ok()) {
+          return Result<CompileExprPtr>(right_paren.status());
+        }
+        return Result<CompileExprPtr>(MakeSubquery(
+            CompileSubqueryKind::In, subquery.value(), left.value(),
+            negated));
+      }
       std::vector<CompileExprPtr> options;
       while (true) {
         auto option = ParseCompileExpr();
@@ -429,6 +535,23 @@ class ParserImpl {
 
   Result<CompileExprPtr> ParseCompilePrimary() {
     // 原子表达式包括布尔值、字符串、整数、列名和括号表达式。
+    if (Match(TokenType::Null)) {
+      return Result<CompileExprPtr>(MakeLiteralExpr(Value()));
+    }
+    if (Match(TokenType::Exists)) {
+      auto left = Expect(TokenType::LeftParen, "EXISTS 后的 '('");
+      if (!left.ok()) return Result<CompileExprPtr>(left.status());
+      if (Peek().type != TokenType::Select) {
+        return Result<CompileExprPtr>(
+            Error("SELECT after EXISTS (", Peek()));
+      }
+      auto subquery = ParseSubquery();
+      if (!subquery.ok()) return Result<CompileExprPtr>(subquery.status());
+      auto right = Expect(TokenType::RightParen, "EXISTS 子查询后的 ')'");
+      if (!right.ok()) return Result<CompileExprPtr>(right.status());
+      return Result<CompileExprPtr>(MakeSubquery(
+          CompileSubqueryKind::Exists, subquery.value()));
+    }
     if (Match(TokenType::True)) {
       return Result<CompileExprPtr>(MakeBoolExpr(true));
     }
@@ -455,11 +578,17 @@ class ParserImpl {
     }
     if (Peek().type == TokenType::Identifier) {
       if (IsAggregateCall()) return ParseAggregateExpr();
-      auto name = ExpectIdentifier("表达式中的列名");
-      if (!name.ok()) return Result<CompileExprPtr>(name.status());
-      return Result<CompileExprPtr>(MakeColumnExpr(std::move(name.value())));
+      return ParseColumnRef("表达式中的列名");
     }
     if (Match(TokenType::LeftParen)) {
+      if (Peek().type == TokenType::Select) {
+        auto subquery = ParseSubquery();
+        if (!subquery.ok()) return Result<CompileExprPtr>(subquery.status());
+        auto right = Expect(TokenType::RightParen, "标量子查询后的 ')'");
+        if (!right.ok()) return Result<CompileExprPtr>(right.status());
+        return Result<CompileExprPtr>(
+            MakeSubquery(CompileSubqueryKind::Scalar, subquery.value()));
+      }
       auto inner = ParseCompileExpr();
       if (!inner.ok()) return inner;
       auto right = Expect(TokenType::RightParen, "')'");
@@ -467,7 +596,7 @@ class ParserImpl {
       return inner;
     }
     return Result<CompileExprPtr>(
-        Error("表达式（列名、常量、括号或 NOT）", Peek()));
+        Error("表达式（列名、常量、NULL、括号、EXISTS 或 NOT）", Peek()));
   }
 
   std::optional<Predicate> ExtractPredicate(const CompileExprPtr &expr) {
@@ -476,6 +605,22 @@ class ParserImpl {
 
   std::optional<Value> ExtractLiteral(const CompileExprPtr &expr) {
     return ExtractLiteralValue(expr);
+  }
+
+  std::optional<JoinCondition> ExtractJoinCondition(
+      const CompileExprPtr &expr) const {
+    if (expr == nullptr) return std::nullopt;
+    const auto *binary = std::get_if<CompileBinaryExpr>(&expr->data);
+    if (binary == nullptr || binary->op != "=") return std::nullopt;
+    const auto *left =
+        binary->left ? std::get_if<CompileColumnExpr>(&binary->left->data)
+                     : nullptr;
+    const auto *right =
+        binary->right ? std::get_if<CompileColumnExpr>(&binary->right->data)
+                      : nullptr;
+    if (left == nullptr || right == nullptr) return std::nullopt;
+    return JoinCondition{left->table_name, left->name, right->table_name,
+                         right->name};
   }
 
   struct ParsedWhere {
@@ -504,6 +649,94 @@ class ParserImpl {
     return Result<Statement>(Error("TABLE 或 INDEX after CREATE", Peek(1)));
   }
 
+  // 解析“列名 类型[(长度)]”。CREATE TABLE 和 ALTER TABLE ADD COLUMN 复用
+  // 同一实现，确保两种入口对 VARCHAR 长度和类型名的处理一致。
+  Result<Column> ParseColumnDefinition() {
+    auto column_name = ExpectIdentifier("列名");
+    if (!column_name.ok()) return Result<Column>(column_name.status());
+    DataType type;
+    std::optional<std::size_t> length;
+    if (Match(TokenType::Int)) {
+      type = DataType::Int;
+    } else if (Match(TokenType::Varchar)) {
+      type = DataType::Varchar;
+      if (Match(TokenType::LeftParen)) {
+        auto length_token = Expect(TokenType::Integer, "VARCHAR 的长度");
+        if (!length_token.ok()) return Result<Column>(length_token.status());
+        std::size_t parsed_length = 0;
+        const auto &text = length_token.value().lexeme;
+        const auto parsed =
+            std::from_chars(text.data(), text.data() + text.size(),
+                            parsed_length);
+        if (parsed.ec != std::errc{} ||
+            parsed.ptr != text.data() + text.size() ||
+            parsed_length == 0) {
+          return Result<Column>(Status::InvalidArgument(
+              "VARCHAR 长度非法，位置 " +
+              std::to_string(length_token.value().line) + ":" +
+              std::to_string(length_token.value().column)));
+        }
+        length = parsed_length;
+        auto right_length = Expect(TokenType::RightParen, "')'");
+        if (!right_length.ok()) {
+          return Result<Column>(right_length.status());
+        }
+      }
+    } else {
+      return Result<Column>(Error("INT 或 VARCHAR", Peek()));
+    }
+
+    Column column(std::move(column_name.value()), type, length);
+    bool has_primary_key = false;
+    bool has_unique = false;
+    bool has_not_null = false;
+    bool has_default = false;
+    while (true) {
+      if (Match(TokenType::Primary)) {
+        if (has_primary_key) {
+          return Result<Column>(Status::AlreadyExists(
+              "列 " + column.name + " 重复声明 PRIMARY KEY"));
+        }
+        auto key = Expect(TokenType::Key, "PRIMARY 后的 KEY");
+        if (!key.ok()) return Result<Column>(key.status());
+        has_primary_key = true;
+        has_not_null = true;
+        has_unique = true;
+      } else if (Match(TokenType::Not)) {
+        auto null_token = Expect(TokenType::Null, "NOT 后的 NULL");
+        if (!null_token.ok()) return Result<Column>(null_token.status());
+        if (has_not_null) {
+          return Result<Column>(Status::AlreadyExists(
+              "列 " + column.name + " 重复声明 NOT NULL"));
+        }
+        has_not_null = true;
+      } else if (Match(TokenType::Unique)) {
+        if (has_unique) {
+          return Result<Column>(Status::AlreadyExists(
+              "列 " + column.name + " 重复声明 UNIQUE"));
+        }
+        has_unique = true;
+      } else if (Match(TokenType::Default)) {
+        if (has_default) {
+          return Result<Column>(Status::AlreadyExists(
+              "列 " + column.name + " 重复声明 DEFAULT"));
+        }
+        auto default_value = ParseLiteral();
+        if (!default_value.ok()) {
+          return Result<Column>(default_value.status());
+        }
+        column.default_value = std::move(default_value.value());
+        has_default = true;
+      } else {
+        break;
+      }
+    }
+    column.nullable = !has_not_null;
+    column.primary_key = has_primary_key;
+    column.unique = has_unique || has_primary_key;
+    return Result<Column>(std::move(column));
+  }
+
   Result<Statement> ParseCreateTable() {
     // 语法：CREATE TABLE name (column type [, ...]);
     // VARCHAR 的长度可选；长度必须为正整数，真正的 Schema 合法性交给 Planner。
@@ -518,33 +751,9 @@ class ParserImpl {
 
     std::vector<Column> columns;
     while (true) {
-      auto column_name = ExpectIdentifier("列名");
-      if (!column_name.ok()) return Result<Statement>(column_name.status());
-      DataType type;
-      std::optional<std::size_t> length;
-      if (Match(TokenType::Int)) {
-        type = DataType::Int;
-      } else if (Match(TokenType::Varchar)) {
-        type = DataType::Varchar;
-        if (Match(TokenType::LeftParen)) {
-          auto length_token = Expect(TokenType::Integer, "VARCHAR 的长度");
-          if (!length_token.ok()) return Result<Statement>(length_token.status());
-          std::size_t parsed_length = 0;
-          const auto &text = length_token.value().lexeme;
-          const auto parsed = std::from_chars(text.data(), text.data() + text.size(), parsed_length);
-          if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || parsed_length == 0) {
-            return Result<Statement>(Status::InvalidArgument("VARCHAR 长度非法，位置 " +
-                                                               std::to_string(length_token.value().line) + ":" +
-                                                               std::to_string(length_token.value().column)));
-          }
-          length = parsed_length;
-          auto right_length = Expect(TokenType::RightParen, "')'");
-          if (!right_length.ok()) return Result<Statement>(right_length.status());
-        }
-      } else {
-        return Result<Statement>(Error("INT 或 VARCHAR", Peek()));
-      }
-      columns.emplace_back(std::move(column_name.value()), type, length);
+      auto column = ParseColumnDefinition();
+      if (!column.ok()) return Result<Statement>(column.status());
+      columns.push_back(std::move(column.value()));
       if (!Match(TokenType::Comma)) break;
     }
     auto right = Expect(TokenType::RightParen, "')'");
@@ -641,7 +850,7 @@ class ParserImpl {
     return Result<Statement>(std::move(statement));
   }
 
-  Result<Statement> ParseSelect() {
+  Result<Statement> ParseSelect(bool consume_semicolon = true) {
     // 语法顺序固定为 SELECT [DISTINCT] 列表 -> FROM [AS 表别名]
     // -> WHERE? -> GROUP BY? -> HAVING? -> ORDER BY? -> LIMIT?。
     auto select = Expect(TokenType::Select, "SELECT");
@@ -687,6 +896,61 @@ class ParserImpl {
       auto alias = ExpectIdentifier("AS 后的表别名");
       if (!alias.ok()) return Result<Statement>(alias.status());
       statement.table_alias = std::move(alias.value());
+    }
+    // FROM 后允许连续 JOIN。每次循环只解析一个子句，Planner 再按顺序构造
+    // 左深连接树；裸 JOIN 与 INNER JOIN 等价。
+    while (true) {
+      std::optional<JoinType> join_type;
+      if (Match(TokenType::Left)) {
+        (void)Match(TokenType::Outer);
+        auto join = Expect(TokenType::Join, "JOIN after LEFT");
+        if (!join.ok()) return Result<Statement>(join.status());
+        join_type = JoinType::Left;
+      } else if (Match(TokenType::Right)) {
+        (void)Match(TokenType::Outer);
+        auto join = Expect(TokenType::Join, "JOIN after RIGHT");
+        if (!join.ok()) return Result<Statement>(join.status());
+        join_type = JoinType::Right;
+      } else if (Match(TokenType::Full)) {
+        (void)Match(TokenType::Outer);
+        auto join = Expect(TokenType::Join, "JOIN after FULL");
+        if (!join.ok()) return Result<Statement>(join.status());
+        join_type = JoinType::Full;
+      } else if (Match(TokenType::Inner)) {
+        auto join = Expect(TokenType::Join, "JOIN after INNER");
+        if (!join.ok()) return Result<Statement>(join.status());
+        join_type = JoinType::Inner;
+      } else if (Match(TokenType::Join)) {
+        join_type = JoinType::Inner;
+      } else {
+        break;
+      }
+
+      JoinClause clause;
+      clause.type = *join_type;
+      auto right_table = ExpectIdentifier("JOIN 后的表名");
+      if (!right_table.ok()) return Result<Statement>(right_table.status());
+      clause.table_name = std::move(right_table.value());
+      if (Match(TokenType::As)) {
+        auto alias = ExpectIdentifier("JOIN 表别名");
+        if (!alias.ok()) return Result<Statement>(alias.status());
+        clause.table_alias = std::move(alias.value());
+      }
+      auto on = Expect(TokenType::On, "JOIN 后的 ON");
+      if (!on.ok()) return Result<Statement>(on.status());
+      clause.location = TokenPosition(on.value());
+      auto condition = ParseCompileExpr();
+      if (!condition.ok()) return Result<Statement>(condition.status());
+      auto folded = FoldCompileExpr(condition.value());
+      auto join_condition = ExtractJoinCondition(folded);
+      if (!join_condition.has_value()) {
+        return Result<Statement>(Status::InvalidArgument(
+            "JOIN ON 目前只支持两列等值连接，位置 " +
+            std::to_string(on.value().line) + ":" +
+            std::to_string(on.value().column)));
+      }
+      clause.condition = std::move(*join_condition);
+      statement.joins.push_back(std::move(clause));
     }
     statement.location = TokenPosition(select.value());
     if (Match(TokenType::Where)) {
@@ -750,8 +1014,10 @@ class ParserImpl {
       }
       statement.limit = limit;
     }
-    auto semicolon = Expect(TokenType::Semicolon, "';'");
-    if (!semicolon.ok()) return Result<Statement>(semicolon.status());
+    if (consume_semicolon) {
+      auto semicolon = Expect(TokenType::Semicolon, "';'");
+      if (!semicolon.ok()) return Result<Statement>(semicolon.status());
+    }
     return Result<Statement>(std::move(statement));
   }
 
@@ -819,6 +1085,77 @@ class ParserImpl {
     return Result<Statement>(std::move(statement));
   }
 
+  Result<Statement> ParseAlter() {
+    // 当前支持三种结构：
+    //   ALTER TABLE t RENAME TO new_t;
+    //   ALTER TABLE t RENAME COLUMN old_c TO new_c;
+    //   ALTER TABLE t ADD COLUMN c TYPE [DEFAULT literal];
+    auto alter = Expect(TokenType::Alter, "ALTER");
+    if (!alter.ok()) return Result<Statement>(alter.status());
+    auto table = Expect(TokenType::Table, "TABLE");
+    if (!table.ok()) return Result<Statement>(table.status());
+    auto table_name = ExpectIdentifier("ALTER TABLE 后的表名");
+    if (!table_name.ok()) return Result<Statement>(table_name.status());
+
+    AlterTableStatement statement;
+    statement.table_name = std::move(table_name.value());
+    statement.location = TokenPosition(alter.value());
+    if (Match(TokenType::Rename)) {
+      if (Match(TokenType::To)) {
+        auto new_name = ExpectIdentifier("RENAME TO 后的新表名");
+        if (!new_name.ok()) return Result<Statement>(new_name.status());
+        statement.action = AlterTableAction::RenameTable;
+        statement.new_name = std::move(new_name.value());
+      } else {
+        auto column = Expect(TokenType::Column, "RENAME 后的 TO 或 COLUMN");
+        if (!column.ok()) return Result<Statement>(column.status());
+        auto old_name = ExpectIdentifier("RENAME COLUMN 后的旧列名");
+        if (!old_name.ok()) return Result<Statement>(old_name.status());
+        auto to = Expect(TokenType::To, "旧列名后的 TO");
+        if (!to.ok()) return Result<Statement>(to.status());
+        auto new_name = ExpectIdentifier("TO 后的新列名");
+        if (!new_name.ok()) return Result<Statement>(new_name.status());
+        statement.action = AlterTableAction::RenameColumn;
+        statement.column_name = std::move(old_name.value());
+        statement.new_name = std::move(new_name.value());
+      }
+    } else {
+      auto add = Expect(TokenType::Add, "RENAME 或 ADD after ALTER TABLE name");
+      if (!add.ok()) return Result<Statement>(add.status());
+      auto column = Expect(TokenType::Column, "ADD 后的 COLUMN");
+      if (!column.ok()) return Result<Statement>(column.status());
+      auto definition = ParseColumnDefinition();
+      if (!definition.ok()) return Result<Statement>(definition.status());
+      statement.action = AlterTableAction::AddColumn;
+      statement.column = std::move(definition.value());
+      statement.column_name = statement.column.name;
+      statement.default_value = statement.column.default_value;
+    }
+    auto semicolon = Expect(TokenType::Semicolon, "';'");
+    if (!semicolon.ok()) return Result<Statement>(semicolon.status());
+    return Result<Statement>(std::move(statement));
+  }
+
+  Result<Statement> ParseTransaction() {
+    Token keyword = Peek();
+    ++index_;
+    TransactionStatement statement;
+    if (keyword.type == TokenType::Begin) {
+      statement.action = TransactionAction::Begin;
+    } else if (keyword.type == TokenType::Commit) {
+      statement.action = TransactionAction::Commit;
+    } else if (keyword.type == TokenType::Rollback) {
+      statement.action = TransactionAction::Rollback;
+    } else {
+      return Result<Statement>(
+          Error("BEGIN, COMMIT or ROLLBACK", keyword));
+    }
+    auto semicolon = Expect(TokenType::Semicolon, "';'");
+    if (!semicolon.ok()) return Result<Statement>(semicolon.status());
+    statement.location = TokenPosition(keyword);
+    return Result<Statement>(std::move(statement));
+  }
+
   Result<Statement> ParseDrop() {
     // 语法：DROP TABLE name; 或 DROP INDEX name;
     auto drop = Expect(TokenType::Drop, "DROP");
@@ -870,6 +1207,11 @@ class ParserImpl {
       case TokenType::Explain: return ParseExplain();
       case TokenType::Delete: return ParseDelete();
       case TokenType::Drop: return ParseDrop();
+      case TokenType::Alter: return ParseAlter();
+      case TokenType::Begin:
+      case TokenType::Commit:
+      case TokenType::Rollback:
+        return ParseTransaction();
       case TokenType::Update: return ParseUpdate();
       default: return Result<Statement>(
           Error("CREATE、INSERT、SELECT、EXPLAIN、DELETE、DROP 或 UPDATE",
@@ -929,6 +1271,22 @@ std::string ToString(const Statement &statement) {
           std::string result = "SelectStatement(table=" + value.table_name;
           if (!value.table_alias.empty()) {
             result += ",alias=" + value.table_alias;
+          }
+          if (!value.joins.empty()) {
+            result += ",joins=[";
+            for (std::size_t i = 0; i < value.joins.size(); ++i) {
+              if (i != 0) result += ",";
+              const auto &join = value.joins[i];
+              result += JoinTypeName(join.type) + ":" + join.table_name;
+              if (!join.table_alias.empty()) {
+                result += " AS " + join.table_alias;
+              }
+              result += " ON " + join.condition.left_table + "." +
+                        join.condition.left_column + "=" +
+                        join.condition.right_table + "." +
+                        join.condition.right_column;
+            }
+            result += "]";
           }
           result += ",projection=";
           if (value.select_all) {
@@ -1007,6 +1365,39 @@ std::string ToString(const Statement &statement) {
           return "DropIndexStatement(index=" + value.index_name + ")";
         } else if constexpr (std::is_same_v<Type, ExplainStatement>) {
           return "ExplainStatement(select=" + ToString(value.select) + ")";
+        } else if constexpr (std::is_same_v<Type, AlterTableStatement>) {
+          std::string action =
+              value.action == AlterTableAction::RenameTable
+                  ? "rename_table"
+                  : value.action == AlterTableAction::RenameColumn
+                        ? "rename_column"
+                        : "add_column";
+          std::string result = "AlterTableStatement(table=" + value.table_name +
+                               ",action=" + action;
+          if (value.action == AlterTableAction::RenameColumn) {
+            result += ",column=" + value.column_name;
+          } else if (value.action == AlterTableAction::AddColumn) {
+            result += ",column=" + value.column.name + ":" +
+                      (value.column.type == DataType::Int ? "INT"
+                                                         : "VARCHAR");
+            if (value.column.length.has_value()) {
+              result += "(" + std::to_string(*value.column.length) + ")";
+            }
+          }
+          if (value.action != AlterTableAction::AddColumn) {
+            result += ",new_name=" + value.new_name;
+          }
+          if (value.default_value.has_value()) {
+            result += ",default=" + QuoteValue(*value.default_value);
+          }
+          return result + ")";
+        } else if constexpr (std::is_same_v<Type, TransactionStatement>) {
+          const char *action =
+              value.action == TransactionAction::Begin
+                  ? "begin"
+                  : value.action == TransactionAction::Commit ? "commit"
+                                                              : "rollback";
+          return "TransactionStatement(action=" + std::string(action) + ")";
         } else {
           std::string result = "UpdateStatement(table=" + value.table_name +
                                ",assignments=[";

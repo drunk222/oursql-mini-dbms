@@ -15,6 +15,8 @@ inline constexpr slot_id_t INVALID_SLOT_ID = std::numeric_limits<slot_id_t>::max
 enum class DataType {
   Int,
   Varchar,
+  // Null 只作为 Value 的运行时类型，不能用于 Column 定义。
+  Null,
 };
 
 struct RID {

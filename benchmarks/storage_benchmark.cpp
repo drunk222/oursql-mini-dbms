@@ -68,6 +68,12 @@ bool CreateFixture(const std::filesystem::path &path) {
   return disk.Close().ok();
 }
 
+bool ResetFixture(const std::filesystem::path &path) {
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  return !ec && CreateFixture(path);
+}
+
 struct Measurement {
   bool ok{false};
   std::uint64_t accesses{0};
@@ -80,6 +86,22 @@ struct Measurement {
   double elapsed_ms{0.0};
 };
 
+bool ExecuteRequests(oursql::BufferPoolManager &buffer_pool,
+                     const std::vector<oursql::page_id_t> &requests) {
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    if (i % 11 == 0) {
+      auto page = buffer_pool.FetchPageWrite(requests[i]);
+      if (!page.ok()) return false;
+      page.value().Data()[1] = std::byte{static_cast<unsigned char>(i)};
+      if (!page.value().MarkDirty().ok()) return false;
+    } else {
+      auto page = buffer_pool.FetchPage(requests[i]);
+      if (!page.ok()) return false;
+    }
+  }
+  return true;
+}
+
 Measurement Run(const std::filesystem::path &path, oursql::ReplacementPolicy policy,
                 const std::vector<oursql::page_id_t> &requests) {
   oursql::DiskManager disk;
@@ -88,17 +110,35 @@ Measurement Run(const std::filesystem::path &path, oursql::ReplacementPolicy pol
   oursql::BufferPoolManager buffer_pool(4, &disk, policy, oursql::FlushPolicy::WriteBack);
   if (!buffer_pool.GetInitStatus().ok()) return result;
   const auto start = Clock::now();
-  for (std::size_t i = 0; i < requests.size(); ++i) {
-    if (i % 11 == 0) {
-      auto page = buffer_pool.FetchPageWrite(requests[i]);
-      if (!page.ok()) return result;
-      page.value().Data()[1] = std::byte{static_cast<unsigned char>(i)};
-      if (!page.value().MarkDirty().ok()) return result;
-    } else {
-      auto page = buffer_pool.FetchPage(requests[i]);
-      if (!page.ok()) return result;
-    }
-  }
+  if (!ExecuteRequests(buffer_pool, requests)) return result;
+  if (!buffer_pool.Close().ok() || !disk.Close().ok()) return result;
+  const auto end = Clock::now();
+  result.ok = true;
+  result.accesses = buffer_pool.GetAccessCount();
+  result.hits = buffer_pool.GetHitCount();
+  result.misses = buffer_pool.GetMissCount();
+  result.hit_rate = buffer_pool.GetHitRate();
+  result.evictions = buffer_pool.GetEvictionCount();
+  result.disk_reads = disk.GetReadCount();
+  result.disk_writes = disk.GetWriteCount();
+  result.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+  return result;
+}
+
+Measurement RunHot(const std::filesystem::path &path, oursql::ReplacementPolicy policy,
+                   const std::vector<oursql::page_id_t> &requests) {
+  oursql::DiskManager disk;
+  Measurement result;
+  if (!disk.Open(path).ok()) return result;
+  oursql::BufferPoolManager buffer_pool(4, &disk, policy, oursql::FlushPolicy::WriteBack);
+  if (!buffer_pool.GetInitStatus().ok()) return result;
+  if (!ExecuteRequests(buffer_pool, requests)) return result;
+  if (!buffer_pool.FlushAllPages().ok()) return result;
+  buffer_pool.ResetStatistics();
+  disk.ResetIoStatistics();
+
+  const auto start = Clock::now();
+  if (!ExecuteRequests(buffer_pool, requests)) return result;
   if (!buffer_pool.Close().ok() || !disk.Close().ok()) return result;
   const auto end = Clock::now();
   result.ok = true;
@@ -174,11 +214,29 @@ int main() {
   std::cout << "OurSQL buffer benchmark pool=4 requests=128 seed=20260908 write_policy=WriteBack\n";
   for (const std::string pattern : {"sequential", "random", "hotspot"}) {
     const auto requests = MakeRequests(pattern);
+    if (!ResetFixture(temp.path)) return 1;
     PrintMeasurement(pattern, "FIFO", Run(temp.path, oursql::ReplacementPolicy::FIFO, requests));
+    if (!ResetFixture(temp.path)) return 1;
     PrintMeasurement(pattern, "LRU", Run(temp.path, oursql::ReplacementPolicy::LRU, requests));
+    if (!ResetFixture(temp.path)) return 1;
+    PrintMeasurement(pattern, "CLOCK", Run(temp.path, oursql::ReplacementPolicy::CLOCK, requests));
+    if (!ResetFixture(temp.path)) return 1;
+    PrintMeasurement(pattern + "-hot", "FIFO",
+                     RunHot(temp.path, oursql::ReplacementPolicy::FIFO, requests));
+    if (!ResetFixture(temp.path)) return 1;
+    PrintMeasurement(pattern + "-hot", "LRU",
+                     RunHot(temp.path, oursql::ReplacementPolicy::LRU, requests));
+    if (!ResetFixture(temp.path)) return 1;
+    PrintMeasurement(pattern + "-hot", "CLOCK",
+                     RunHot(temp.path, oursql::ReplacementPolicy::CLOCK, requests));
   }
+  if (!ResetFixture(temp.path)) return 1;
   RunContrast(temp.path, oursql::ReplacementPolicy::FIFO, "FIFO");
+  if (!ResetFixture(temp.path)) return 1;
   RunContrast(temp.path, oursql::ReplacementPolicy::LRU, "LRU");
+  if (!ResetFixture(temp.path)) return 1;
+  RunContrast(temp.path, oursql::ReplacementPolicy::CLOCK, "CLOCK");
+  if (!ResetFixture(temp.path)) return 1;
   oursql::DiskManager disk;
   if (!disk.Open(temp.path).ok()) return 1;
   oursql::BufferPoolManager write_through_pool(4, &disk, oursql::ReplacementPolicy::LRU,

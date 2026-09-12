@@ -2,12 +2,16 @@
 #include "oursql/storage/storage.h"
 
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -719,10 +723,410 @@ bool TestGuardAndExplicitErrors() {
   }
   oursql::BufferPoolManager write_through_bpm(1, &dm, oursql::ReplacementPolicy::FIFO,
                                                oursql::FlushPolicy::WriteThrough);
-  const bool not_implemented =
-      Check(write_through_bpm.GetInitStatus().code() == oursql::ErrorCode::NotImplemented,
-            "WriteThrough 应明确返回 NotImplemented");
-  return CloseDb(dm) && not_implemented;
+  if (!Check(write_through_bpm.GetInitStatus().ok(),
+             "WriteThrough 应该可以正常初始化")) {
+    CloseDb(dm);
+    return false;
+  }
+  dm.ResetIoStatistics();
+  auto write_result = write_through_bpm.FetchPageWrite(pages[0]);
+  if (!Check(write_result.ok(), "WriteThrough Fetch 写 guard 应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto write_guard = std::move(write_result.value());
+  write_guard.Data()[17] = std::byte{0x6D};
+  if (!Check(write_guard.MarkDirty().ok(), "WriteThrough 标脏应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  const auto release_status = write_guard.Release();
+  if (!Check(release_status.ok(), "WriteThrough 释放 guard 应立即刷盘")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(dm.GetWriteCount() == 1, "WriteThrough 释放脏 guard 应产生一次写盘")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto snapshots = write_through_bpm.GetFrameSnapshots();
+  bool write_through_clean = false;
+  for (const auto &snapshot : snapshots) {
+    if (snapshot.page_id == pages[0]) write_through_clean = !snapshot.is_dirty;
+  }
+  if (!Check(write_through_clean, "WriteThrough 成功写回后 frame 应保持 clean")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto persisted = dm.ReadPage(pages[0]);
+  const bool persisted_ok = Check(persisted.ok() && persisted.value().Data()[17] == std::byte{0x6D},
+                                  "WriteThrough 刷盘后磁盘内容应立即可读");
+  if (!persisted_ok) {
+    CloseDb(dm);
+    return false;
+  }
+  auto second_page = dm.AllocatePage();
+  if (!Check(second_page.ok(), "WriteThrough 淘汰测试第二页分配应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  dm.ResetIoStatistics();
+  auto evicted = write_through_bpm.FetchPage(second_page.value());
+  if (!Check(evicted.ok(), "WriteThrough 应能淘汰已写回的 clean page")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto evicted_guard = std::move(evicted.value());
+  if (!Check(dm.GetWriteCount() == 0, "WriteThrough 淘汰 clean page 不应重复写盘")) {
+    CloseDb(dm);
+    return false;
+  }
+  return write_through_bpm.Close().ok() && CloseDb(dm);
+}
+
+bool TestClockReplacerAndFrameSnapshots() {
+  oursql::ClockReplacer clock(3);
+  if (!Check(clock.Unpin(0).ok() && clock.Unpin(1).ok() && clock.Unpin(2).ok(),
+             "CLOCK 应接受三个可淘汰 frame")) {
+    return false;
+  }
+  if (!Check(clock.Pin(1).ok() && !clock.IsEvictable(1),
+             "CLOCK pinned frame 不应处于候选集合")) {
+    return false;
+  }
+  auto first = clock.Victim();
+  if (!Check(first.ok() && first.value() == 0,
+             "CLOCK 应清除 reference bit 后淘汰第一个可用 frame")) {
+    return false;
+  }
+  if (!Check(clock.Unpin(0).ok(), "CLOCK 淘汰后的 frame 应能重新加入")) {
+    return false;
+  }
+  if (!Check(clock.Unpin(2).code() == oursql::ErrorCode::AlreadyExists,
+             "CLOCK 重复 Unpin 不应制造重复候选")) {
+    return false;
+  }
+  if (!Check(clock.Pin(0).ok() && clock.Pin(2).ok(),
+             "CLOCK 应能 pin 剩余候选 frame")) {
+    return false;
+  }
+  auto none = clock.Victim();
+  return Check(!none.ok() && none.status().code() == oursql::ErrorCode::NotFound,
+               "CLOCK 全部 frame 不可淘汰时应明确失败");
+}
+
+bool TestFrameSnapshots() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  std::vector<oursql::page_id_t> pages;
+  if (!AllocatePages(dm, 1, &pages)) {
+    CloseDb(dm);
+    return false;
+  }
+  oursql::BufferPoolManager bpm(2, &dm);
+  auto initial = bpm.GetFrameSnapshots();
+  if (!Check(initial.size() == 2 && !initial[0].page_id.has_value() &&
+                 !initial[0].is_evictable,
+             "空 frame 快照应没有 page_id 且不可淘汰")) {
+    CloseDb(dm);
+    return false;
+  }
+  const auto accesses_before = bpm.GetAccessCount();
+  auto result = bpm.FetchPageWrite(pages[0]);
+  if (!Check(result.ok(), "快照测试 Fetch 写 guard 应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto guard = std::move(result.value());
+  guard.Data()[0] = std::byte{0x4A};
+  if (!Check(guard.MarkDirty().ok(), "快照测试标脏应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto pinned = bpm.GetFrameSnapshots();
+  if (!Check(bpm.GetAccessCount() == accesses_before + 1,
+             "读取 frame 快照不应增加 Fetch 访问统计")) {
+    CloseDb(dm);
+    return false;
+  }
+  const auto frame_id = pinned[0].page_id == pages[0] ? 0U : 1U;
+  if (!Check(pinned[frame_id].page_id == pages[0] && pinned[frame_id].pin_count == 1 &&
+                 !pinned[frame_id].is_evictable,
+             "pinned frame 快照状态应准确且不可淘汰")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(guard.Release().ok(), "快照测试释放 guard 应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto released = bpm.GetFrameSnapshots();
+  if (!Check(released[frame_id].pin_count == 0 && released[frame_id].is_dirty &&
+                 released[frame_id].is_evictable,
+             "unpin 后 frame 应成为带 dirty 状态的候选")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (!Check(bpm.FlushPage(pages[0]).ok(), "快照测试 Flush 应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto flushed = bpm.GetFrameSnapshots();
+  const bool ok = Check(!flushed[frame_id].is_dirty, "Flush 后快照 dirty 应清除");
+  return bpm.Close().ok() && CloseDb(dm) && ok;
+}
+
+bool TestConcurrentGuardsDoNotDeadlock() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  auto allocated = dm.AllocatePage();
+  if (!Check(allocated.ok(), "并发 guard 测试页面分配应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+  const auto page_id = allocated.value();
+  oursql::Page initial;
+  initial.Data()[0] = std::byte{0x21};
+  if (!Check(dm.WritePage(page_id, initial).ok(), "并发 guard 测试初始写入应成功")) {
+    CloseDb(dm);
+    return false;
+  }
+
+  oursql::BufferPoolManager bpm(2, &dm);
+  std::mutex coordination_mutex;
+  std::condition_variable coordination;
+  int readers_ready = 0;
+  bool release_readers = false;
+  bool reader_failed = false;
+  std::atomic<bool> writer_started{false};
+  std::atomic<bool> writer_acquired{false};
+  std::atomic<bool> writer_ok{false};
+
+  auto reader = [&]() {
+    auto result = bpm.FetchPage(page_id);
+    if (!result.ok()) {
+      std::lock_guard<std::mutex> lock(coordination_mutex);
+      reader_failed = true;
+      ++readers_ready;
+      coordination.notify_all();
+      return;
+    }
+    auto guard = std::move(result.value());
+    {
+      std::unique_lock<std::mutex> lock(coordination_mutex);
+      ++readers_ready;
+      coordination.notify_all();
+      coordination.wait(lock, [&] { return release_readers; });
+    }
+  };
+  std::thread first_reader(reader);
+  std::thread second_reader(reader);
+  {
+    std::unique_lock<std::mutex> lock(coordination_mutex);
+    coordination.wait(lock, [&] { return readers_ready == 2; });
+  }
+
+  if (reader_failed) {
+    {
+      std::lock_guard<std::mutex> lock(coordination_mutex);
+      release_readers = true;
+    }
+    coordination.notify_all();
+    first_reader.join();
+    second_reader.join();
+    CloseDb(dm);
+    return Check(false, "两个读 guard 都应获取同一页面");
+  }
+
+  std::promise<void> started_promise;
+  auto started = started_promise.get_future();
+  std::thread writer([&]() {
+    writer_started.store(true);
+    started_promise.set_value();
+    auto result = bpm.FetchPageWrite(page_id);
+    if (!result.ok()) return;
+    auto guard = std::move(result.value());
+    writer_acquired.store(true);
+    guard.Data()[0] = std::byte{0x7C};
+    writer_ok.store(guard.MarkDirty().ok());
+  });
+  started.wait();
+
+  // 两个读 guard 仍持有共享锁，写 guard 此时只能等待；没有时间延迟依赖。
+  const bool blocked_before_release = !writer_acquired.load() && writer_started.load();
+  {
+    std::lock_guard<std::mutex> lock(coordination_mutex);
+    release_readers = true;
+  }
+  coordination.notify_all();
+  first_reader.join();
+  second_reader.join();
+  writer.join();
+
+  if (!Check(blocked_before_release && writer_acquired.load() && writer_ok.load(),
+             "读锁释放后写 guard 应继续且不发生死锁")) {
+    CloseDb(dm);
+    return false;
+  }
+
+  std::mutex writer_coordination_mutex;
+  std::condition_variable writer_coordination;
+  bool writer_ready = false;
+  bool release_writer = false;
+  bool writer_failed = false;
+  std::thread writer_holder([&]() {
+    auto result = bpm.FetchPageWrite(page_id);
+    if (!result.ok()) {
+      std::lock_guard<std::mutex> lock(writer_coordination_mutex);
+      writer_failed = true;
+      writer_ready = true;
+      writer_coordination.notify_all();
+      return;
+    }
+    auto guard = std::move(result.value());
+    guard.Data()[0] = std::byte{0x39};
+    (void)guard.MarkDirty();
+    {
+      std::lock_guard<std::mutex> lock(writer_coordination_mutex);
+      writer_ready = true;
+      writer_coordination.notify_all();
+    }
+    std::unique_lock<std::mutex> lock(writer_coordination_mutex);
+    writer_coordination.wait(lock, [&] { return release_writer; });
+  });
+  {
+    std::unique_lock<std::mutex> lock(writer_coordination_mutex);
+    writer_coordination.wait(lock, [&] { return writer_ready; });
+  }
+  if (writer_failed) {
+    {
+      std::lock_guard<std::mutex> lock(writer_coordination_mutex);
+      release_writer = true;
+    }
+    writer_coordination.notify_all();
+    writer_holder.join();
+    CloseDb(dm);
+    return Check(false, "写线程应能持有页面独占锁");
+  }
+
+  std::atomic<bool> reader_started{false};
+  std::atomic<bool> reader_acquired{false};
+  std::promise<void> reader_start_promise;
+  auto reader_start = reader_start_promise.get_future();
+  std::thread blocked_reader([&]() {
+    reader_started.store(true);
+    reader_start_promise.set_value();
+    auto result = bpm.FetchPage(page_id);
+    if (!result.ok()) return;
+    auto guard = std::move(result.value());
+    reader_acquired.store(true);
+  });
+  reader_start.wait();
+  const bool writer_blocks_reader = reader_started.load() && !reader_acquired.load();
+  {
+    std::lock_guard<std::mutex> lock(writer_coordination_mutex);
+    release_writer = true;
+  }
+  writer_coordination.notify_all();
+  writer_holder.join();
+  blocked_reader.join();
+  if (!Check(writer_blocks_reader && reader_acquired.load(),
+             "写锁持有期间读 guard 应等待，写锁释放后应继续")) {
+    CloseDb(dm);
+    return false;
+  }
+  auto verify = bpm.FetchPage(page_id);
+  if (!Check(verify.ok() && verify.value().Data()[0] == std::byte{0x39},
+             "并发写入完成后页面内容应正确")) {
+    CloseDb(dm);
+    return false;
+  }
+  if (verify.ok()) {
+    auto verify_guard = std::move(verify.value());
+  }
+  auto snapshots = bpm.GetFrameSnapshots();
+  bool pin_count_zero = false;
+  for (const auto &snapshot : snapshots) {
+    if (snapshot.page_id == page_id) pin_count_zero = snapshot.pin_count == 0;
+  }
+  const bool ok = Check(pin_count_zero, "并发 guard 完成后 pin_count 应回到 0") &&
+                  Check(bpm.FlushPage(page_id).ok(), "并发测试脏页 Flush 应成功");
+  return bpm.Close().ok() && CloseDb(dm) && ok;
+}
+
+bool TestBufferPoolPressureAcrossSmallCapacities() {
+  TempDb temp;
+  oursql::DiskManager dm;
+  if (!OpenDb(dm, temp.path)) return false;
+  std::vector<oursql::page_id_t> pages;
+  if (!AllocatePages(dm, 8, &pages)) {
+    CloseDb(dm);
+    return false;
+  }
+
+  for (std::size_t capacity = 1; capacity <= 3; ++capacity) {
+    oursql::BufferPoolManager bpm(capacity, &dm, oursql::ReplacementPolicy::CLOCK);
+    if (!Check(bpm.GetInitStatus().ok(), "小容量 CLOCK 缓冲池应初始化成功")) {
+      CloseDb(dm);
+      return false;
+    }
+    for (int round = 0; round < 4; ++round) {
+      for (const auto page_id : pages) {
+        auto result = bpm.FetchPage(page_id);
+        if (!Check(result.ok(), "小容量缓冲池应能完成高频干净换页")) {
+          CloseDb(dm);
+          return false;
+        }
+        auto guard = std::move(result.value());
+      }
+    }
+    if (!Check(bpm.GetEvictionCount() > 0, "小容量缓冲池高频换页应产生淘汰")) {
+      CloseDb(dm);
+      return false;
+    }
+
+    std::vector<oursql::ReadPageGuard> pinned;
+    for (std::size_t i = 0; i < capacity; ++i) {
+      auto result = bpm.FetchPage(pages[i]);
+      if (!Check(result.ok(), "容量范围内的页面应能同时 pin")) {
+        CloseDb(dm);
+        return false;
+      }
+      pinned.emplace_back(std::move(result.value()));
+    }
+    auto blocked = bpm.FetchPage(pages[capacity]);
+    if (!Check(!blocked.ok() && blocked.status().code() == oursql::ErrorCode::NotFound,
+               "所有 frame pinned 时 Fetch 应明确失败")) {
+      CloseDb(dm);
+      return false;
+    }
+    pinned.clear();
+
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+      auto result = bpm.FetchPageWrite(pages[i]);
+      if (!Check(result.ok(), "小容量缓冲池应能完成高频脏页换页")) {
+        CloseDb(dm);
+        return false;
+      }
+      auto guard = std::move(result.value());
+      guard.Data()[capacity] = std::byte{static_cast<unsigned char>(i)};
+      if (!Check(guard.MarkDirty().ok(), "高频脏页换页应能标脏")) {
+        CloseDb(dm);
+        return false;
+      }
+    }
+    if (!Check(bpm.GetEvictionCount() >= pages.size(), "高频脏页换页淘汰统计应增长")) {
+      CloseDb(dm);
+      return false;
+    }
+    if (!Check(bpm.Close().ok(), "小容量压力测试缓冲池应能刷盘关闭")) {
+      CloseDb(dm);
+      return false;
+    }
+  }
+  return CloseDb(dm);
 }
 
 bool TestPinnedDeletePreservesPageAndAllowsReuse() {
@@ -823,6 +1227,10 @@ int main() {
   run("Free frame list and policy contrast", &TestFreeFrameListAndPolicyContrast);
   run("Dirty and clean eviction", &TestDirtyAndCleanEviction);
   run("Page guards and explicit errors", &TestGuardAndExplicitErrors);
+  run("CLOCK replacer and frame snapshots", &TestClockReplacerAndFrameSnapshots);
+  run("Frame snapshot state", &TestFrameSnapshots);
+  run("Concurrent guards", &TestConcurrentGuardsDoNotDeadlock);
+  run("Small-capacity buffer pool pressure", &TestBufferPoolPressureAcrossSmallCapacities);
   run("Pinned delete preserves page and allows reuse",
       &TestPinnedDeletePreservesPageAndAllowsReuse);
   run("Buffer pool delete persists free list across restart",

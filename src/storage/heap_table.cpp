@@ -207,11 +207,82 @@ Status HeapTable::DeleteRow(const RID &rid) {
   if (buffer_pool_ == nullptr) return Status::InvalidArgument("HeapTable 缺少 BufferPoolManager");
   auto ownership = ValidateRidPage(rid.page_id);
   if (!ownership.ok()) return ownership;
-  // 删除仅修改 slot/page 元数据；页面仍留在表链中，后续插入可复用其空间。
-  auto page_result = buffer_pool_->FetchPageWrite(rid.page_id);
-  if (!page_result.ok()) return page_result.status();
-  auto page = std::move(page_result.value());
-  return SlottedPage::DeleteRecord(page, rid.slot_id);
+
+  page_id_t target_next = INVALID_PAGE_ID;
+  {
+    auto page_result = buffer_pool_->FetchPageWrite(rid.page_id);
+    if (!page_result.ok()) return page_result.status();
+    auto page = std::move(page_result.value());
+    auto next_result = SlottedPage::NextPageId(page);
+    if (!next_result.ok()) return next_result.status();
+    target_next = next_result.value();
+    auto delete_status = SlottedPage::DeleteRecord(page, rid.slot_id);
+    if (!delete_status.ok()) return delete_status;
+    // 显式释放，使 WriteThrough 的 I/O 错误能够返回给调用者。
+    auto release_status = page.Release();
+    if (!release_status.ok()) return release_status;
+  }
+
+  // 首数据页是 TableMetadata 的稳定入口，即使为空也必须保留。
+  if (rid.page_id == metadata_.first_data_page_id) return Status::Ok();
+
+  bool page_empty = true;
+  {
+    auto page_result = buffer_pool_->FetchPage(rid.page_id);
+    if (!page_result.ok()) return page_result.status();
+    auto page = std::move(page_result.value());
+    auto count_result = SlottedPage::SlotCount(page);
+    if (!count_result.ok()) return count_result.status();
+    for (std::uint32_t slot = 0; slot < count_result.value(); ++slot) {
+      auto record = SlottedPage::GetRecord(page, static_cast<slot_id_t>(slot));
+      if (record.ok()) {
+        page_empty = false;
+        break;
+      }
+      if (record.status().code() != ErrorCode::NotFound) return record.status();
+    }
+  }
+  if (!page_empty) return Status::Ok();
+
+  // 找到前驱后跳过空页，再把它交给 BufferPoolManager 回收到磁盘空闲链表。
+  page_id_t predecessor = INVALID_PAGE_ID;
+  page_id_t current = metadata_.first_data_page_id;
+  std::unordered_set<page_id_t> visited;
+  while (current != INVALID_PAGE_ID && current != rid.page_id) {
+    if (current == 0 || !visited.insert(current).second) {
+      return Status::InvalidArgument("数据页链表损坏或成环");
+    }
+    auto page_result = buffer_pool_->FetchPage(current);
+    if (!page_result.ok()) return page_result.status();
+    auto page = std::move(page_result.value());
+    auto next_result = SlottedPage::NextPageId(page);
+    if (!next_result.ok()) return next_result.status();
+    if (next_result.value() == rid.page_id) {
+      predecessor = current;
+      break;
+    }
+    current = next_result.value();
+  }
+  if (predecessor == INVALID_PAGE_ID) {
+    return Status::InternalError("已确认归属的数据页找不到前驱: " + std::to_string(rid.page_id));
+  }
+
+  {
+    auto predecessor_result = buffer_pool_->FetchPageWrite(predecessor);
+    if (!predecessor_result.ok()) return predecessor_result.status();
+    auto predecessor_page = std::move(predecessor_result.value());
+    auto next_result = SlottedPage::NextPageId(predecessor_page);
+    if (!next_result.ok()) return next_result.status();
+    if (next_result.value() != rid.page_id) {
+      return Status::InvalidArgument("删除空数据页时发现链表发生变化");
+    }
+    auto link_status = SlottedPage::SetNextPageId(predecessor_page, target_next);
+    if (!link_status.ok()) return link_status;
+    auto release_status = predecessor_page.Release();
+    if (!release_status.ok()) return release_status;
+  }
+
+  return buffer_pool_->DeletePage(rid.page_id);
 }
 
 Result<std::vector<RowEntry>> HeapTable::Scan() {

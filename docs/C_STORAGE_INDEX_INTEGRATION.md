@@ -77,4 +77,65 @@ Catalog 元数据不能先删，否则索引和数据页入口会丢失。当前
 
 - B+ 树节点布局、分裂、合并、借位、查询算法未由 C 侧修改。
 - Parser、Planner、Executor 的 SQL 语义未由 C 侧扩张。
-- 当前不提供事务、WAL、后台刷脏、CLOCK、Write-Through 或完整 DROP TABLE 原子性。
+- 当前不提供事务、WAL、后台刷脏或完整 DROP TABLE 原子性。
+
+## C 侧存储补充说明
+
+### 页面替换与可观测性
+
+`BufferPoolManager` 当前支持 `FIFO`、`LRU` 和 `CLOCK` 三种策略。替换器始终返回
+`frame_id`，因为它管理的是内存槽位；`BufferPoolManager` 再通过该 frame 找到被替换的
+`page_id`。CLOCK 为每个 frame 保留 reference bit：第一次遇到可淘汰 frame 时清零并给予
+二次机会，下一轮仍未被访问才淘汰。`pin_count != 0` 的 frame 永远不会进入候选集合。
+
+CLI 可以用下面的命令观察当前状态：
+
+```text
+oursql.exe --pool-size 3 --policy fifo demo.oursql
+.buffer
+.evictions
+.stats
+```
+
+`.buffer` 显示 frame、page、pin、dirty 和 evictable；`.evictions` 显示实际被淘汰的
+page ID，而不是 frame ID。淘汰日志最多保留最近 1024 条，日志只用于观测，不参与恢复。
+
+`oursql_benchmark` 使用固定种子 `20260908`、相同的 4-frame 缓冲池和 WriteBack，分别测量
+顺序、随机、热点三种请求模式下的 FIFO/LRU/CLOCK。每个冷缓存实验都会重新建立同样的
+32 页 fixture；每个热缓存实验先用同一请求序列预热，再调用 `ResetStatistics()`，所以输出
+中的 accesses/hits/misses/disk reads 是预热之后的数据。耗时只作为实测观察值，不作为单元
+测试的固定断言。
+
+### 空数据页回收
+
+`HeapTable::DeleteRow()` 先把 slot 标为 deleted。若删除后目标页没有任何有效记录，且它不是
+`TableMetadata.first_data_page_id`，则前驱页会跳过目标页，之后调用
+`BufferPoolManager::DeletePage()` 将目标页放回 DiskManager 的 Free List。首页是表的稳定入口，
+即使变空也不回收；这样 Catalog 中的入口不会失效。删除部分记录但仍有有效记录的页面也不会
+回收，后续插入可以复用其中的 slot 和空间。
+
+这段链表修改没有 WAL 或事务保护。如果在“前驱改链”和“释放目标页”之间发生进程崩溃，当前
+版本不能保证操作原子提交；I/O 错误会向上返回，但可能需要人工检查数据库文件。该边界不应
+包装成事务安全。
+
+### WriteBack 与 WriteThrough
+
+- `WriteBack` 是默认策略：修改先留在 frame 中，页面在淘汰、显式 `FlushPage`、
+  `FlushAllPages` 或缓冲池关闭时写回。
+- `WriteThrough` 使用同一配置接口：写 guard 标脏后，在 guard 显式 `Release()` 或普通
+  `UnpinPage(page_id, true)` 时立即写回；成功后清除 dirty，失败则保留 dirty 并返回 I/O
+  错误，后续 Flush/Close 可以重试。
+
+WriteThrough 只描述页面写回时机，不提供 WAL、事务原子性或崩溃一致性。`MarkDirty()` 本身
+先记录在 guard 内部，guard 释放前 frame 快照仍可能显示 clean，这是为了让 guard 在离开
+作用域时一次性提交 pin 和 dirty 状态。
+
+### 当前边界
+
+- 文件 I/O 仍只允许出现在 `DiskManager`；HeapTable、Catalog、索引和执行层通过 Guard 与
+  BufferPoolManager 访问页面。
+- 当前没有事务、MVCC、WAL、后台刷脏线程、并发表级修改和完整 B+ 树算法扩展。
+- 页级读写锁保护单个 frame 的字节访问；它与 `pin_count` 是两件事：锁防止同时读写，pin
+  防止页面在使用期间被替换。
+- BufferPool 的并发测试使用条件变量协调两个读 guard 和读写等待，不依赖随意 sleep；多个
+  ReadPageGuard 可以共享读锁，WritePageGuard 获取独占锁，guard 释放后等待者继续执行。

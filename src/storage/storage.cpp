@@ -568,6 +568,11 @@ std::size_t FIFOReplacer::Size() const {
   return order_.size();
 }
 
+bool FIFOReplacer::IsEvictable(frame_id_t frame_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return frame_id < capacity_ && candidates_.find(frame_id) != candidates_.end();
+}
+
 LRUReplacer::LRUReplacer(std::size_t capacity) : capacity_(capacity) {}
 
 Status LRUReplacer::Pin(frame_id_t frame_id) {
@@ -650,6 +655,104 @@ std::size_t LRUReplacer::Size() const {
   return order_.size();
 }
 
+bool LRUReplacer::IsEvictable(frame_id_t frame_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return frame_id < capacity_ && candidates_.find(frame_id) != candidates_.end();
+}
+
+ClockReplacer::ClockReplacer(std::size_t capacity)
+    : capacity_(capacity),
+      active_(capacity, false),
+      evictable_(capacity, false),
+      reference_bits_(capacity, false) {}
+
+Status ClockReplacer::Pin(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("CLOCK frame 编号越界: " + std::to_string(frame_id));
+  }
+  active_[frame_id] = true;
+  reference_bits_[frame_id] = true;
+  if (evictable_[frame_id]) {
+    evictable_[frame_id] = false;
+    --evictable_count_;
+  }
+  return Status::Ok();
+}
+
+Status ClockReplacer::Unpin(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("CLOCK frame 编号越界: " + std::to_string(frame_id));
+  }
+  active_[frame_id] = true;
+  if (evictable_[frame_id]) {
+    return Status::AlreadyExists("CLOCK frame 已在候选集合: " + std::to_string(frame_id));
+  }
+  evictable_[frame_id] = true;
+  reference_bits_[frame_id] = true;
+  ++evictable_count_;
+  return Status::Ok();
+}
+
+Status ClockReplacer::RecordAccess(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("CLOCK frame 编号越界: " + std::to_string(frame_id));
+  }
+  active_[frame_id] = true;
+  reference_bits_[frame_id] = true;
+  return Status::Ok();
+}
+
+Status ClockReplacer::Remove(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (frame_id >= capacity_) {
+    return Status::InvalidArgument("CLOCK frame 编号越界: " + std::to_string(frame_id));
+  }
+  if (evictable_[frame_id]) {
+    evictable_[frame_id] = false;
+    --evictable_count_;
+  }
+  active_[frame_id] = false;
+  reference_bits_[frame_id] = false;
+  return Status::Ok();
+}
+
+Result<frame_id_t> ClockReplacer::Victim() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (evictable_count_ == 0 || capacity_ == 0) {
+    return Result<frame_id_t>(Status::NotFound("CLOCK 没有可淘汰的 frame"));
+  }
+  const std::size_t max_steps = capacity_ * 2;
+  for (std::size_t step = 0; step < max_steps; ++step) {
+    const frame_id_t frame_id = hand_;
+    hand_ = (hand_ + 1) % capacity_;
+    if (!active_[frame_id] || !evictable_[frame_id]) {
+      continue;
+    }
+    if (reference_bits_[frame_id]) {
+      reference_bits_[frame_id] = false;
+      continue;
+    }
+    evictable_[frame_id] = false;
+    --evictable_count_;
+    active_[frame_id] = false;
+    return Result<frame_id_t>(frame_id);
+  }
+  return Result<frame_id_t>(Status::NotFound("CLOCK 扫描后没有可淘汰的 frame"));
+}
+
+std::size_t ClockReplacer::Size() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return evictable_count_;
+}
+
+bool ClockReplacer::IsEvictable(frame_id_t frame_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return frame_id < capacity_ && evictable_[frame_id];
+}
+
 ReadPageGuard::ReadPageGuard(BufferPoolManager *buffer_pool, frame_id_t frame_id,
                              page_id_t page_id, std::shared_mutex *latch)
     : buffer_pool_(buffer_pool), frame_id_(frame_id), page_id_(page_id), latch_(*latch) {}
@@ -709,7 +812,7 @@ WritePageGuard::WritePageGuard(BufferPoolManager *buffer_pool, frame_id_t frame_
                                page_id_t page_id, std::shared_mutex *latch)
     : buffer_pool_(buffer_pool), frame_id_(frame_id), page_id_(page_id), latch_(*latch) {}
 
-WritePageGuard::~WritePageGuard() { Reset(); }
+WritePageGuard::~WritePageGuard() { (void)Reset(); }
 
 WritePageGuard::WritePageGuard(WritePageGuard &&other) noexcept
     : buffer_pool_(other.buffer_pool_),
@@ -724,7 +827,7 @@ WritePageGuard::WritePageGuard(WritePageGuard &&other) noexcept
 
 WritePageGuard &WritePageGuard::operator=(WritePageGuard &&other) noexcept {
   if (this != &other) {
-    Reset();
+    (void)Reset();
     buffer_pool_ = other.buffer_pool_;
     frame_id_ = other.frame_id_;
     page_id_ = other.page_id_;
@@ -767,17 +870,20 @@ bool WritePageGuard::IsValid() const noexcept {
   return buffer_pool_ != nullptr && latch_.owns_lock();
 }
 
-void WritePageGuard::Reset() noexcept {
+Status WritePageGuard::Release() noexcept { return Reset(); }
+
+Status WritePageGuard::Reset() noexcept {
   if (buffer_pool_ == nullptr) {
-    return;
+    return Status::Ok();
   }
   if (latch_.owns_lock()) {
     latch_.unlock();
   }
-  (void)buffer_pool_->ReleaseGuard(frame_id_, page_id_, dirty_);
+  const auto status = buffer_pool_->ReleaseGuard(frame_id_, page_id_, dirty_);
   buffer_pool_ = nullptr;
   page_id_ = INVALID_PAGE_ID;
   dirty_ = false;
+  return status;
 }
 
 namespace {
@@ -1133,14 +1239,14 @@ BufferPoolManager::BufferPoolManager(std::size_t pool_size, DiskManager *disk_ma
     init_status_ = Status::InvalidArgument("缓冲池容量必须大于 0");
   } else if (disk_manager_ == nullptr) {
     init_status_ = Status::InvalidArgument("BufferPoolManager 需要有效的 DiskManager");
-  } else if (flush_policy_ == FlushPolicy::WriteThrough) {
-    init_status_ = Status::NotImplemented("WriteThrough 刷新策略尚未实现");
   }
 
   if (replacement_policy_ == ReplacementPolicy::FIFO) {
     replacer_ = std::make_unique<FIFOReplacer>(pool_size_);
-  } else {
+  } else if (replacement_policy_ == ReplacementPolicy::LRU) {
     replacer_ = std::make_unique<LRUReplacer>(pool_size_);
+  } else {
+    replacer_ = std::make_unique<ClockReplacer>(pool_size_);
   }
 }
 
@@ -1237,15 +1343,29 @@ Status BufferPoolManager::ReleaseGuard(frame_id_t frame_id, page_id_t page_id,
     return Status::InvalidArgument("页面 pin_count 已经为 0: " + std::to_string(page_id));
   }
   frame.is_dirty = frame.is_dirty || is_dirty;
+
+  Status flush_status = Status::Ok();
+  if (flush_policy_ == FlushPolicy::WriteThrough && frame.is_dirty) {
+    // WriteThrough 在最后一个 guard/unpin 释放脏状态时立即写回；失败时保留 dirty，
+    // 使后续显式 Flush 或正常关闭仍有机会重试。
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    flush_status = disk_manager_->WritePage(page_id, frame.page);
+    if (flush_status.ok()) {
+      frame.is_dirty = false;
+    }
+  }
+
   --frame.pin_count;
   if (frame.pin_count == 0) {
-    return replacer_->Unpin(frame_id);
+    const auto unpin_status = replacer_->Unpin(frame_id);
+    if (!flush_status.ok()) return flush_status;
+    return unpin_status;
   }
-  return Status::Ok();
+  return flush_status;
 }
 
 Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
   if (!ready.ok()) {
     return Result<ReadPageGuard>(ready);
@@ -1268,6 +1388,7 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
       return Result<ReadPageGuard>(pin_status);
     }
     ++hit_count_;
+    lock.unlock();
     return Result<ReadPageGuard>(ReadPageGuard(this, found->second, page_id, &frame.latch));
   }
 
@@ -1298,13 +1419,15 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
   (void)replacer_->RecordAccess(frame_id);
   if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
     ++eviction_count_;
+    if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
     eviction_log_.push_back(old_page_id);
   }
+  lock.unlock();
   return Result<ReadPageGuard>(ReadPageGuard(this, frame_id, page_id, &frame.latch));
 }
 
 Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
   if (!ready.ok()) {
     return Result<WritePageGuard>(ready);
@@ -1327,6 +1450,7 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
       return Result<WritePageGuard>(pin_status);
     }
     ++hit_count_;
+    lock.unlock();
     return Result<WritePageGuard>(WritePageGuard(this, found->second, page_id, &frame.latch));
   }
 
@@ -1357,13 +1481,15 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
   (void)replacer_->RecordAccess(frame_id);
   if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
     ++eviction_count_;
+    if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
     eviction_log_.push_back(old_page_id);
   }
+  lock.unlock();
   return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch));
 }
 
 Result<WritePageGuard> BufferPoolManager::NewPage() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
   if (!ready.ok()) {
     return Result<WritePageGuard>(ready);
@@ -1395,8 +1521,10 @@ Result<WritePageGuard> BufferPoolManager::NewPage() {
   (void)replacer_->RecordAccess(frame_id);
   if (!selection.from_free_list && old_page_id != INVALID_PAGE_ID) {
     ++eviction_count_;
+    if (eviction_log_.size() >= 1024) eviction_log_.erase(eviction_log_.begin());
     eviction_log_.push_back(old_page_id);
   }
+  lock.unlock();
   return Result<WritePageGuard>(WritePageGuard(this, frame_id, allocated.value(), &frame.latch));
 }
 
@@ -1415,11 +1543,23 @@ Status BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
     return Status::InvalidArgument("页面不能重复 Unpin: " + std::to_string(page_id));
   }
   frame.is_dirty = frame.is_dirty || is_dirty;
+
+  Status flush_status = Status::Ok();
+  if (flush_policy_ == FlushPolicy::WriteThrough && frame.is_dirty) {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    flush_status = disk_manager_->WritePage(page_id, frame.page);
+    if (flush_status.ok()) {
+      frame.is_dirty = false;
+    }
+  }
+
   --frame.pin_count;
   if (frame.pin_count == 0) {
-    return replacer_->Unpin(found->second);
+    const auto unpin_status = replacer_->Unpin(found->second);
+    if (!flush_status.ok()) return flush_status;
+    return unpin_status;
   }
-  return Status::Ok();
+  return flush_status;
 }
 
 Status BufferPoolManager::FlushPage(page_id_t page_id) {
@@ -1617,5 +1757,31 @@ void BufferPoolManager::ResetStatistics() {
   eviction_count_ = 0;
   eviction_log_.clear();
 }
+
+std::vector<FrameSnapshot> BufferPoolManager::GetFrameSnapshots() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<FrameSnapshot> snapshots;
+  snapshots.reserve(frames_.size());
+  for (frame_id_t frame_id = 0; frame_id < frames_.size(); ++frame_id) {
+    const auto &frame = frames_[frame_id];
+    FrameSnapshot snapshot;
+    snapshot.frame_id = frame_id;
+    if (frame.page_id != INVALID_PAGE_ID) snapshot.page_id = frame.page_id;
+    snapshot.pin_count = frame.pin_count;
+    snapshot.is_dirty = frame.is_dirty;
+    snapshot.is_evictable = frame.page_id != INVALID_PAGE_ID &&
+                            frame.pin_count == 0 && replacer_->IsEvictable(frame_id);
+    snapshots.push_back(snapshot);
+  }
+  return snapshots;
+}
+
+ReplacementPolicy BufferPoolManager::GetReplacementPolicy() const noexcept {
+  return replacement_policy_;
+}
+
+FlushPolicy BufferPoolManager::GetFlushPolicy() const noexcept { return flush_policy_; }
+
+std::size_t BufferPoolManager::GetPoolSize() const noexcept { return pool_size_; }
 
 }  // namespace oursql

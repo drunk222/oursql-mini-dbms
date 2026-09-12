@@ -12,6 +12,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -115,6 +116,7 @@ using frame_id_t = std::size_t;
 enum class ReplacementPolicy {
   FIFO,
   LRU,
+  CLOCK,
 };
 
 enum class FlushPolicy {
@@ -138,6 +140,7 @@ class Replacer {
   [[nodiscard]] virtual Result<frame_id_t> Victim() = 0;
   // 调用者：缓冲池或测试；作用：查询候选 frame 数量；返回：数量。
   [[nodiscard]] virtual std::size_t Size() const = 0;
+  [[nodiscard]] virtual bool IsEvictable(frame_id_t frame_id) const = 0;
 };
 
 // 调用者：缓冲池或替换策略测试；作用：按进入候选集合顺序淘汰 frame；返回：确定性替换器。
@@ -150,6 +153,7 @@ class FIFOReplacer final : public Replacer {
   [[nodiscard]] Status Remove(frame_id_t frame_id) override;
   [[nodiscard]] Result<frame_id_t> Victim() override;
   [[nodiscard]] std::size_t Size() const override;
+  [[nodiscard]] bool IsEvictable(frame_id_t frame_id) const override;
 
  private:
   std::size_t capacity_{0};
@@ -170,6 +174,7 @@ class LRUReplacer final : public Replacer {
   [[nodiscard]] Status Remove(frame_id_t frame_id) override;
   [[nodiscard]] Result<frame_id_t> Victim() override;
   [[nodiscard]] std::size_t Size() const override;
+  [[nodiscard]] bool IsEvictable(frame_id_t frame_id) const override;
 
  private:
   std::size_t capacity_{0};
@@ -178,6 +183,27 @@ class LRUReplacer final : public Replacer {
   std::unordered_set<frame_id_t> candidates_;
   std::unordered_map<frame_id_t, std::uint64_t> last_used_;
   std::uint64_t access_clock_{0};
+};
+
+class ClockReplacer final : public Replacer {
+ public:
+  explicit ClockReplacer(std::size_t capacity);
+  [[nodiscard]] Status Pin(frame_id_t frame_id) override;
+  [[nodiscard]] Status Unpin(frame_id_t frame_id) override;
+  [[nodiscard]] Status RecordAccess(frame_id_t frame_id) override;
+  [[nodiscard]] Status Remove(frame_id_t frame_id) override;
+  [[nodiscard]] Result<frame_id_t> Victim() override;
+  [[nodiscard]] std::size_t Size() const override;
+  [[nodiscard]] bool IsEvictable(frame_id_t frame_id) const override;
+
+ private:
+  std::size_t capacity_{0};
+  mutable std::mutex mutex_;
+  std::vector<bool> active_;
+  std::vector<bool> evictable_;
+  std::vector<bool> reference_bits_;
+  std::size_t hand_{0};
+  std::size_t evictable_count_{0};
 };
 
 class BufferPoolManager;
@@ -227,6 +253,7 @@ class WritePageGuard {
   [[nodiscard]] page_id_t PageId() const noexcept;
   // 调用者：修改页面的调用者；作用：显式标记页面已修改；返回：标脏状态。
   [[nodiscard]] Status MarkDirty() noexcept;
+  [[nodiscard]] Status Release() noexcept;
   // 调用者：上层存储；作用：查询 guard 是否持有页面；返回：有效性。
   [[nodiscard]] bool IsValid() const noexcept;
 
@@ -234,7 +261,7 @@ class WritePageGuard {
   friend class BufferPoolManager;
   WritePageGuard(BufferPoolManager *buffer_pool, frame_id_t frame_id, page_id_t page_id,
                  std::shared_mutex *latch);
-  void Reset() noexcept;
+  [[nodiscard]] Status Reset() noexcept;
 
   BufferPoolManager *buffer_pool_{nullptr};
   frame_id_t frame_id_{0};
@@ -286,6 +313,14 @@ class SlottedPage {
   [[nodiscard]] static Status ValidateBytes(const std::byte *data);
 };
 
+struct FrameSnapshot {
+  frame_id_t frame_id{0};
+  std::optional<page_id_t> page_id;
+  std::uint32_t pin_count{0};
+  bool is_dirty{false};
+  bool is_evictable{false};
+};
+
 class BufferPoolManager {
  public:
   // 调用者：上层数据库；作用：创建缓冲池管理器；返回：持有容量和磁盘句柄的对象。
@@ -335,6 +370,10 @@ class BufferPoolManager {
   [[nodiscard]] std::vector<page_id_t> GetEvictionLog() const;
   // 调用者：测试或监控；作用：清零缓冲池统计；返回：无。
   void ResetStatistics();
+  [[nodiscard]] std::vector<FrameSnapshot> GetFrameSnapshots() const;
+  [[nodiscard]] ReplacementPolicy GetReplacementPolicy() const noexcept;
+  [[nodiscard]] FlushPolicy GetFlushPolicy() const noexcept;
+  [[nodiscard]] std::size_t GetPoolSize() const noexcept;
 
  private:
   friend class ReadPageGuard;

@@ -407,6 +407,71 @@ Status Catalog::CreateTable(TableInfo table) {
   return Status::Ok();
 }
 
+Status Catalog::DropTable(std::string_view table_name) {
+  const bool persistent = buffer_pool_ != nullptr || disk_manager_ != nullptr;
+  if (persistent && (buffer_pool_ == nullptr || disk_manager_ == nullptr)) {
+    return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
+  }
+  if (persistent && !opened_) {
+    auto status = Open();
+    if (!status.ok()) return status;
+  }
+  auto table = tables_.find(std::string(table_name));
+  if (table == tables_.end()) {
+    return Status::NotFound("Catalog 未找到表: " + std::string(table_name));
+  }
+  if (!ListTableIndexes(table_name).empty()) {
+    return Status::InvalidArgument("删除表元数据前必须先删除该表的全部索引");
+  }
+  if (persistent) {
+    page_id_t record_page_id = INVALID_PAGE_ID;
+    slot_id_t record_slot_id = INVALID_SLOT_ID;
+    std::unordered_set<page_id_t> visited;
+    page_id_t current = catalog_head_;
+    while (current != INVALID_PAGE_ID && record_page_id == INVALID_PAGE_ID) {
+      if (current == 0 || !visited.insert(current).second) {
+        return Status::InvalidArgument("Catalog 页面链表损坏或成环");
+      }
+      auto page_result = buffer_pool_->FetchPage(current);
+      if (!page_result.ok()) return page_result.status();
+      auto page = std::move(page_result.value());
+      auto count = SlottedPage::SlotCount(page);
+      if (!count.ok()) return count.status();
+      for (std::uint32_t slot = 0; slot < count.value(); ++slot) {
+        auto record = SlottedPage::GetRecord(page, slot);
+        if (!record.ok()) {
+          if (record.status().code() == ErrorCode::NotFound) continue;
+          return record.status();
+        }
+        if (!CanRead(record.value(), 0, 4) ||
+            ReadU32(record.value(), 0) != kCatalogRecordMagic) {
+          continue;
+        }
+        auto decoded = DecodeTable(record.value());
+        if (!decoded.ok()) return decoded.status();
+        if (decoded.value().name == table_name) {
+          record_page_id = current;
+          record_slot_id = slot;
+          break;
+        }
+      }
+      auto next = SlottedPage::NextPageId(page);
+      if (!next.ok()) return next.status();
+      current = next.value();
+    }
+    if (record_page_id == INVALID_PAGE_ID) {
+      return Status::InternalError("Catalog 内存表缺少对应的磁盘记录");
+    }
+    auto page_result = buffer_pool_->FetchPageWrite(record_page_id);
+    if (!page_result.ok()) return page_result.status();
+    auto page = std::move(page_result.value());
+    auto status = SlottedPage::DeleteRecord(page, record_slot_id);
+    if (!status.ok()) return status;
+  }
+  tables_.erase(table);
+  return Status::Ok();
+}
+
 Status Catalog::CreateIndex(IndexInfo index) {
   auto valid = ValidateIndexShape(index);
   if (!valid.ok()) return valid;

@@ -39,7 +39,7 @@ disk_manager_.ResetIoStatistics();
 
 ## DROP TABLE 接线顺序
 
-完整 `DROP TABLE` 仍由 A 侧负责语法、计划和执行编排，固定顺序应为：
+完整 `DROP TABLE` 已在执行层接通，执行顺序固定为：
 
 ```text
 查找该表的全部索引

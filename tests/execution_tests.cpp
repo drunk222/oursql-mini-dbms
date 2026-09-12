@@ -1,5 +1,6 @@
 #include "oursql/execution/database_engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -283,7 +284,7 @@ bool TestDistinctAndLimitCompileOnly() {
                "LIMIT 应完成编译后明确拒绝执行");
 }
 
-bool TestDropAndAliasCompileOnly() {
+bool TestDropTableExecutionAndAliases() {
   TempDb temp;
   oursql::DatabaseEngine engine(temp.path, 3);
   if (!Check(engine.GetInitStatus().ok(), "DROP/AS 测试数据库打开应成功")) {
@@ -314,21 +315,49 @@ bool TestDropAndAliasCompileOnly() {
     return false;
   }
 
-  auto dropped = engine.ExecuteSql("DROP TABLE student;");
-  if (!Check(!dropped.ok() &&
-                 dropped.status().code() == oursql::ErrorCode::NotImplemented,
-             "DROP TABLE 应完成编译后明确拒绝执行")) {
-    return false;
+  std::string more_rows;
+  for (int id = 2; id <= 300; ++id) {
+    more_rows += "INSERT INTO student VALUES(" + std::to_string(id) + ",'user_" +
+                 std::to_string(id) + "');";
   }
+  if (!Check(engine.ExecuteSqlBatch(more_rows).ok() &&
+                 engine.ExecuteSql("CREATE UNIQUE INDEX idx_student_id ON student(id);").ok() &&
+                 engine.Flush().ok(),
+             "DROP TABLE前应建立多页表和索引")) return false;
+  const auto size_before_drop = std::filesystem::file_size(temp.path);
 
+  auto dropped = engine.ExecuteSql("DROP TABLE student;");
+  if (!Check(dropped.ok(), "DROP TABLE应删除索引、数据页和表元数据")) return false;
   const auto tables = engine.ListTables();
   bool student_exists = false;
   for (const auto &table : tables) {
     if (table.name == "student") student_exists = true;
   }
   auto rows = engine.ExecuteSql("SELECT * FROM student;");
-  return Check(student_exists && rows.ok() && rows.value().rows.size() == 1,
-               "未实现的 DROP TABLE 不得删除 Catalog 或数据");
+  if (!Check(!student_exists && !rows.ok() && rows.status().code() == oursql::ErrorCode::NotFound,
+             "DROP TABLE后Catalog和查询入口都应消失")) return false;
+
+  if (!Check(engine.ExecuteSql("CREATE TABLE learner(id INT, name VARCHAR);").ok(),
+             "DROP后应能创建替代表")) return false;
+  std::string replacement_rows;
+  for (int id = 1; id <= 300; ++id) {
+    replacement_rows += "INSERT INTO learner VALUES(" + std::to_string(id) + ",'user_" +
+                        std::to_string(id) + "');";
+  }
+  if (!Check(engine.ExecuteSqlBatch(replacement_rows).ok() &&
+                 engine.ExecuteSql("CREATE UNIQUE INDEX idx_learner_id ON learner(id);").ok() &&
+                 engine.Flush().ok(),
+             "DROP后应复用页面建立等规模表和索引")) return false;
+  if (!Check(std::filesystem::file_size(temp.path) <= size_before_drop,
+             "DROP TABLE释放的数据页和索引页应由Free List复用")) return false;
+  if (!Check(engine.Close().ok(), "DROP TABLE测试关闭应成功")) return false;
+
+  oursql::DatabaseEngine reopened(temp.path, 3);
+  if (!Check(reopened.GetInitStatus().ok(), "DROP TABLE测试重启应成功")) return false;
+  auto old_table = reopened.ExecuteSql("SELECT * FROM student;");
+  auto replacement = reopened.ExecuteSql("SELECT * FROM learner WHERE id = 300;");
+  return Check(!old_table.ok() && replacement.ok() && replacement.value().rows.size() == 1,
+               "重启后旧表和索引不应恢复，替代表索引应可查询");
 }
 
 bool TestAggregateAndHavingCompileOnly() {
@@ -534,6 +563,131 @@ bool TestStatisticsResetKeepsWarmPages() {
                "ResetStatistics should reject a closed engine");
 }
 
+std::vector<std::string> CanonicalRows(const oursql::ExecutionResult &result) {
+  std::vector<std::string> rows;
+  rows.reserve(result.rows.size());
+  for (const auto &row : result.rows) {
+    std::string encoded;
+    for (const auto &value : row) {
+      encoded += value.ToString();
+      encoded.push_back('\x1f');
+    }
+    rows.push_back(std::move(encoded));
+  }
+  std::sort(rows.begin(), rows.end());
+  return rows;
+}
+
+bool TestIndexSqlRestartAndConsistency() {
+  TempDb temp;
+  std::vector<std::string> sequential_rows;
+  {
+    oursql::DatabaseEngine engine(temp.path, 8);
+    if (!Check(engine.GetInitStatus().ok(), "SQL索引验收数据库应打开")) return false;
+    if (!Check(engine.ExecuteSql(
+                   "CREATE TABLE student(id INT, group_id INT, name VARCHAR(32));").ok(),
+               "SQL索引验收建表应成功")) return false;
+    for (std::int64_t first = 0; first < 600; first += 100) {
+      std::string sql;
+      for (std::int64_t id = first; id < first + 100; ++id) {
+        sql += "INSERT INTO student VALUES(" + std::to_string(id) + "," +
+               std::to_string(id % 5) + ",'student_" + std::to_string(id) + "');";
+      }
+      if (!Check(engine.ExecuteSqlBatch(sql).ok(), "600行测试数据批量插入应成功")) return false;
+    }
+    auto sequential = engine.ExecuteSql("SELECT * FROM student WHERE group_id = 3;");
+    if (!Check(sequential.ok() && sequential.value().rows.size() == 120,
+               "无索引SeqScan应返回完整重复Key集合")) return false;
+    sequential_rows = CanonicalRows(sequential.value());
+    if (!Check(engine.ExecuteSql("CREATE UNIQUE INDEX idx_student_id ON student(id);").ok() &&
+                   engine.ExecuteSql("CREATE INDEX idx_student_group ON student(group_id);").ok(),
+               "一张表创建唯一和非唯一两个索引应成功")) return false;
+    auto indexed = engine.ExecuteSql("SELECT * FROM student WHERE group_id = 3;");
+    if (!Check(indexed.ok() && CanonicalRows(indexed.value()) == sequential_rows,
+               "同一查询的SeqScan与IndexScan完整结果集合应一致")) return false;
+    auto duplicate_key = engine.ExecuteSql("SELECT * FROM student WHERE group_id = 3;");
+    if (!Check(duplicate_key.ok() && duplicate_key.value().rows.size() == 120,
+               "非唯一索引同一Key应返回全部RID")) return false;
+    for (const auto key : {0, 599, 9999}) {
+      auto result = engine.ExecuteSql(
+          "SELECT * FROM student WHERE id = " + std::to_string(key) + ";");
+      const auto expected = key == 9999 ? 0U : 1U;
+      if (!Check(result.ok() && result.value().rows.size() == expected,
+                 "索引应正确处理最小Key、最大Key和不存在Key")) return false;
+    }
+    if (!Check(engine.Close().ok(), "SQL索引首次关闭应成功")) return false;
+  }
+
+  {
+    oursql::DatabaseEngine engine(temp.path, 8);
+    if (!Check(engine.GetInitStatus().ok(), "SQL索引首次重启应成功")) return false;
+    auto explain = engine.ExecuteSql("EXPLAIN SELECT * FROM student WHERE id = 599;");
+    if (!Check(explain.ok() && explain.value().rows[0][0].AsVarchar().find("IndexScanPlan") !=
+                                      std::string::npos,
+               "重启后SQL仍应选择IndexScan")) return false;
+    if (!Check(engine.ExecuteSql("INSERT INTO student VALUES(700,3,'restart');").ok(),
+               "重启后INSERT应维护两个索引")) return false;
+    if (!Check(engine.ExecuteSql("UPDATE student SET group_id = 4 WHERE id = 700;").ok(),
+               "重启后UPDATE应维护两个索引")) return false;
+    auto updated = engine.ExecuteSql("SELECT * FROM student WHERE id = 700;");
+    if (!Check(updated.ok() && updated.value().rows.size() == 1 &&
+                   updated.value().rows[0][1].AsInt() == 4,
+               "UPDATE后唯一索引应指向新RID且非唯一索引Key应更新")) return false;
+    if (!Check(engine.ExecuteSql("DELETE FROM student WHERE id = 700;").ok(),
+               "重启后DELETE应维护两个索引")) return false;
+    auto bulk_delete = engine.ExecuteSql("DELETE FROM student WHERE group_id = 1;");
+    if (!bulk_delete.ok()) {
+      std::cerr << "bulk delete status: " << bulk_delete.status().ToString() << '\n';
+    } else if (bulk_delete.value().affected_rows != 120) {
+      std::cerr << "bulk delete affected rows: " << bulk_delete.value().affected_rows << '\n';
+    }
+    if (!Check(bulk_delete.ok() && bulk_delete.value().affected_rows == 120,
+               "大量删除应触发B+树合并并维护两个索引")) return false;
+    if (!Check(engine.Close().ok(), "SQL索引第二次关闭应成功")) return false;
+  }
+
+  {
+    oursql::DatabaseEngine engine(temp.path, 8);
+    if (!Check(engine.GetInitStatus().ok(), "SQL索引第二次重启应成功")) return false;
+    auto deleted = engine.ExecuteSql("SELECT * FROM student WHERE group_id = 1;");
+    auto removed_update = engine.ExecuteSql("SELECT * FROM student WHERE id = 700;");
+    if (!Check(deleted.ok() && deleted.value().rows.empty() && removed_update.ok() &&
+                   removed_update.value().rows.empty(),
+               "第二次重启后增删改索引状态应一致")) return false;
+
+    if (!Check(engine.ExecuteSql("CREATE TABLE duplicate_ids(id INT);").ok() &&
+                   engine.ExecuteSql("INSERT INTO duplicate_ids VALUES(1);INSERT INTO duplicate_ids VALUES(1);").ok(),
+               "唯一索引失败场景数据应建立")) return false;
+    auto rejected = engine.ExecuteSql(
+        "CREATE UNIQUE INDEX idx_duplicate_ids ON duplicate_ids(id);");
+    auto fallback = engine.ExecuteSql(
+        "EXPLAIN SELECT * FROM duplicate_ids WHERE id = 1;");
+    if (!Check(!rejected.ok() && rejected.status().code() == oursql::ErrorCode::AlreadyExists &&
+                   fallback.ok() && fallback.value().rows[0][0].AsVarchar().find("SeqScanPlan") !=
+                                        std::string::npos,
+               "已有重复数据创建唯一索引应失败且不遗留元数据")) return false;
+
+    if (!Check(engine.Flush().ok(), "DROP INDEX复用测试预刷新应成功")) return false;
+    const auto size_before_drop = std::filesystem::file_size(temp.path);
+    if (!Check(engine.ExecuteSql("DROP INDEX idx_student_group;").ok(),
+               "SQL DROP INDEX应成功")) return false;
+    if (!Check(engine.ExecuteSql("CREATE INDEX idx_student_group_rebuilt ON student(group_id);").ok() &&
+                   engine.Flush().ok(),
+               "DROP后重建等规模索引应成功")) return false;
+    const auto size_after_rebuild = std::filesystem::file_size(temp.path);
+    if (!Check(size_after_rebuild <= size_before_drop,
+               "DROP INDEX释放页面应由Free List复用而不扩展数据库文件")) return false;
+    if (!Check(engine.Close().ok(), "SQL索引最终关闭应成功")) return false;
+  }
+
+  oursql::DatabaseEngine reopened(temp.path, 8);
+  if (!Check(reopened.GetInitStatus().ok(), "重建索引后最终重启应成功")) return false;
+  auto explain = reopened.ExecuteSql("EXPLAIN SELECT * FROM student WHERE group_id = 3;");
+  return Check(explain.ok() && explain.value().rows[0][0].AsVarchar().find(
+                                   "idx_student_group_rebuilt") != std::string::npos,
+               "最终重启应恢复DROP后重建的索引元数据");
+}
+
 }  // namespace
 
 int main() {
@@ -562,8 +716,8 @@ int main() {
   } else {
     return 1;
   }
-  if (TestDropAndAliasCompileOnly()) {
-    std::cout << "[PASS] DROP TABLE and AS compile-only\n";
+  if (TestDropTableExecutionAndAliases()) {
+    std::cout << "[PASS] DROP TABLE execution and AS compile-only\n";
   } else {
     return 1;
   }
@@ -579,6 +733,11 @@ int main() {
   }
   if (TestStatisticsResetKeepsWarmPages()) {
     std::cout << "[PASS] Statistics reset keeps warm pages\n";
+  } else {
+    return 1;
+  }
+  if (TestIndexSqlRestartAndConsistency()) {
+    std::cout << "[PASS] Index SQL restart and consistency\n";
   } else {
     return 1;
   }

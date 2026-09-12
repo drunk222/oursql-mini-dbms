@@ -99,7 +99,7 @@ struct DeletePlan {
   std::optional<Predicate> where;
 };
 
-// DROP TABLE 计划。当前执行层明确返回 NotImplemented。
+// DROP TABLE 计划。执行层依次释放索引、数据页链和表元数据。
 struct DropTablePlan {
   std::string table_name;
 };

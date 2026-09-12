@@ -122,11 +122,11 @@ RowCodec 把 Values 编成带边界信息的记录，HeapTable 沿数据页链�
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-本次最新构建的 CTest 实际结果为 `8/8` 通过，对应 8 个测试目标：`oursql_tests`（公共类型与基础结构）、`oursql_storage_tests`（DiskManager/Replacer/BufferPool）、`oursql_slotted_page_tests`（Slotted Page 与 RowCodec）、`oursql_frontend_tests`（Lexer/Parser/Planner）、`oursql_optimizer_tests`（编译层计划形态校验）、`oursql_catalog_heap_tests`（Catalog 与 HeapTable）、`oursql_execution_tests`（Executor、重启端到端）、`oursql_edge_case_tests`（边界）。另有 `oursql_benchmark` 基准目标，不作为 CTest 用例。
+本次最新构建的 CTest 实际结果为 `9/9` 通过，除原有公共类型、存储、前端、优化器、Catalog/HeapTable、执行器和边界测试外，新增 `oursql_b_plus_tree_tests`。另有 `oursql_benchmark` 和 `oursql_index_benchmark` 两个基准目标，不作为 CTest 用例。
 
 使用 Ninja 单配置生成器时，可执行文件位于 `build/`（例如 `build/oursql.exe`），而不是 `build/Debug/`。
 
-当前没有实现：JOIN、索引、事务、MVCC、完整 WAL、WriteThrough、ALTER/DROP、网络服务和 GUI。数据库仍是单数据库、单表查询教学实现；这些功能不能在演示中包装成已实现能力。
+当前已经支持单列 INT B+ 树索引、唯一/非唯一索引、SQL 等值 IndexScan、DROP INDEX 和 DROP TABLE。尚未实现：JOIN、SQL 范围 IndexScan、VARCHAR/复合索引、事务、MVCC、完整 WAL、WriteThrough、ALTER、网络服务和 GUI。
 
 编译层已能解析并生成对应 Plan 节点，但执行层没有对应算子的语法（`GROUP BY`、`ORDER BY`、`UPDATE`）在本项目中会**先完成表、列和类型语义检查，再由 ExecutionEngine 明确返回 `NotImplemented`**。指定列 INSERT 和多行 INSERT 也已生成 `InsertPlan`，但执行层当前只保留原有单行全列写入路径，其余形式明确返回 `NotImplemented`。复杂 WHERE 表达式目前仍由 Planner 在语义检查后返回 `NotImplemented`。整个链路不会让执行器静默忽略计划节点。演示时可以直接展示这一行为：
 
@@ -143,6 +143,6 @@ SELECT * FROM student WHERE id IN (1, 2);   -- NotImplemented: Planner: 复杂 W
 SELECT * FROM student WHERE name LIKE 'A%'; -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
 SELECT id AS user_id FROM student;         -- NotImplemented: Execution: 列别名仅编译层支持，未接入数据库执行
 SELECT id FROM student AS s;               -- NotImplemented: Execution: 表别名仅编译层支持，未接入数据库执行
-DROP TABLE student;                        -- NotImplemented: Execution: DROP TABLE 仅编译层支持，未接入数据库执行
+DROP TABLE student;                        -- 删除该表全部索引、数据页链和 Catalog 元数据
 SELECT * FROM student WHERE id > 1;       -- NotImplemented: Planner: 复杂 WHERE 表达式仅编译层支持，未接入数据库执行，位置 1:1
 ```

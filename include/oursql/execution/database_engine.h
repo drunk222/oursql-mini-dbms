@@ -48,6 +48,11 @@ class DatabaseEngine {
   [[nodiscard]] DatabaseStatistics GetStatistics() const;
   // 调用者：CLI 或性能测试；作用：只清零存储统计、不清缓存；返回：成功或引擎状态错误。
   [[nodiscard]] Status ResetStatistics();
+  [[nodiscard]] std::vector<FrameSnapshot> GetBufferSnapshots() const;
+  [[nodiscard]] std::vector<page_id_t> GetEvictionLog() const;
+  [[nodiscard]] ReplacementPolicy GetReplacementPolicy() const noexcept;
+  [[nodiscard]] FlushPolicy GetFlushPolicy() const noexcept;
+  [[nodiscard]] std::size_t GetPoolSize() const noexcept;
   // 调用者：CLI 或批处理客户端；作用：编译并逐条执行多条 SQL；返回：每条语句的结果序列。
   [[nodiscard]] Result<std::vector<ExecutionResult>> ExecuteSqlBatch(std::string_view sql);
   // 调用者：命令行或客户端；作用：编译并执行多条 SQL；返回：最后一条结果或执行错误。

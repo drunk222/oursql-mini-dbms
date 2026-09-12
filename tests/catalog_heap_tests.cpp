@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <string>
 #include <system_error>
 #include <unordered_set>
@@ -678,6 +679,246 @@ bool TestHeapTableDestroyRejectsCycleBeforeDeleting() {
                "Cycle Destroy test should close cleanly");
 }
 
+bool TestHeapTableReclaimsEmptyNonHeadPages() {
+  TempDb temp;
+  const oursql::Schema schema{{"id", oursql::DataType::Int},
+                              {"payload", oursql::DataType::Varchar, 512}};
+  oursql::page_id_t first_page = oursql::INVALID_PAGE_ID;
+
+  {
+    oursql::DiskManager disk;
+    if (!Check(disk.Open(temp.path).ok(), "Empty-page reclaim database should open")) {
+      return false;
+    }
+    oursql::BufferPoolManager pool(4, &disk);
+    oursql::Catalog catalog(&pool, &disk);
+    if (!Check(catalog.Open().ok(), "Empty-page reclaim Catalog should open")) return false;
+    if (!Check(catalog.CreateTable(oursql::TableMetadata{
+                       "reclaim_rows", schema, oursql::INVALID_PAGE_ID})
+                   .ok(),
+               "Empty-page reclaim table should be created")) {
+      return false;
+    }
+    auto metadata = catalog.GetTableMetadata("reclaim_rows");
+    if (!Check(metadata.ok(), "Empty-page reclaim metadata should be readable")) return false;
+    first_page = metadata.value()->first_data_page_id;
+    oursql::HeapTable table(&pool, *metadata.value());
+
+    for (std::int64_t i = 0; i < 120; ++i) {
+      const auto row = oursql::Row{
+          oursql::Value(i), oursql::Value(std::string(300, static_cast<char>('a' + i % 26)))};
+      auto rid = table.InsertRow(row);
+      if (!rid.ok()) {
+        std::cerr << "Empty-page reclaim insert " << i << ": "
+                  << rid.status().ToString() << '\n';
+        return Check(false, "Empty-page reclaim rows should insert across pages");
+      }
+    }
+    auto scanned = table.Scan();
+    if (!Check(scanned.ok(), "Empty-page reclaim table should scan before deletion")) return false;
+
+    std::vector<oursql::page_id_t> page_order;
+    std::unordered_set<oursql::page_id_t> seen_pages;
+    std::map<oursql::page_id_t, std::vector<oursql::RID>> rids_by_page;
+    for (const auto &entry : scanned.value()) {
+      if (seen_pages.insert(entry.first.page_id).second) page_order.push_back(entry.first.page_id);
+      rids_by_page[entry.first.page_id].push_back(entry.first);
+    }
+    if (!Check(page_order.size() >= 3, "Empty-page reclaim test should create at least three pages")) {
+      return false;
+    }
+
+    const auto middle_page = page_order[1];
+    for (const auto &rid : rids_by_page[middle_page]) {
+      if (!Check(table.DeleteRow(rid).ok(), "Deleting all middle-page rows should succeed")) {
+        return false;
+      }
+    }
+    scanned = table.Scan();
+    if (!Check(scanned.ok(), "Scan should succeed after middle-page reclaim")) return false;
+    for (const auto &entry : scanned.value()) {
+      if (!Check(entry.first.page_id != middle_page,
+                 "Reclaimed middle page must not remain in the table chain")) {
+        return false;
+      }
+    }
+
+    {
+      auto reused = pool.NewPage();
+      if (!Check(reused.ok() && reused.value().PageId() == middle_page,
+                 "Reclaimed middle page should be reused first")) {
+        return false;
+      }
+    }
+    if (!Check(pool.DeletePage(middle_page).ok(),
+               "Temporary reuse of middle page should be releasable")) {
+      return false;
+    }
+
+    const auto tail_page = page_order.back();
+    for (const auto &rid : rids_by_page[tail_page]) {
+      if (!Check(table.DeleteRow(rid).ok(), "Deleting all tail-page rows should succeed")) {
+        return false;
+      }
+    }
+    scanned = table.Scan();
+    if (!Check(scanned.ok(), "Scan should succeed after tail-page reclaim")) return false;
+    for (const auto &entry : scanned.value()) {
+      if (!Check(entry.first.page_id != tail_page,
+                 "Reclaimed tail page must not remain in the table chain")) {
+        return false;
+      }
+    }
+
+    for (const auto page_id : page_order) {
+      if (page_id == first_page || page_id == middle_page || page_id == tail_page) continue;
+      for (const auto &rid : rids_by_page[page_id]) {
+        if (!Check(table.DeleteRow(rid).ok(),
+                   "Deleting all remaining non-head page rows should succeed")) {
+          return false;
+        }
+      }
+    }
+
+    for (const auto &rid : rids_by_page[first_page]) {
+      if (!Check(table.DeleteRow(rid).ok(), "Deleting all head-page rows should succeed")) {
+        return false;
+      }
+    }
+    auto empty_head_scan = table.Scan();
+    if (!Check(empty_head_scan.ok(), "An empty but retained head page should scan")) return false;
+
+    if (!Check(pool.Close().ok() && disk.Close().ok(),
+               "Empty-page reclaim first lifetime should close cleanly")) {
+      return false;
+    }
+  }
+
+  oursql::DiskManager reopened_disk;
+  if (!Check(reopened_disk.Open(temp.path).ok(), "Empty-page reclaim database should reopen")) {
+    return false;
+  }
+  oursql::BufferPoolManager reopened_pool(4, &reopened_disk);
+  oursql::Catalog reopened_catalog(&reopened_pool, &reopened_disk);
+  if (!Check(reopened_catalog.Open().ok(), "Empty-page reclaim Catalog should reopen")) return false;
+  auto metadata = reopened_catalog.GetTableMetadata("reclaim_rows");
+  if (!Check(metadata.ok() && metadata.value()->first_data_page_id == first_page,
+             "Reopen should preserve the first data-page entry")) {
+    return false;
+  }
+  oursql::HeapTable reopened_table(&reopened_pool, *metadata.value());
+  auto scanned = reopened_table.Scan();
+  const bool ok = Check(scanned.ok() && scanned.value().empty(),
+                        "Reopen should scan the table after all rows are deleted");
+  return reopened_pool.Close().ok() && reopened_disk.Close().ok() && ok;
+}
+
+bool TestHeapTableLargePersistenceAndReclaim() {
+  TempDb temp;
+  const oursql::Schema schema{{"id", oursql::DataType::Int},
+                              {"name", oursql::DataType::Varchar, 64}};
+  oursql::page_id_t first_page = oursql::INVALID_PAGE_ID;
+  oursql::page_id_t reclaimed_page = oursql::INVALID_PAGE_ID;
+  std::unordered_set<std::int64_t> removed_ids;
+  constexpr std::int64_t kRowCount = 5000;
+
+  {
+    oursql::DiskManager disk;
+    if (!Check(disk.Open(temp.path).ok(), "Large persistence database should open")) return false;
+    oursql::BufferPoolManager pool(8, &disk);
+    oursql::Catalog catalog(&pool, &disk);
+    if (!Check(catalog.Open().ok(), "Large persistence Catalog should open")) return false;
+    if (!Check(catalog.CreateTable(oursql::TableMetadata{
+                       "large_rows", schema, oursql::INVALID_PAGE_ID})
+                   .ok(),
+               "Large persistence table should be created")) {
+      return false;
+    }
+    auto metadata = catalog.GetTableMetadata("large_rows");
+    if (!Check(metadata.ok(), "Large persistence metadata should be readable")) return false;
+    first_page = metadata.value()->first_data_page_id;
+    oursql::HeapTable table(&pool, *metadata.value());
+
+    for (std::int64_t id = 0; id < kRowCount; ++id) {
+      auto inserted = table.InsertRow({oursql::Value(id), oursql::Value("row_" + std::to_string(id))});
+      if (!Check(inserted.ok(), "5000 rows should insert across multiple pages")) return false;
+    }
+    auto before = table.Scan();
+    if (!Check(before.ok() && before.value().size() == kRowCount,
+               "5000 rows should scan completely before reclaim")) {
+      return false;
+    }
+
+    std::vector<oursql::page_id_t> page_order;
+    std::unordered_set<oursql::page_id_t> seen_pages;
+    std::map<oursql::page_id_t, std::vector<oursql::RID>> rids_by_page;
+    for (const auto &entry : before.value()) {
+      if (seen_pages.insert(entry.first.page_id).second) page_order.push_back(entry.first.page_id);
+      rids_by_page[entry.first.page_id].push_back(entry.first);
+    }
+    if (!Check(page_order.size() >= 3, "5000-row test should create multiple data pages")) return false;
+    reclaimed_page = page_order[page_order.size() / 2];
+    for (const auto &rid : rids_by_page[reclaimed_page]) {
+      auto row = table.GetRow(rid);
+      if (!Check(row.ok(), "Rows selected for full-page reclaim should be readable")) return false;
+      removed_ids.insert(row.value()[0].AsInt());
+      if (!Check(table.DeleteRow(rid).ok(), "Deleting a complete large-table page should succeed")) {
+        return false;
+      }
+    }
+    auto after_delete = table.Scan();
+    if (!Check(after_delete.ok() && after_delete.value().size() == kRowCount - removed_ids.size(),
+               "Large-table scan should skip reclaimed page rows")) {
+      return false;
+    }
+    if (!Check(pool.Close().ok() && disk.Close().ok(),
+               "Large persistence first lifetime should close cleanly")) {
+      return false;
+    }
+  }
+
+  oursql::DiskManager reopened_disk;
+  if (!Check(reopened_disk.Open(temp.path).ok(), "Large persistence database should reopen")) return false;
+  oursql::BufferPoolManager reopened_pool(8, &reopened_disk);
+  oursql::Catalog reopened_catalog(&reopened_pool, &reopened_disk);
+  if (!Check(reopened_catalog.Open().ok(), "Large persistence Catalog should reopen")) return false;
+  auto metadata = reopened_catalog.GetTableMetadata("large_rows");
+  if (!Check(metadata.ok() && metadata.value()->first_data_page_id == first_page,
+             "Large persistence should preserve the first data page")) {
+    return false;
+  }
+  oursql::HeapTable reopened_table(&reopened_pool, *metadata.value());
+  auto scanned = reopened_table.Scan();
+  if (!Check(scanned.ok() && scanned.value().size() == kRowCount - removed_ids.size(),
+             "Reopened large table should retain every non-deleted row")) {
+    return false;
+  }
+  std::unordered_set<std::int64_t> observed_ids;
+  for (const auto &entry : scanned.value()) {
+    const auto id = entry.second[0].AsInt();
+    if (!Check(removed_ids.count(id) == 0 && observed_ids.insert(id).second,
+               "Reopened large scan should have no deleted or duplicate ids")) {
+      return false;
+    }
+    if (!Check(entry.second[1].AsVarchar() == "row_" + std::to_string(id),
+               "Reopened large scan should preserve row contents")) {
+      return false;
+    }
+  }
+  {
+    auto reused = reopened_pool.NewPage();
+    if (!Check(reused.ok() && reused.value().PageId() == reclaimed_page,
+               "Reclaimed large-table page should be reusable after restart")) {
+      return false;
+    }
+  }
+  if (!Check(reopened_pool.DeletePage(reclaimed_page).ok(),
+             "Temporary large-table page reuse should be releasable")) {
+    return false;
+  }
+  return reopened_pool.Close().ok() && reopened_disk.Close().ok();
+}
+
 bool TestDropIndexReusesAllPagesAcrossRestart() {
   TempDb temp;
   std::uintmax_t page_count_before = 0;
@@ -768,6 +1009,8 @@ int main() {
       &TestHeapTableDestroyMiddlePinnedIsAllOrNothing);
   run("HeapTable Destroy rejects cycle before deleting",
       &TestHeapTableDestroyRejectsCycleBeforeDeleting);
+  run("HeapTable reclaims empty non-head pages", &TestHeapTableReclaimsEmptyNonHeadPages);
+  run("HeapTable large persistence and reclaim", &TestHeapTableLargePersistenceAndReclaim);
   run("DropIndex reuses all pages across restart",
       &TestDropIndexReusesAllPagesAcrossRestart);
   if (failures == 0) {

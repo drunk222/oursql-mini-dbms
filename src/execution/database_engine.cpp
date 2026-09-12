@@ -97,6 +97,24 @@ Status DatabaseEngine::ResetStatistics() {
   return Status::Ok();
 }
 
+std::vector<FrameSnapshot> DatabaseEngine::GetBufferSnapshots() const {
+  return buffer_pool_.GetFrameSnapshots();
+}
+
+std::vector<page_id_t> DatabaseEngine::GetEvictionLog() const {
+  return buffer_pool_.GetEvictionLog();
+}
+
+ReplacementPolicy DatabaseEngine::GetReplacementPolicy() const noexcept {
+  return buffer_pool_.GetReplacementPolicy();
+}
+
+FlushPolicy DatabaseEngine::GetFlushPolicy() const noexcept {
+  return buffer_pool_.GetFlushPolicy();
+}
+
+std::size_t DatabaseEngine::GetPoolSize() const noexcept { return buffer_pool_.GetPoolSize(); }
+
 Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string_view sql) {
   if (!init_status_.ok()) {
     return Result<std::vector<ExecutionResult>>(Contextualize("DatabaseEngine", init_status_));

@@ -57,6 +57,9 @@ class Catalog final : public CatalogView {
   // 调用者：DDL 执行器；作用：登记一张表；返回：成功或失败状态。
   [[nodiscard]] Status CreateTable(TableInfo table);
 
+  // 调用者：DROP TABLE编排层；作用：删除无关联索引的表元数据记录；不释放数据页。
+  [[nodiscard]] Status DropTable(std::string_view table_name);
+
   // 调用者：索引创建流程；作用：登记并持久化索引定义；返回：成功或校验错误。
   [[nodiscard]] Status CreateIndex(IndexInfo index);
 

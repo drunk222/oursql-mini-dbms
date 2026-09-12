@@ -74,6 +74,9 @@ target_link_libraries(oursql_b_plus_tree_tests PRIVATE oursql_core)
 add_executable(oursql_benchmark benchmarks/storage_benchmark.cpp)
 target_link_libraries(oursql_benchmark PRIVATE oursql_core)
 
+add_executable(oursql_index_benchmark benchmarks/index_benchmark.cpp)
+target_link_libraries(oursql_index_benchmark PRIVATE oursql_core)
+
 enable_testing()
 add_test(NAME oursql_tests COMMAND oursql_tests)
 add_test(NAME oursql_storage_tests COMMAND oursql_storage_tests)

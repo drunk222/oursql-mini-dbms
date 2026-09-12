@@ -533,6 +533,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
     if (left_entries.size() > minimum_size) {
       leaf_entries.insert(leaf_entries.begin(), left_entries.back());
       left_entries.pop_back();
+      std::sort(leaf_entries.begin(), leaf_entries.end(), EntryLess);
       {
         auto write_result = buffer_pool_->FetchPageWrite(left_id);
         if (!write_result.ok()) return write_result.status();
@@ -572,6 +573,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
     if (right_entries.size() > minimum_size) {
       leaf_entries.push_back(right_entries.front());
       right_entries.erase(right_entries.begin());
+      std::sort(leaf_entries.begin(), leaf_entries.end(), EntryLess);
       {
         auto write_result = buffer_pool_->FetchPageWrite(leaf_page_id);
         if (!write_result.ok()) return write_result.status();
@@ -599,6 +601,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
 
     if (left_id == INVALID_PAGE_ID) {
       leaf_entries.insert(leaf_entries.end(), right_entries.begin(), right_entries.end());
+      std::sort(leaf_entries.begin(), leaf_entries.end(), EntryLess);
       {
         auto write_result = buffer_pool_->FetchPageWrite(leaf_page_id);
         if (!write_result.ok()) return write_result.status();
@@ -632,6 +635,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
     left_entries = left.Entries();
   }
   left_entries.insert(left_entries.end(), leaf_entries.begin(), leaf_entries.end());
+  std::sort(left_entries.begin(), left_entries.end(), EntryLess);
   {
     auto write_result = buffer_pool_->FetchPageWrite(left_id);
     if (!write_result.ok()) return write_result.status();

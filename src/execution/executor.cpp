@@ -757,8 +757,27 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
           }
           return Result<ExecutionResult>(std::move(result));
         } else if constexpr (std::is_same_v<Type, DropTablePlan>) {
-          return Result<ExecutionResult>(Status::NotImplemented(
-              "DROP TABLE 仅编译层支持，未接入数据库执行"));
+          auto metadata = catalog_->GetTableMetadata(operation.table_name);
+          if (!metadata.ok()) return Result<ExecutionResult>(metadata.status());
+          const auto table_metadata = *metadata.value();
+          const auto indexes = catalog_->ListTableIndexes(operation.table_name);
+          IndexManager index_manager(catalog_, buffer_pool_);
+          for (const auto &index : indexes) {
+            auto status = index_manager.DropIndex(index.name);
+            if (!status.ok()) {
+              return Result<ExecutionResult>(Contextualize("DropTableExecutor", status));
+            }
+          }
+          HeapTable table(buffer_pool_, table_metadata);
+          auto status = table.Destroy();
+          if (!status.ok()) {
+            return Result<ExecutionResult>(Contextualize("DropTableExecutor", status));
+          }
+          status = catalog_->DropTable(operation.table_name);
+          if (!status.ok()) {
+            return Result<ExecutionResult>(Contextualize("DropTableExecutor", status));
+          }
+          return Result<ExecutionResult>(ExecutionResult{});
         } else if constexpr (std::is_same_v<Type, CreateIndexPlan>) {
           auto status = IndexManager(catalog_, buffer_pool_)
                             .CreateIndex(operation.index_name,

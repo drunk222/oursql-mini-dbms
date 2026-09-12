@@ -10,6 +10,9 @@ namespace oursql {
 
 class Value {
  public:
+  // 调用者：Parser/执行器；作用：构造 SQL NULL；返回：空值。
+  Value();
+
   // 调用者：解析器或执行器；作用：构造整数值；返回：可比较的标量值。
   Value(std::int64_t integer);
 
@@ -21,6 +24,7 @@ class Value {
 
   [[nodiscard]] bool IsInt() const noexcept;
   [[nodiscard]] bool IsVarchar() const noexcept;
+  [[nodiscard]] bool IsNull() const noexcept;
   [[nodiscard]] DataType type() const noexcept;
   [[nodiscard]] std::int64_t AsInt() const;
   [[nodiscard]] const std::string &AsVarchar() const;
@@ -30,7 +34,7 @@ class Value {
   friend bool operator!=(const Value &lhs, const Value &rhs) noexcept;
 
  private:
-  std::variant<std::int64_t, std::string> data_;
+  std::variant<std::monostate, std::int64_t, std::string> data_;
 };
 
 }  // namespace oursql

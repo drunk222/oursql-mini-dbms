@@ -7,6 +7,7 @@
 
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <variant>
@@ -282,7 +283,10 @@ bool TestInsertColumnListAndMultipleRows() {
   if (!Check(insert_plan.columns ==
                      std::vector<std::string>{"name", "id"} &&
                  insert_plan.rows.size() == 2 &&
-                 insert_plan.rows[1][1].AsInt() == 2,
+                 insert_plan.rows[0][0].AsInt() == 1 &&
+                 insert_plan.rows[0][1].AsVarchar() == "Alice" &&
+                 insert_plan.rows[1][0].AsInt() == 2 &&
+                 insert_plan.rows[1][1].AsVarchar() == "Bob",
              "指定列多行 INSERT 的 Plan 字段应正确")) {
     return false;
   }
@@ -313,8 +317,10 @@ bool TestInsertColumnListAndMultipleRows() {
       std::get<oursql::InsertPlan>(partial_plan.value());
   if (!Check(partial_insert_plan.columns ==
                      std::vector<std::string>{"name"} &&
-                 partial_insert_plan.rows.size() == 1,
-             "部分列值应按目标列顺序保留")) {
+                 partial_insert_plan.rows.size() == 1 &&
+                 partial_insert_plan.rows[0][0].IsNull() &&
+                 partial_insert_plan.rows[0][1].AsVarchar() == "Alice",
+             "部分列值应填充为 Schema 顺序并使用 NULL 默认")) {
     return false;
   }
 
@@ -349,7 +355,7 @@ bool TestInsertColumnListAndMultipleRows() {
               "rows=[['Alice',1],['Bob',2]])" &&
           oursql::ToString(plan.value()) ==
               "InsertPlan(table=users,columns=[name,id],"
-              "rows=[['Alice',1],['Bob',2]])",
+              "rows=[[1,'Alice'],[2,'Bob']])",
       "INSERT AST 和 Plan 文本格式应稳定");
 }
 
@@ -648,6 +654,587 @@ bool TestCreateDropIndexAndExplain() {
   return Check(oursql::ToString(indexed_plan.value()).find(
                    "IndexScanPlan") != std::string::npos,
                "EXPLAIN 文本应包含 IndexScanPlan");
+}
+
+bool TestInnerJoinCompilePlan() {
+  oursql::Catalog catalog;
+  (void)catalog.CreateTable(oursql::TableInfo{
+      "student",
+      oursql::Schema{{"id", oursql::DataType::Int},
+                     {"name", oursql::DataType::Varchar, 8},
+                     {"common", oursql::DataType::Int}},
+      oursql::INVALID_PAGE_ID});
+  (void)catalog.CreateTable(oursql::TableInfo{
+      "score",
+      oursql::Schema{{"student_id", oursql::DataType::Int},
+                     {"grade", oursql::DataType::Int},
+                     {"common", oursql::DataType::Int}},
+      oursql::INVALID_PAGE_ID});
+  (void)catalog.CreateTable(oursql::TableInfo{
+      "course",
+      oursql::Schema{{"student_id", oursql::DataType::Int},
+                     {"title", oursql::DataType::Varchar, 16}},
+      oursql::INVALID_PAGE_ID});
+
+  oursql::Parser parser;
+  oursql::Planner planner;
+  auto parsed = parser.Parse(
+      "SELECT student.name, score.grade "
+      "FROM student JOIN score ON student.id = score.student_id;");
+  if (!Check(parsed.ok(), "两表 INNER JOIN 应解析成功")) return false;
+  const auto &select =
+      std::get<oursql::SelectStatement>(parsed.value()[0]);
+  if (!Check(select.joins.size() == 1 &&
+                 select.joins[0].type == oursql::JoinType::Inner &&
+                 select.joins[0].table_name == "score" &&
+                 select.joins[0].condition.left_table == "student" &&
+                 select.joins[0].condition.left_column == "id" &&
+                 select.joins[0].condition.right_table == "score" &&
+                 select.joins[0].condition.right_column == "student_id",
+             "JOIN AST 字段应正确")) {
+    return false;
+  }
+
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok(), "INNER JOIN 应规划成功")) return false;
+  const auto &select_plan = std::get<oursql::SelectPlan>(plan.value());
+  const auto &project =
+      std::get<oursql::ProjectPlan>(select_plan.root->operation);
+  const auto *join =
+      project.child ? std::get_if<oursql::JoinPlan>(&project.child->operation)
+                    : nullptr;
+  if (!Check(join != nullptr &&
+                 std::holds_alternative<oursql::SeqScanPlan>(
+                     join->left->operation) &&
+                 std::holds_alternative<oursql::SeqScanPlan>(
+                     join->right->operation) &&
+                 project.columns ==
+                     std::vector<std::string>{"name", "grade"} &&
+                 project.input_indexes ==
+                     std::vector<std::size_t>{1, 4} &&
+                 join->left_column_index == std::optional<std::size_t>(0) &&
+                 join->right_column_index == std::optional<std::size_t>(0),
+             "JOIN Plan 与投影下标应正确")) {
+    return false;
+  }
+
+  auto multi = parser.Parse(
+      "SELECT student.name, score.grade, course.title "
+      "FROM student "
+      "JOIN score ON student.id = score.student_id "
+      "JOIN course ON score.student_id = course.student_id;");
+  if (!Check(multi.ok(), "多表 JOIN 应解析成功")) return false;
+  const auto &multi_statement =
+      std::get<oursql::SelectStatement>(multi.value()[0]);
+  if (!Check(multi_statement.joins.size() == 2 &&
+                 multi_statement.joins[0].table_name == "score" &&
+                 multi_statement.joins[1].table_name == "course",
+             "多表 JOIN AST 应保持子句顺序")) {
+    return false;
+  }
+  auto multi_plan = planner.Build(multi.value()[0], catalog);
+  if (!Check(multi_plan.ok(), "多表 JOIN 应规划成功")) return false;
+  const auto &multi_select =
+      std::get<oursql::SelectPlan>(multi_plan.value());
+  const auto &multi_project =
+      std::get<oursql::ProjectPlan>(multi_select.root->operation);
+  const auto *outer_join =
+      multi_project.child
+          ? std::get_if<oursql::JoinPlan>(&multi_project.child->operation)
+          : nullptr;
+  const auto *inner_join =
+      outer_join != nullptr && outer_join->left != nullptr
+          ? std::get_if<oursql::JoinPlan>(&outer_join->left->operation)
+          : nullptr;
+  if (!Check(outer_join != nullptr && inner_join != nullptr &&
+                 outer_join->join_type == oursql::JoinType::Inner &&
+                 inner_join->join_type == oursql::JoinType::Inner &&
+                 std::holds_alternative<oursql::SeqScanPlan>(
+                     inner_join->left->operation) &&
+                 std::holds_alternative<oursql::SeqScanPlan>(
+                     inner_join->right->operation) &&
+                 std::holds_alternative<oursql::SeqScanPlan>(
+                     outer_join->right->operation) &&
+                 multi_project.input_indexes ==
+                     std::vector<std::size_t>{1, 4, 7},
+             "多表 JOIN 应形成左深 JoinPlan 并正确映射投影")) {
+    return false;
+  }
+
+  auto aliased = parser.Parse(
+      "SELECT s.name, c.grade FROM student AS s "
+      "INNER JOIN score AS c ON s.id = c.student_id;");
+  if (!Check(aliased.ok(), "带别名 INNER JOIN 应解析成功")) return false;
+  auto aliased_plan = planner.Build(aliased.value()[0], catalog);
+  if (!Check(aliased_plan.ok() &&
+                 std::holds_alternative<oursql::SelectPlan>(
+                     aliased_plan.value()),
+             "带别名 INNER JOIN 应规划成功")) {
+    return false;
+  }
+
+  auto ambiguous = parser.Parse(
+      "SELECT common FROM student JOIN score "
+      "ON student.id = score.student_id;");
+  if (!Check(ambiguous.ok(), "歧义列 JOIN 应先通过 Parser")) return false;
+  auto ambiguous_plan = planner.Build(ambiguous.value()[0], catalog);
+  if (!Check(!ambiguous_plan.ok() &&
+                 ambiguous_plan.status().code() ==
+                     oursql::ErrorCode::InvalidArgument,
+             "同名列未限定时应报告歧义")) {
+    return false;
+  }
+
+  const std::vector<std::pair<std::string, oursql::JoinType>> outer_joins{
+      {"SELECT student.name FROM student LEFT JOIN score "
+       "ON student.id = score.student_id;",
+       oursql::JoinType::Left},
+      {"SELECT student.name FROM student RIGHT OUTER JOIN score "
+       "ON student.id = score.student_id;",
+       oursql::JoinType::Right},
+      {"SELECT student.name FROM student FULL JOIN score "
+       "ON student.id = score.student_id;",
+       oursql::JoinType::Full},
+  };
+  for (const auto &item : outer_joins) {
+    auto parsed_outer = parser.Parse(item.first);
+    if (!Check(parsed_outer.ok(), "外连接应可解析")) return false;
+    const auto &outer_statement =
+        std::get<oursql::SelectStatement>(parsed_outer.value()[0]);
+    if (!Check(outer_statement.joins.size() == 1 &&
+                   outer_statement.joins[0].type == item.second,
+               "外连接 AST 类型应正确")) {
+      return false;
+    }
+    auto outer_plan = planner.Build(parsed_outer.value()[0], catalog);
+    if (!Check(outer_plan.ok(), "外连接应生成编译层 Plan")) return false;
+    const auto &outer_select_plan =
+        std::get<oursql::SelectPlan>(outer_plan.value());
+    const auto &project_plan =
+        std::get<oursql::ProjectPlan>(outer_select_plan.root->operation);
+    const auto *join_plan =
+        project_plan.child
+            ? std::get_if<oursql::JoinPlan>(&project_plan.child->operation)
+            : nullptr;
+    if (!Check(join_plan != nullptr &&
+                   join_plan->join_type == item.second,
+               "外连接 JoinPlan 类型应正确")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TestSubqueryCompileOnly() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+
+  auto in_query = parser.Parse(
+      "SELECT id FROM users "
+      "WHERE id NOT IN (SELECT id FROM users WHERE id = 1);");
+  if (!Check(in_query.ok(), "IN 子查询应解析成功")) return false;
+  const auto &in_select =
+      std::get<oursql::SelectStatement>(in_query.value()[0]);
+  const auto *in_expr =
+      in_select.compile_where
+          ? std::get_if<oursql::CompileSubqueryExpr>(
+                &in_select.compile_where->data)
+          : nullptr;
+  if (!Check(in_expr != nullptr &&
+                 in_expr->kind == oursql::CompileSubqueryKind::In &&
+                 in_expr->negated && in_expr->query != nullptr &&
+                 in_expr->query->table_name == "users",
+             "IN 子查询 AST 应保存嵌套 SELECT 和否定标记")) {
+    return false;
+  }
+  auto in_plan = planner.Build(in_query.value()[0], catalog);
+  if (!Check(!in_plan.ok() &&
+                 in_plan.status().code() ==
+                     oursql::ErrorCode::NotImplemented,
+             "IN 子查询应通过语义检查后明确报告执行未接入")) {
+    return false;
+  }
+
+  auto exists_query = parser.Parse(
+      "SELECT id FROM users "
+      "WHERE EXISTS (SELECT id FROM users WHERE id = 1);");
+  if (!Check(exists_query.ok(), "EXISTS 子查询应解析成功")) return false;
+  const auto &exists_select =
+      std::get<oursql::SelectStatement>(exists_query.value()[0]);
+  const auto *exists_expr =
+      exists_select.compile_where
+          ? std::get_if<oursql::CompileSubqueryExpr>(
+                &exists_select.compile_where->data)
+          : nullptr;
+  if (!Check(exists_expr != nullptr &&
+                 exists_expr->kind ==
+                     oursql::CompileSubqueryKind::Exists,
+             "EXISTS 子查询 AST 应正确")) {
+    return false;
+  }
+  auto exists_plan = planner.Build(exists_query.value()[0], catalog);
+  if (!Check(!exists_plan.ok() &&
+                 exists_plan.status().code() ==
+                     oursql::ErrorCode::NotImplemented,
+             "EXISTS 子查询应明确报告执行未接入")) {
+    return false;
+  }
+
+  auto scalar_query = parser.Parse(
+      "SELECT (SELECT id FROM users WHERE id = 1) FROM users;");
+  if (!Check(scalar_query.ok() && scalar_query.value().size() == 1,
+             "标量子查询应解析成功")) {
+    return false;
+  }
+  const auto &scalar_select =
+      std::get<oursql::SelectStatement>(scalar_query.value()[0]);
+  const auto *scalar_expr =
+      scalar_select.projection_expressions.size() == 1
+          ? std::get_if<oursql::CompileSubqueryExpr>(
+                &scalar_select.projection_expressions[0]->data)
+          : nullptr;
+  if (!Check(scalar_expr != nullptr &&
+                 scalar_expr->kind ==
+                     oursql::CompileSubqueryKind::Scalar,
+             "标量子查询 AST 应正确")) {
+    return false;
+  }
+  auto scalar_plan = planner.Build(scalar_query.value()[0], catalog);
+  if (!Check(!scalar_plan.ok() &&
+                 scalar_plan.status().code() ==
+                     oursql::ErrorCode::NotImplemented,
+             "SELECT 列表标量子查询应明确报告执行未接入")) {
+    return false;
+  }
+
+  auto mismatch = parser.Parse(
+      "SELECT id FROM users "
+      "WHERE id IN (SELECT name FROM users);");
+  if (!Check(mismatch.ok(), "类型不匹配子查询应先完成解析")) return false;
+  auto mismatch_plan = planner.Build(mismatch.value()[0], catalog);
+  if (!Check(!mismatch_plan.ok() &&
+                 mismatch_plan.status().code() ==
+                     oursql::ErrorCode::TypeMismatch,
+             "IN 子查询两侧类型不一致应报告 TypeMismatch")) {
+    return false;
+  }
+
+  auto multi_column = parser.Parse(
+      "SELECT id FROM users "
+      "WHERE id IN (SELECT id, name FROM users);");
+  if (!Check(multi_column.ok(), "多列子查询应先完成解析")) return false;
+  auto multi_column_plan = planner.Build(multi_column.value()[0], catalog);
+  if (!Check(!multi_column_plan.ok() &&
+                 multi_column_plan.status().code() ==
+                     oursql::ErrorCode::InvalidArgument,
+             "标量/IN 子查询返回多列应报告 InvalidArgument")) {
+    return false;
+  }
+
+  auto missing_table = parser.Parse(
+      "SELECT id FROM users "
+      "WHERE id IN (SELECT id FROM ghost);");
+  if (!Check(missing_table.ok(), "未知表子查询应先完成解析")) return false;
+  auto missing_table_plan =
+      planner.Build(missing_table.value()[0], catalog);
+  return Check(!missing_table_plan.ok() &&
+                   missing_table_plan.status().code() ==
+                       oursql::ErrorCode::NotFound,
+               "子查询中的未知表应报告 NotFound");
+}
+
+bool TestAlterTableCompileOnly() {
+  oursql::Catalog catalog = MakeCatalog();
+  (void)catalog.CreateTable(oursql::TableInfo{
+      "logs", oursql::Schema{{"id", oursql::DataType::Int}}});
+  oursql::Parser parser;
+  oursql::Planner planner;
+
+  auto rename_table =
+      parser.Parse("ALTER TABLE users RENAME TO accounts;");
+  if (!Check(rename_table.ok(), "RENAME TO 应解析成功")) return false;
+  const auto &rename_table_statement =
+      std::get<oursql::AlterTableStatement>(rename_table.value()[0]);
+  if (!Check(rename_table_statement.action ==
+                     oursql::AlterTableAction::RenameTable &&
+                 rename_table_statement.table_name == "users" &&
+                 rename_table_statement.new_name == "accounts",
+             "RENAME TO AST 字段应正确")) {
+    return false;
+  }
+  auto rename_table_plan =
+      planner.Build(rename_table.value()[0], catalog);
+  if (!Check(rename_table_plan.ok() &&
+                 std::holds_alternative<oursql::AlterTablePlan>(
+                     rename_table_plan.value()),
+             "RENAME TO 应生成 AlterTablePlan")) {
+    return false;
+  }
+
+  auto rename_column = parser.Parse(
+      "ALTER TABLE users RENAME COLUMN name TO display_name;");
+  if (!Check(rename_column.ok(), "RENAME COLUMN 应解析成功")) return false;
+  const auto &rename_column_statement =
+      std::get<oursql::AlterTableStatement>(rename_column.value()[0]);
+  if (!Check(rename_column_statement.action ==
+                     oursql::AlterTableAction::RenameColumn &&
+                 rename_column_statement.column_name == "name" &&
+                 rename_column_statement.new_name == "display_name",
+             "RENAME COLUMN AST 字段应正确")) {
+    return false;
+  }
+  auto rename_column_plan =
+      planner.Build(rename_column.value()[0], catalog);
+  if (!Check(rename_column_plan.ok() &&
+                 std::holds_alternative<oursql::AlterTablePlan>(
+                     rename_column_plan.value()),
+             "RENAME COLUMN 应生成 AlterTablePlan")) {
+    return false;
+  }
+
+  auto add_column = parser.Parse(
+      "ALTER TABLE users ADD COLUMN age INT DEFAULT 0;");
+  if (!Check(add_column.ok(), "ADD COLUMN INT DEFAULT 应解析成功")) {
+    return false;
+  }
+  const auto &add_column_statement =
+      std::get<oursql::AlterTableStatement>(add_column.value()[0]);
+  if (!Check(add_column_statement.action ==
+                     oursql::AlterTableAction::AddColumn &&
+                 add_column_statement.column.name == "age" &&
+                 add_column_statement.column.type == oursql::DataType::Int &&
+                 add_column_statement.default_value.has_value() &&
+                 add_column_statement.default_value->AsInt() == 0,
+             "ADD COLUMN AST 字段应正确")) {
+    return false;
+  }
+  auto add_column_plan = planner.Build(add_column.value()[0], catalog);
+  if (!Check(add_column_plan.ok() &&
+                 std::holds_alternative<oursql::AlterTablePlan>(
+                     add_column_plan.value()),
+             "ADD COLUMN 应生成 AlterTablePlan")) {
+    return false;
+  }
+
+  auto add_varchar = parser.Parse(
+      "ALTER TABLE users ADD COLUMN city VARCHAR(16) DEFAULT 'Hong Kong';");
+  if (!Check(add_varchar.ok(), "ADD COLUMN VARCHAR DEFAULT 应解析成功")) {
+    return false;
+  }
+  auto add_varchar_plan = planner.Build(add_varchar.value()[0], catalog);
+  if (!Check(add_varchar_plan.ok() &&
+                 std::holds_alternative<oursql::AlterTablePlan>(
+                     add_varchar_plan.value()),
+             "ADD COLUMN VARCHAR 应生成 AlterTablePlan")) {
+    return false;
+  }
+
+  auto missing_table =
+      parser.Parse("ALTER TABLE ghost RENAME TO other;");
+  auto missing_table_plan =
+      planner.Build(missing_table.value()[0], catalog);
+  if (!Check(!missing_table_plan.ok() &&
+                 missing_table_plan.status().code() ==
+                     oursql::ErrorCode::NotFound,
+             "ALTER 未知表应报告 NotFound")) {
+    return false;
+  }
+
+  auto existing_name =
+      parser.Parse("ALTER TABLE users RENAME TO logs;");
+  auto existing_name_plan =
+      planner.Build(existing_name.value()[0], catalog);
+  if (!Check(!existing_name_plan.ok() &&
+                 existing_name_plan.status().code() ==
+                     oursql::ErrorCode::AlreadyExists,
+             "RENAME TO 已存在表应报告 AlreadyExists")) {
+    return false;
+  }
+
+  auto missing_column = parser.Parse(
+      "ALTER TABLE users RENAME COLUMN ghost TO other;");
+  auto missing_column_plan =
+      planner.Build(missing_column.value()[0], catalog);
+  if (!Check(!missing_column_plan.ok() &&
+                 missing_column_plan.status().code() ==
+                     oursql::ErrorCode::NotFound,
+             "RENAME COLUMN 旧列不存在应报告 NotFound")) {
+    return false;
+  }
+
+  auto duplicate_column = parser.Parse(
+      "ALTER TABLE users ADD COLUMN id INT DEFAULT 0;");
+  auto duplicate_column_plan =
+      planner.Build(duplicate_column.value()[0], catalog);
+  if (!Check(!duplicate_column_plan.ok() &&
+                 duplicate_column_plan.status().code() ==
+                     oursql::ErrorCode::AlreadyExists,
+             "ADD COLUMN 重复列应报告 AlreadyExists")) {
+    return false;
+  }
+
+  auto bad_default = parser.Parse(
+      "ALTER TABLE users ADD COLUMN age INT DEFAULT 'old';");
+  auto bad_default_plan =
+      planner.Build(bad_default.value()[0], catalog);
+  return Check(!bad_default_plan.ok() &&
+                   bad_default_plan.status().code() ==
+                       oursql::ErrorCode::TypeMismatch,
+               "ADD COLUMN DEFAULT 类型不匹配应报告 TypeMismatch");
+}
+
+bool TestColumnConstraintsCompilePlan() {
+  oursql::Parser parser;
+  oursql::Planner planner;
+  auto parsed = parser.Parse(
+      "CREATE TABLE users("
+      "id INT PRIMARY KEY,"
+      "email VARCHAR(32) UNIQUE,"
+      "name VARCHAR(16) NOT NULL,"
+      "age INT DEFAULT 18);");
+  if (!Check(parsed.ok(), "列级约束应解析成功")) return false;
+  const auto &create =
+      std::get<oursql::CreateTableStatement>(parsed.value()[0]);
+  if (!Check(create.schema.size() == 4 &&
+                 create.schema.At(0).primary_key &&
+                 !create.schema.At(0).nullable &&
+                 create.schema.At(0).unique &&
+                 create.schema.At(1).unique &&
+                 !create.schema.At(2).nullable &&
+                 create.schema.At(3).default_value.has_value() &&
+                 create.schema.At(3).default_value->AsInt() == 18,
+             "约束应保存到结构化 Column")) {
+    return false;
+  }
+
+  oursql::Catalog empty;
+  auto plan = planner.Build(parsed.value()[0], empty);
+  if (!Check(plan.ok() &&
+                 std::holds_alternative<oursql::CreateTablePlan>(
+                     plan.value()),
+             "合法约束应生成 CreateTablePlan")) {
+    return false;
+  }
+
+  const std::vector<std::pair<std::string, oursql::ErrorCode>> invalid{
+      {"CREATE TABLE t(a INT PRIMARY KEY, b INT PRIMARY KEY);",
+       oursql::ErrorCode::InvalidArgument},
+      {"CREATE TABLE t(a INT NOT NULL DEFAULT NULL);",
+       oursql::ErrorCode::InvalidArgument},
+      {"CREATE TABLE t(a INT DEFAULT 'wrong');",
+       oursql::ErrorCode::TypeMismatch},
+      {"CREATE TABLE t(a VARCHAR(2) DEFAULT 'toolong');",
+       oursql::ErrorCode::InvalidArgument},
+  };
+  for (const auto &item : invalid) {
+    auto statements = parser.Parse(item.first);
+    if (!Check(statements.ok(), "非法约束样例应先通过 Parser")) {
+      return false;
+    }
+    auto invalid_plan = planner.Build(statements.value()[0], empty);
+    if (!Check(!invalid_plan.ok() &&
+                   invalid_plan.status().code() == item.second,
+               "非法约束应返回预期错误码")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TestNullCompileAndPredicate() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+
+  auto parsed = parser.Parse(
+      "SELECT * FROM users WHERE name IS NULL;");
+  if (!Check(parsed.ok(), "IS NULL 应解析成功")) return false;
+  const auto &select =
+      std::get<oursql::SelectStatement>(parsed.value()[0]);
+  if (!Check(select.where.has_value() &&
+                 select.where->kind == oursql::PredicateKind::IsNull &&
+                 select.where->column == "name",
+             "IS NULL 应抽取为专用 Predicate")) {
+    return false;
+  }
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok() &&
+                 std::holds_alternative<oursql::SelectPlan>(plan.value()),
+             "IS NULL 应生成可执行 SelectPlan")) {
+    return false;
+  }
+
+  auto not_null = parser.Parse(
+      "SELECT * FROM users WHERE name IS NOT NULL;");
+  if (!Check(not_null.ok(), "IS NOT NULL 应解析成功")) return false;
+  const auto &not_null_select =
+      std::get<oursql::SelectStatement>(not_null.value()[0]);
+  if (!Check(not_null_select.where.has_value() &&
+                 not_null_select.where->kind ==
+                     oursql::PredicateKind::IsNotNull,
+             "IS NOT NULL 应抽取为专用 Predicate")) {
+    return false;
+  }
+
+  auto equal_null = parser.Parse(
+      "SELECT * FROM users WHERE name = NULL;");
+  if (!Check(equal_null.ok(), "= NULL 应先完成语法解析")) return false;
+  auto equal_null_plan = planner.Build(equal_null.value()[0], catalog);
+  return Check(!equal_null_plan.ok() &&
+                   equal_null_plan.status().code() ==
+                       oursql::ErrorCode::InvalidArgument,
+               "= NULL 应提示改用 IS NULL");
+}
+
+bool TestTransactionCompilePlan() {
+  oursql::Parser parser;
+  oursql::Planner planner;
+  auto parsed = parser.Parse("BEGIN; COMMIT; ROLLBACK;");
+  if (!Check(parsed.ok() && parsed.value().size() == 3,
+             "事务控制多语句应解析成功")) {
+    return false;
+  }
+  const std::vector<oursql::TransactionAction> expected{
+      oursql::TransactionAction::Begin,
+      oursql::TransactionAction::Commit,
+      oursql::TransactionAction::Rollback,
+  };
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    const auto &statement =
+        std::get<oursql::TransactionStatement>(parsed.value()[i]);
+    if (!Check(statement.action == expected[i],
+               "事务控制 AST action 应正确")) {
+      return false;
+    }
+    auto plan = planner.Build(parsed.value()[i], oursql::Catalog{});
+    if (!Check(plan.ok() &&
+                   std::holds_alternative<oursql::TransactionPlan>(
+                       plan.value()),
+               "事务控制应生成 TransactionPlan")) {
+      return false;
+    }
+    const auto &transaction = std::get<oursql::TransactionPlan>(plan.value());
+    if (!Check(transaction.action == expected[i],
+               "事务控制 Plan action 应正确")) {
+      return false;
+    }
+  }
+  if (!Check(oursql::ToString(parsed.value()[0]) ==
+                 "TransactionStatement(action=begin)" &&
+                 oursql::ToString(parsed.value()[1]) ==
+                     "TransactionStatement(action=commit)" &&
+                 oursql::ToString(parsed.value()[2]) ==
+                     "TransactionStatement(action=rollback)",
+             "事务 AST 文本格式应稳定")) {
+    return false;
+  }
+
+  auto invalid = parser.Parse("BEGIN TRANSACTION;");
+  return Check(!invalid.ok() &&
+                   invalid.status().message().find("位置") !=
+                       std::string::npos,
+               "BEGIN TRANSACTION 当前应返回带位置的语法错误");
 }
 
 bool TestUpdateCompileOnly() {
@@ -1152,6 +1739,12 @@ int main() {
   run("DROP TABLE and AS compile-only",
       &TestDropTableAndAliasesCompileOnly);
   run("CREATE/DROP INDEX and EXPLAIN", &TestCreateDropIndexAndExplain);
+  run("INNER JOIN compile plan", &TestInnerJoinCompilePlan);
+  run("Subquery compile-only", &TestSubqueryCompileOnly);
+  run("ALTER TABLE compile-only", &TestAlterTableCompileOnly);
+  run("Column constraints compile plan", &TestColumnConstraintsCompilePlan);
+  run("NULL compile and predicate", &TestNullCompileAndPredicate);
+  run("Transaction compile plan", &TestTransactionCompilePlan);
   run("UPDATE compile-only", &TestUpdateCompileOnly);
   run("ORDER BY/GROUP BY compile-only", &TestOrderGroupCompileOnly);
   run("Compile expression parsing", &TestCompileExpressionParsing);

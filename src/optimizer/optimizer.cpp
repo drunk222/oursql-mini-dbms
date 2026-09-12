@@ -7,10 +7,19 @@ namespace oursql {
 
 namespace {
 
+// 判断 JOIN 子树是否为执行器认识的二元连接树。叶子只能是 SeqScan；
+// 多表 JOIN 以左深 JoinPlan 表示，右侧每个节点对应一个显式 JOIN 子句。
+bool IsJoinSource(const PlanNode &node) {
+  if (std::holds_alternative<SeqScanPlan>(node.operation)) return true;
+  const auto *join = std::get_if<JoinPlan>(&node.operation);
+  return join != nullptr && join->left != nullptr && join->right != nullptr &&
+         IsJoinSource(*join->left) && IsJoinSource(*join->right);
+}
+
 // 冻结计划形态：SELECT 的根算子必须是 ProjectPlan；其下只允许出现
-// OrderBy?、GroupBy?、Filter? 和 SeqScanPlan。GroupBy/OrderBy 是编译层
-// 扩展算子，Filter 只允许直接包住 SeqScan。执行器依赖根 Project 取得投影
-// 列，因此所有规则都必须保留这一外层合同。
+// OrderBy?、GroupBy?、Filter?、SeqScan 或 Join 子树。GroupBy/OrderBy 是
+// 编译层扩展算子，Filter 只允许直接包住 SeqScan/IndexScan。执行器依赖根
+// Project 取得投影列，因此所有规则都必须保留这一外层合同。
 bool IsFrozenSelectShape(const PlanNode &node) {
   const auto *project = std::get_if<ProjectPlan>(&node.operation);
   if (project == nullptr || project->child == nullptr) return false;
@@ -28,6 +37,9 @@ bool IsFrozenSelectShape(const PlanNode &node) {
     break;
   }
   if (current == nullptr) return false;
+  if (const auto *join = std::get_if<JoinPlan>(&current->operation)) {
+    return IsJoinSource(*current);
+  }
   if (const auto *filter = std::get_if<FilterPlan>(&current->operation)) {
     return filter->child != nullptr &&
            (std::holds_alternative<SeqScanPlan>(
@@ -93,7 +105,7 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(
           if (ProjectionCovers(*inner, *outer)) {
             select->root = std::make_shared<PlanNode>(
                 ProjectPlan{inner->child, outer->columns,
-                            outer->select_all});
+                            outer->select_all, outer->input_indexes});
             ++stats.rule_hits["R1:冗余内层Project裁剪"];
             changed = true;
           }
@@ -111,7 +123,8 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(
           if (filter->child != nullptr) {
             if (const auto *scan =
                     std::get_if<SeqScanPlan>(&filter->child->operation)) {
-              if (filter->predicate.value.IsInt()) {
+              if (filter->predicate.kind == PredicateKind::Equal &&
+                  filter->predicate.value.IsInt()) {
                 for (const auto &index : indexes) {
                   if (index.table_name != scan->table_name ||
                       index.column_name != filter->predicate.column) {
@@ -125,7 +138,8 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(
                       FilterPlan{index_scan, filter->predicate});
                   select->root = std::make_shared<PlanNode>(
                       ProjectPlan{new_filter, project->columns,
-                                  project->select_all});
+                                  project->select_all,
+                                  project->input_indexes});
                   ++stats.rule_hits["R2:等值谓词索引扫描"];
                   changed = true;
                   break;
@@ -146,7 +160,8 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(
   if (!IsFrozenSelectShape(*select->root)) {
     return Result<OptimizationResult>(Status::InternalError(
         "Optimizer: SELECT 的计划树必须固定为 "
-        "Project(OrderBy?(GroupBy?(Filter?(SeqScan|IndexScan))))"));
+        "Project(OrderBy?(GroupBy?(Filter?(SeqScan|IndexScan)))|"
+        "Join(SeqScan,SeqScan))"));
   }
   return Result<OptimizationResult>(
       OptimizationResult{std::move(plan), std::move(stats)});

@@ -28,6 +28,7 @@ TokenType KeywordType(std::string_view word) {
   if (word.compare("distinct") == 0) return TokenType::Distinct;
   if (word.compare("from") == 0) return TokenType::From;
   if (word.compare("where") == 0) return TokenType::Where;
+  if (word.compare("is") == 0) return TokenType::Is;
   if (word.compare("between") == 0) return TokenType::Between;
   if (word.compare("in") == 0) return TokenType::In;
   if (word.compare("like") == 0) return TokenType::Like;
@@ -39,8 +40,26 @@ TokenType KeywordType(std::string_view word) {
   if (word.compare("asc") == 0) return TokenType::Asc;
   if (word.compare("desc") == 0) return TokenType::Desc;
   if (word.compare("as") == 0) return TokenType::As;
+  if (word.compare("exists") == 0) return TokenType::Exists;
+  if (word.compare("join") == 0) return TokenType::Join;
+  if (word.compare("inner") == 0) return TokenType::Inner;
+  if (word.compare("left") == 0) return TokenType::Left;
+  if (word.compare("right") == 0) return TokenType::Right;
+  if (word.compare("full") == 0) return TokenType::Full;
+  if (word.compare("outer") == 0) return TokenType::Outer;
   if (word.compare("delete") == 0) return TokenType::Delete;
   if (word.compare("drop") == 0) return TokenType::Drop;
+  if (word.compare("alter") == 0) return TokenType::Alter;
+  if (word.compare("add") == 0) return TokenType::Add;
+  if (word.compare("column") == 0) return TokenType::Column;
+  if (word.compare("rename") == 0) return TokenType::Rename;
+  if (word.compare("to") == 0) return TokenType::To;
+  if (word.compare("default") == 0) return TokenType::Default;
+  if (word.compare("primary") == 0) return TokenType::Primary;
+  if (word.compare("key") == 0) return TokenType::Key;
+  if (word.compare("begin") == 0) return TokenType::Begin;
+  if (word.compare("commit") == 0) return TokenType::Commit;
+  if (word.compare("rollback") == 0) return TokenType::Rollback;
   if (word.compare("update") == 0) return TokenType::Update;
   if (word.compare("set") == 0) return TokenType::Set;
   if (word.compare("int") == 0) return TokenType::Int;
@@ -50,6 +69,7 @@ TokenType KeywordType(std::string_view word) {
   if (word.compare("not") == 0) return TokenType::Not;
   if (word.compare("true") == 0) return TokenType::True;
   if (word.compare("false") == 0) return TokenType::False;
+  if (word.compare("null") == 0) return TokenType::Null;
   return TokenType::Identifier;
 }
 
@@ -62,7 +82,9 @@ const char *TokenTypeName(TokenType type) noexcept {
     case TokenType::String: return "string";
     case TokenType::True: return "TRUE";
     case TokenType::False: return "FALSE";
+    case TokenType::Null: return "NULL";
     case TokenType::Comma: return "','";
+    case TokenType::Dot: return "'.'";
     case TokenType::LeftParen: return "'('";
     case TokenType::RightParen: return "')'";
     case TokenType::Star: return "'*'";
@@ -92,6 +114,7 @@ const char *TokenTypeName(TokenType type) noexcept {
     case TokenType::Distinct: return "DISTINCT";
     case TokenType::From: return "FROM";
     case TokenType::Where: return "WHERE";
+    case TokenType::Is: return "IS";
     case TokenType::Between: return "BETWEEN";
     case TokenType::In: return "IN";
     case TokenType::Like: return "LIKE";
@@ -103,8 +126,26 @@ const char *TokenTypeName(TokenType type) noexcept {
     case TokenType::Asc: return "ASC";
     case TokenType::Desc: return "DESC";
     case TokenType::As: return "AS";
+    case TokenType::Exists: return "EXISTS";
+    case TokenType::Join: return "JOIN";
+    case TokenType::Inner: return "INNER";
+    case TokenType::Left: return "LEFT";
+    case TokenType::Right: return "RIGHT";
+    case TokenType::Full: return "FULL";
+    case TokenType::Outer: return "OUTER";
     case TokenType::Delete: return "DELETE";
     case TokenType::Drop: return "DROP";
+    case TokenType::Alter: return "ALTER";
+    case TokenType::Add: return "ADD";
+    case TokenType::Column: return "COLUMN";
+    case TokenType::Rename: return "RENAME";
+    case TokenType::To: return "TO";
+    case TokenType::Default: return "DEFAULT";
+    case TokenType::Primary: return "PRIMARY";
+    case TokenType::Key: return "KEY";
+    case TokenType::Begin: return "BEGIN";
+    case TokenType::Commit: return "COMMIT";
+    case TokenType::Rollback: return "ROLLBACK";
     case TokenType::Update: return "UPDATE";
     case TokenType::Set: return "SET";
     case TokenType::Int: return "INT";
@@ -311,6 +352,7 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
     TokenType punctuation = TokenType::EndOfFile;
     switch (character) {
       case ',': punctuation = TokenType::Comma; break;
+      case '.': punctuation = TokenType::Dot; break;
       case '(': punctuation = TokenType::LeftParen; break;
       case ')': punctuation = TokenType::RightParen; break;
       case '*': punctuation = TokenType::Star; break;

@@ -41,6 +41,11 @@ CompileExprPtr MakeBetween(bool negated, CompileExprPtr operand,
                          std::move(upper), negated}));
 }
 
+CompileExprPtr MakeIsNull(CompileExprPtr operand, bool negated) {
+  return std::make_shared<CompileExpr>(CompileExpr::Data(
+      CompileIsNullExpr{std::move(operand), negated}));
+}
+
 CompileExprPtr MakeIn(bool negated, CompileExprPtr operand,
                       std::vector<CompileExprPtr> options) {
   return std::make_shared<CompileExpr>(CompileExpr::Data(
@@ -235,6 +240,18 @@ CompileExprPtr FoldCompileExpr(const CompileExprPtr &expr) {
         CompileExpr::Data(CompileUnaryExpr{unary->op, operand}));
   }
 
+  if (const auto *is_null = std::get_if<CompileIsNullExpr>(&expr->data)) {
+    CompileExprPtr operand = FoldCompileExpr(is_null->operand);
+    const auto *literal =
+        operand ? std::get_if<CompileLiteralExpr>(&operand->data) : nullptr;
+    if (literal != nullptr) {
+      const bool result =
+          literal->kind == CompileLiteralKind::Null;
+      return MakeBool(is_null->negated ? !result : result);
+    }
+    return MakeIsNull(std::move(operand), is_null->negated);
+  }
+
   if (const auto *between = std::get_if<CompileBetweenExpr>(&expr->data)) {
     CompileExprPtr operand = FoldCompileExpr(between->operand);
     CompileExprPtr lower = FoldCompileExpr(between->lower);
@@ -288,6 +305,18 @@ std::optional<Predicate> ExtractPredicateFromCompileExpr(
   // 只识别 column = literal 和 literal = column 两种交换形式。
   // 其余表达式返回 nullopt，由 Planner 进行完整语义检查后决定是否支持执行。
   if (expr == nullptr) return std::nullopt;
+  if (const auto *is_null = std::get_if<CompileIsNullExpr>(&expr->data)) {
+    const auto *column =
+        is_null->operand
+            ? std::get_if<CompileColumnExpr>(&is_null->operand->data)
+            : nullptr;
+    if (column != nullptr && column->table_name.empty()) {
+      return Predicate(is_null->negated ? PredicateKind::IsNotNull
+                                        : PredicateKind::IsNull,
+                       column->name);
+    }
+    return std::nullopt;
+  }
   const auto *binary = std::get_if<CompileBinaryExpr>(&expr->data);
   if (binary == nullptr || binary->op != "=") return std::nullopt;
 
@@ -300,10 +329,12 @@ std::optional<Predicate> ExtractPredicateFromCompileExpr(
   const auto right_value = ExtractLiteralValue(binary->right);
   const auto left_value = ExtractLiteralValue(binary->left);
 
-  if (left_column != nullptr && right_value.has_value()) {
+  if (left_column != nullptr && left_column->table_name.empty() &&
+      right_value.has_value()) {
     return Predicate(left_column->name, *right_value);
   }
-  if (right_column != nullptr && left_value.has_value()) {
+  if (right_column != nullptr && right_column->table_name.empty() &&
+      left_value.has_value()) {
     return Predicate(right_column->name, *left_value);
   }
   return std::nullopt;

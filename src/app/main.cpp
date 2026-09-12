@@ -69,7 +69,11 @@ bool ParsePoolSize(std::basic_string_view<CharT> text, std::size_t *value) {
     const auto digit = static_cast<unsigned int>(character);
     if (digit < '0' || digit > '9') return false;
     const auto number = static_cast<std::size_t>(digit - '0');
-    if (parsed > (std::numeric_limits<std::size_t>::max() - number) / 10) return false;
+    // windows.h 可能定义函数式 max 宏；括号包住 max 可阻止宏展开。
+    if (parsed >
+        (std::numeric_limits<std::size_t>::max)() - number) {
+      return false;
+    }
     parsed = parsed * 10 + number;
   }
   if (parsed == 0) return false;

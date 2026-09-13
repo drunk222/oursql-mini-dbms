@@ -1,6 +1,7 @@
 #pragma once
 
 #include "oursql/common/schema.h"
+#include "oursql/transaction/transaction.h"
 
 #include <map>
 #include <string>
@@ -53,6 +54,8 @@ class Catalog final : public CatalogView {
 
   // 调用者：数据库打开流程；作用：加载或创建 Catalog Slotted Page 链；返回：操作状态。
   [[nodiscard]] Status Open();
+  // 调用者：事务协调器；作用：在回滚恢复 Catalog 页面后重建内存索引；返回：重新加载状态。
+  [[nodiscard]] Status Reload();
 
   // 调用者：DDL 执行器；作用：登记一张表；返回：成功或失败状态。
   [[nodiscard]] Status CreateTable(TableInfo table);
@@ -65,7 +68,8 @@ class Catalog final : public CatalogView {
 
   // 调用者：B+树根分裂流程；作用：更新并持久化索引根页面编号；返回：操作状态。
   [[nodiscard]] Status UpdateIndexRootPageId(std::string_view index_name,
-                                             page_id_t root_page_id);
+                                             page_id_t root_page_id,
+                                             Transaction *transaction = nullptr);
 
   // 调用者：IndexManager；作用：删除索引元数据记录；不负责释放B+树页面。
   [[nodiscard]] Status DropIndex(std::string_view index_name);

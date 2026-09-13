@@ -308,6 +308,17 @@ Status Catalog::Open() {
   return Status::Ok();
 }
 
+Status Catalog::Reload() {
+  if (buffer_pool_ == nullptr || disk_manager_ == nullptr) {
+    return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
+  }
+  tables_.clear();
+  indexes_.clear();
+  catalog_head_ = INVALID_PAGE_ID;
+  opened_ = false;
+  return Open();
+}
+
 Status Catalog::AppendCatalogRecord(const std::vector<std::byte> &record) {
   page_id_t current = catalog_head_;
   std::unordered_set<page_id_t> visited;
@@ -507,7 +518,8 @@ Status Catalog::CreateIndex(IndexInfo index) {
 }
 
 Status Catalog::UpdateIndexRootPageId(std::string_view index_name,
-                                      page_id_t root_page_id) {
+                                      page_id_t root_page_id,
+                                      Transaction *transaction) {
   if (root_page_id == 0) return Status::InvalidArgument("索引根页面编号不能是superblock");
   const bool persistent = buffer_pool_ != nullptr || disk_manager_ != nullptr;
   if (persistent && (buffer_pool_ == nullptr || disk_manager_ == nullptr)) {
@@ -565,7 +577,7 @@ Status Catalog::UpdateIndexRootPageId(std::string_view index_name,
     if (record_page_id == INVALID_PAGE_ID) {
       return Status::InternalError("Catalog 内存索引缺少对应的磁盘记录");
     }
-    auto page_result = buffer_pool_->FetchPageWrite(record_page_id);
+    auto page_result = buffer_pool_->FetchPageWrite(record_page_id, transaction);
     if (!page_result.ok()) return page_result.status();
     auto page = std::move(page_result.value());
     auto delete_status = SlottedPage::DeleteRecord(page, record_slot_id);
@@ -575,6 +587,8 @@ Status Catalog::UpdateIndexRootPageId(std::string_view index_name,
       return Status::InternalError("更新Catalog索引根页面记录失败: " +
                                    inserted.status().ToString());
     }
+    auto release_status = page.Release();
+    if (!release_status.ok()) return release_status;
   }
   index->second.root_page_id = root_page_id;
   return Status::Ok();

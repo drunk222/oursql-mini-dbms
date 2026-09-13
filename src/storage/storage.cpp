@@ -1,4 +1,5 @@
 #include "oursql/storage/storage.h"
+#include "oursql/storage/log_manager.h"
 
 #include <algorithm>
 #include <array>
@@ -809,8 +810,21 @@ void ReadPageGuard::Reset() noexcept {
 }
 
 WritePageGuard::WritePageGuard(BufferPoolManager *buffer_pool, frame_id_t frame_id,
-                               page_id_t page_id, std::shared_mutex *latch)
-    : buffer_pool_(buffer_pool), frame_id_(frame_id), page_id_(page_id), latch_(*latch) {}
+                               page_id_t page_id, std::shared_mutex *latch,
+                               Transaction *transaction)
+    : buffer_pool_(buffer_pool),
+      frame_id_(frame_id),
+      page_id_(page_id),
+      transaction_(transaction),
+      latch_(*latch) {
+  if (transaction_ != nullptr && IsValid()) {
+    std::copy(buffer_pool_->frames_[frame_id_].page.Data(),
+              buffer_pool_->frames_[frame_id_].page.Data() + Page::kSize,
+              before_image_.begin());
+    has_before_image_ = true;
+    transaction_->AddActiveWriteGuard();
+  }
+}
 
 WritePageGuard::~WritePageGuard() { (void)Reset(); }
 
@@ -819,10 +833,15 @@ WritePageGuard::WritePageGuard(WritePageGuard &&other) noexcept
       frame_id_(other.frame_id_),
       page_id_(other.page_id_),
       dirty_(other.dirty_),
+      transaction_(other.transaction_),
+      before_image_(other.before_image_),
+      has_before_image_(other.has_before_image_),
       latch_(std::move(other.latch_)) {
   other.buffer_pool_ = nullptr;
   other.page_id_ = INVALID_PAGE_ID;
   other.dirty_ = false;
+  other.transaction_ = nullptr;
+  other.has_before_image_ = false;
 }
 
 WritePageGuard &WritePageGuard::operator=(WritePageGuard &&other) noexcept {
@@ -832,10 +851,15 @@ WritePageGuard &WritePageGuard::operator=(WritePageGuard &&other) noexcept {
     frame_id_ = other.frame_id_;
     page_id_ = other.page_id_;
     dirty_ = other.dirty_;
+    transaction_ = other.transaction_;
+    before_image_ = other.before_image_;
+    has_before_image_ = other.has_before_image_;
     latch_ = std::move(other.latch_);
     other.buffer_pool_ = nullptr;
     other.page_id_ = INVALID_PAGE_ID;
     other.dirty_ = false;
+    other.transaction_ = nullptr;
+    other.has_before_image_ = false;
   }
   return *this;
 }
@@ -876,13 +900,25 @@ Status WritePageGuard::Reset() noexcept {
   if (buffer_pool_ == nullptr) {
     return Status::Ok();
   }
+  Status log_status = Status::Ok();
+  if (latch_.owns_lock() && transaction_ != nullptr && has_before_image_ && dirty_) {
+    bool logged = false;
+    log_status = buffer_pool_->RecordGuardUpdate(frame_id_, page_id_, transaction_, dirty_,
+                                                  before_image_, &logged);
+    if (!log_status.ok()) dirty_ = false;
+  }
   if (latch_.owns_lock()) {
     latch_.unlock();
   }
   const auto status = buffer_pool_->ReleaseGuard(frame_id_, page_id_, dirty_);
+  if (!status.ok() && transaction_ != nullptr) transaction_->MarkFailed();
   buffer_pool_ = nullptr;
   page_id_ = INVALID_PAGE_ID;
   dirty_ = false;
+  if (transaction_ != nullptr) transaction_->ReleaseActiveWriteGuard();
+  transaction_ = nullptr;
+  has_before_image_ = false;
+  if (!log_status.ok()) return log_status;
   return status;
 }
 
@@ -1281,6 +1317,140 @@ BufferPoolManager::BufferPoolManager(std::size_t pool_size, DiskManager *disk_ma
   }
 }
 
+Status BufferPoolManager::SetLogManager(LogManager *log_manager) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (log_manager == nullptr) return Status::InvalidArgument("BufferPoolManager requires a LogManager");
+  if (log_manager_bound_ && log_manager_ != log_manager) {
+    return Status::InvalidArgument("BufferPoolManager WAL binding cannot be changed");
+  }
+  log_manager_ = log_manager;
+  log_manager_bound_ = true;
+  return Status::Ok();
+}
+
+Status BufferPoolManager::RestorePage(page_id_t page_id, const Page &page,
+                                      bool write_disk) {
+  if (page_id == INVALID_PAGE_ID || page_id == 0) {
+    return Status::InvalidArgument("RestorePage requires a data page id");
+  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  auto ready = EnsureReadyUnlocked();
+  if (!ready.ok()) return ready;
+  const auto found = page_table_.find(page_id);
+  if (found == page_table_.end()) {
+    lock.unlock();
+    return write_disk ? disk_manager_->WritePage(page_id, page) : Status::Ok();
+  }
+  Frame &frame = frames_[found->second];
+  if (frame.state != FrameState::Valid || frame.pin_count != 0) {
+    return Status::InvalidArgument("RestorePage requires an unpinned valid frame");
+  }
+  auto pin_status = replacer_->Pin(found->second);
+  if (!pin_status.ok()) return pin_status;
+  frame.pin_count = 1;
+  lock.unlock();
+
+  Status status = Status::Ok();
+  {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    if (write_disk) status = disk_manager_->WritePage(page_id, page);
+    if (status.ok()) frame.page = page;
+  }
+  lock.lock();
+  if (status.ok()) {
+    frame.is_dirty = false;
+    frame.page_lsn = kInvalidLsn;
+  }
+  frame.pin_count = 0;
+  (void)replacer_->Unpin(found->second);
+  NotifyStateChange();
+  return status;
+}
+
+Status BufferPoolManager::RecordGuardUpdate(
+    frame_id_t frame_id, page_id_t page_id, Transaction *transaction, bool dirty,
+    const std::array<std::byte, Page::kSize> &before, bool *logged) noexcept {
+  if (logged != nullptr) *logged = false;
+  if (!dirty || transaction == nullptr) return Status::Ok();
+  if (log_manager_ == nullptr) {
+    transaction->MarkFailed();
+    return Status::InvalidArgument("transactional page write requires a bound LogManager");
+  }
+
+  std::array<std::byte, Page::kSize> after{};
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (frame_id >= frames_.size() || frames_[frame_id].page_id != page_id) {
+      transaction->MarkFailed();
+      return Status::InternalError("WritePageGuard frame changed before WAL append");
+    }
+    std::copy(frames_[frame_id].page.Data(),
+              frames_[frame_id].page.Data() + Page::kSize, after.begin());
+  }
+
+  LogRecord record;
+  record.type = LogRecordType::PageUpdate;
+  record.txn_id = transaction->id();
+  record.prev_lsn = transaction->last_lsn();
+  record.page_id = page_id;
+  record.before_image.assign(before.begin(), before.end());
+  record.after_image.assign(after.begin(), after.end());
+  auto append = log_manager_->Append(std::move(record));
+  if (!append.ok()) {
+    std::copy(before.begin(), before.end(), frames_[frame_id].page.Data());
+    transaction->MarkFailed();
+    return Status::IOError("page WAL append failed: " + append.status().message());
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (frame_id >= frames_.size() || frames_[frame_id].page_id != page_id) {
+      transaction->MarkFailed();
+      return Status::InternalError("WritePageGuard frame changed after WAL append");
+    }
+    frames_[frame_id].page_lsn = append.value();
+  }
+  transaction->SetLastLsn(append.value());
+  if (logged != nullptr) *logged = true;
+  return Status::Ok();
+}
+
+Status BufferPoolManager::FlushFrameToDisk(page_id_t page_id, const Page &page,
+                                           lsn_t page_lsn) {
+  if (log_manager_ != nullptr && page_lsn != kInvalidLsn) {
+    auto wal_status = log_manager_->Flush(page_lsn);
+    if (!wal_status.ok()) return Status::IOError("WAL-before-data failed: " + wal_status.message());
+  }
+  if (disk_manager_ == nullptr) return Status::InvalidArgument("BufferPoolManager missing DiskManager");
+  return disk_manager_->WritePage(page_id, page);
+}
+
+Status BufferPoolManager::AppendPageFreeLog(page_id_t page_id, Transaction *transaction) {
+  if (transaction == nullptr || log_manager_ == nullptr) {
+    return Status::InvalidArgument("transactional page deletion requires a bound LogManager");
+  }
+  if (!transaction->IsUsableForWork()) {
+    return Status::InvalidArgument("page deletion requires an Active transaction");
+  }
+  if (std::find(transaction->deferred_free_pages().begin(),
+                transaction->deferred_free_pages().end(), page_id) !=
+      transaction->deferred_free_pages().end()) {
+    return Status::AlreadyExists("page deletion is already logged: " + std::to_string(page_id));
+  }
+  LogRecord record;
+  record.type = LogRecordType::PageFree;
+  record.txn_id = transaction->id();
+  record.prev_lsn = transaction->last_lsn();
+  record.page_id = page_id;
+  auto append = log_manager_->Append(std::move(record));
+  if (!append.ok()) {
+    transaction->MarkFailed();
+    return append.status();
+  }
+  transaction->SetLastLsn(append.value());
+  transaction->AddDeferredFreePage(page_id);
+  return Status::Ok();
+}
+
 BufferPoolManager::~BufferPoolManager() {
   if (!closed_) {
     (void)FlushAllPages();
@@ -1393,10 +1563,13 @@ Status BufferPoolManager::ReleaseGuard(frame_id_t frame_id, page_id_t page_id,
     Status flush_status = Status::Ok();
     {
       std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-      flush_status = disk_manager_->WritePage(page_id, frame.page);
+      flush_status = FlushFrameToDisk(page_id, frame.page, frame.page_lsn);
     }
     lock.lock();
-    if (flush_status.ok()) frame.is_dirty = false;
+    if (flush_status.ok()) {
+      frame.is_dirty = false;
+      frame.page_lsn = kInvalidLsn;
+    }
     frame.state = FrameState::Valid;
     --frame.pin_count;
     if (frame.pin_count == 0) (void)replacer_->Unpin(frame_id);
@@ -1498,7 +1671,8 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
     {
       std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
       if (!selection.from_free_list && frame.is_dirty) {
-        write_status = disk_manager_->WritePage(old_page_id, frame.page);
+        write_status = FlushFrameToDisk(old_page_id, frame.page, frame.page_lsn);
+        if (write_status.ok()) frame.page_lsn = kInvalidLsn;
       }
       if (write_status.ok()) loaded = disk_manager_->ReadPage(page_id);
       if (loaded.ok()) {
@@ -1540,6 +1714,7 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
     frame.page_id = page_id;
     frame.pin_count = 1;
     frame.is_dirty = false;
+    frame.page_lsn = kInvalidLsn;
     frame.state = FrameState::Valid;
     (void)replacer_->Remove(frame_id);
     (void)replacer_->RecordAccess(frame_id);
@@ -1549,9 +1724,18 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
   }
   }
 Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
+  return FetchPageWrite(page_id, nullptr);
+}
+
+Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id,
+                                                         Transaction *transaction) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
   if (!ready.ok()) return Result<WritePageGuard>(ready);
+  if (transaction != nullptr && !transaction->IsUsableForWork()) {
+    return Result<WritePageGuard>(Status::InvalidArgument(
+        "FetchPageWrite requires an Active transaction"));
+  }
   auto valid = ValidateDataPageId(page_id);
   if (!valid.ok()) return Result<WritePageGuard>(valid);
   ++access_count_;
@@ -1576,7 +1760,8 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
         }
         ++hit_count_;
         lock.unlock();
-        return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch));
+        return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch,
+                                                     transaction));
       }
       if (frame.state == FrameState::DeletePending) {
         return Result<WritePageGuard>(Status::NotFound("页面正在删除: " + std::to_string(page_id)));
@@ -1627,7 +1812,8 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
     {
       std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
       if (!selection.from_free_list && frame.is_dirty) {
-        write_status = disk_manager_->WritePage(old_page_id, frame.page);
+        write_status = FlushFrameToDisk(old_page_id, frame.page, frame.page_lsn);
+        if (write_status.ok()) frame.page_lsn = kInvalidLsn;
       }
       if (write_status.ok()) loaded = disk_manager_->ReadPage(page_id);
       if (loaded.ok()) {
@@ -1667,18 +1853,28 @@ Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
     frame.page_id = page_id;
     frame.pin_count = 1;
     frame.is_dirty = false;
+    frame.page_lsn = kInvalidLsn;
     frame.state = FrameState::Valid;
     (void)replacer_->Remove(frame_id);
     (void)replacer_->RecordAccess(frame_id);
     NotifyStateChange();
     lock.unlock();
-    return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch));
+    return Result<WritePageGuard>(WritePageGuard(this, frame_id, page_id, &frame.latch,
+                                                 transaction));
   }
-  }
+}
 Result<WritePageGuard> BufferPoolManager::NewPage() {
+  return NewPage(nullptr);
+}
+
+Result<WritePageGuard> BufferPoolManager::NewPage(Transaction *transaction) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
   if (!ready.ok()) return Result<WritePageGuard>(ready);
+  if (transaction != nullptr && !transaction->IsUsableForWork()) {
+    return Result<WritePageGuard>(Status::InvalidArgument(
+        "NewPage requires an Active transaction"));
+  }
   auto selected = SelectFrameUnlocked();
   if (!selected.ok()) return Result<WritePageGuard>(selected.status());
   const FrameSelection selection = selected.value();
@@ -1692,18 +1888,40 @@ Result<WritePageGuard> BufferPoolManager::NewPage() {
   {
     std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
     if (!selection.from_free_list && frame.is_dirty) {
-      write_status = disk_manager_->WritePage(old_page_id, frame.page);
+      write_status = FlushFrameToDisk(old_page_id, frame.page, frame.page_lsn);
+      if (write_status.ok()) frame.page_lsn = kInvalidLsn;
     }
   }
   Result<page_id_t> allocated(Status::IOError("页面分配未完成"));
   if (write_status.ok()) allocated = disk_manager_->AllocatePage();
 
-  if (write_status.ok() && allocated.ok()) {
+  if (!allocated.ok() && selection.from_free_list) {
     std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
     frame.page = Page{};
-  } else if (selection.from_free_list) {
-    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    frame.page = Page{};
+  }
+
+  if (write_status.ok() && allocated.ok() && transaction != nullptr) {
+    if (log_manager_ == nullptr) {
+      (void)disk_manager_->DeallocatePage(allocated.value());
+      allocated = Result<page_id_t>(Status::InvalidArgument(
+          "transactional NewPage requires a bound LogManager"));
+      transaction->MarkFailed();
+    } else {
+      LogRecord record;
+      record.type = LogRecordType::PageAllocate;
+      record.txn_id = transaction->id();
+      record.prev_lsn = transaction->last_lsn();
+      record.page_id = allocated.value();
+      auto append = log_manager_->Append(std::move(record));
+      if (!append.ok()) {
+        (void)disk_manager_->DeallocatePage(allocated.value());
+        allocated = Result<page_id_t>(append.status());
+        transaction->MarkFailed();
+      } else {
+        transaction->SetLastLsn(append.value());
+        transaction->AddAllocatedPage(allocated.value());
+      }
+    }
   }
 
   lock.lock();
@@ -1724,6 +1942,14 @@ Result<WritePageGuard> BufferPoolManager::NewPage() {
     return Result<WritePageGuard>(status);
   }
 
+  // Keep a selected victim intact until allocation and its WAL record both succeed.
+  // Otherwise a failed PageAllocate append could leave the old page id mapped to a
+  // zeroed frame.
+  {
+    std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
+    frame.page = Page{};
+  }
+
   if (!selection.from_free_list) {
     page_table_.erase(old_page_id);
     ++eviction_count_;
@@ -1733,14 +1959,16 @@ Result<WritePageGuard> BufferPoolManager::NewPage() {
   frame.page_id = allocated.value();
   frame.pin_count = 1;
   frame.is_dirty = false;
+  frame.page_lsn = kInvalidLsn;
   frame.state = FrameState::Valid;
   page_table_[frame.page_id] = frame_id;
   (void)replacer_->Remove(frame_id);
   (void)replacer_->RecordAccess(frame_id);
   NotifyStateChange();
   lock.unlock();
-  return Result<WritePageGuard>(WritePageGuard(this, frame_id, frame.page_id, &frame.latch));
-  }
+  return Result<WritePageGuard>(WritePageGuard(this, frame_id, frame.page_id, &frame.latch,
+                                               transaction));
+}
 Status BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
@@ -1764,10 +1992,13 @@ Status BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
     Status flush_status = Status::Ok();
     {
       std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-      flush_status = disk_manager_->WritePage(page_id, frame.page);
+      flush_status = FlushFrameToDisk(page_id, frame.page, frame.page_lsn);
     }
     lock.lock();
-    if (flush_status.ok()) frame.is_dirty = false;
+    if (flush_status.ok()) {
+      frame.is_dirty = false;
+      frame.page_lsn = kInvalidLsn;
+    }
     frame.state = FrameState::Valid;
     --frame.pin_count;
     if (frame.pin_count == 0) (void)replacer_->Unpin(frame_id);
@@ -1834,10 +2065,13 @@ Status BufferPoolManager::FlushPage(page_id_t page_id) {
   Status write_status = Status::Ok();
   {
     std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    if (frame.is_dirty) write_status = disk_manager_->WritePage(page_id, frame.page);
+    if (frame.is_dirty) write_status = FlushFrameToDisk(page_id, frame.page, frame.page_lsn);
   }
   lock.lock();
-  if (write_status.ok()) frame.is_dirty = false;
+  if (write_status.ok()) {
+    frame.is_dirty = false;
+    frame.page_lsn = kInvalidLsn;
+  }
   frame.state = FrameState::Valid;
   --frame.pin_count;
   if (frame.pin_count == 0) (void)replacer_->Unpin(frame_id);
@@ -1867,7 +2101,29 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
   const auto begin = BeginPageDeletion(page_id);
   if (!begin.ok()) return begin;
   return FinalizePageDeletion(page_id);
+}
+
+Status BufferPoolManager::DeletePage(page_id_t page_id, Transaction *transaction) {
+  if (transaction == nullptr) return DeletePage(page_id);
+  if (!transaction->IsUsableForWork()) {
+    return Status::InvalidArgument("DeletePage requires an Active transaction");
   }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (delete_pending_pages_.find(page_id) != delete_pending_pages_.end()) {
+      // HeapTable may reserve a page while its last guard is still held.
+      return AppendPageFreeLog(page_id, transaction);
+    }
+  }
+  auto begin = BeginPageDeletion(page_id);
+  if (!begin.ok()) return begin;
+  auto log_status = AppendPageFreeLog(page_id, transaction);
+  if (!log_status.ok()) {
+    (void)CancelPageDeletion(page_id);
+    return log_status;
+  }
+  return Status::Ok();
+}
 
 Status BufferPoolManager::BeginPageDeletion(page_id_t page_id) {
   return BeginPageDeletion(page_id, 0);
@@ -1929,9 +2185,12 @@ Status BufferPoolManager::FinalizePageDeletion(page_id_t page_id) {
   const auto found = page_table_.find(page_id);
   if (found == page_table_.end()) {
     lock.unlock();
-    const auto status = disk_manager_->DeallocatePage(page_id);
+    auto status = disk_manager_->DeallocatePage(page_id);
     lock.lock();
-    if (status.ok()) delete_pending_pages_.erase(page_id);
+    if (status.ok() || status.code() == ErrorCode::AlreadyExists) {
+      delete_pending_pages_.erase(page_id);
+      if (status.code() == ErrorCode::AlreadyExists) status = Status::Ok();
+    }
     NotifyStateChange();
     return status;
   }
@@ -1947,10 +2206,11 @@ Status BufferPoolManager::FinalizePageDeletion(page_id_t page_id) {
   Status write_status = Status::Ok();
   {
     std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
-    if (frame.is_dirty) write_status = disk_manager_->WritePage(page_id, frame.page);
+    if (frame.is_dirty) write_status = FlushFrameToDisk(page_id, frame.page, frame.page_lsn);
   }
   Status delete_status = write_status;
   if (delete_status.ok()) delete_status = disk_manager_->DeallocatePage(page_id);
+  if (delete_status.code() == ErrorCode::AlreadyExists) delete_status = Status::Ok();
   if (delete_status.ok()) {
     std::unique_lock<std::shared_mutex> frame_lock(frame.latch);
     frame.page = Page{};
@@ -2004,7 +2264,28 @@ Status BufferPoolManager::DeletePages(const std::vector<page_id_t> &page_ids) {
     }
   }
   return Status::Ok();
+}
+
+Status BufferPoolManager::DeletePages(const std::vector<page_id_t> &page_ids,
+                                      Transaction *transaction) {
+  if (transaction == nullptr) return DeletePages(page_ids);
+  std::unordered_set<page_id_t> seen;
+  for (const auto page_id : page_ids) {
+    if (!seen.insert(page_id).second) {
+      return Status::InvalidArgument("DeletePages contains a duplicate page");
+    }
   }
+  std::vector<page_id_t> reserved;
+  for (const auto page_id : page_ids) {
+    auto status = DeletePage(page_id, transaction);
+    if (!status.ok()) {
+      for (const auto reserved_id : reserved) (void)CancelPageDeletion(reserved_id);
+      return status;
+    }
+    reserved.push_back(page_id);
+  }
+  return Status::Ok();
+}
 Status BufferPoolManager::Close() {
   {
     std::lock_guard<std::mutex> lock(mutex_);

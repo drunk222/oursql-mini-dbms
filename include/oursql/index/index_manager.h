@@ -3,6 +3,7 @@
 #include "oursql/catalog/catalog.h"
 #include "oursql/index/b_plus_tree.h"
 #include "oursql/storage/row_codec.h"
+#include "oursql/transaction/transaction.h"
 
 #include <memory>
 #include <string_view>
@@ -22,15 +23,29 @@ class IndexManager {
   [[nodiscard]] Status DropIndex(std::string_view index_name);
 
   [[nodiscard]] Status InsertEntry(std::string_view index_name, index_key_t key, RID rid);
+  [[nodiscard]] Status InsertEntry(std::string_view index_name, index_key_t key, RID rid,
+                                   Transaction *transaction);
   [[nodiscard]] Status DeleteEntry(std::string_view index_name, index_key_t key, RID rid);
+  [[nodiscard]] Status DeleteEntry(std::string_view index_name, index_key_t key, RID rid,
+                                   Transaction *transaction);
   [[nodiscard]] Status UpdateEntry(std::string_view index_name, index_key_t old_key,
                                    RID old_rid, index_key_t new_key, RID new_rid);
+  [[nodiscard]] Status UpdateEntry(std::string_view index_name, index_key_t old_key,
+                                   RID old_rid, index_key_t new_key, RID new_rid,
+                                   Transaction *transaction);
 
   // 行级维护接口供 INSERT/DELETE/UPDATE 执行路径在后续接线时调用。
   [[nodiscard]] Status OnInsert(std::string_view table_name, const Row &row, RID rid);
+  [[nodiscard]] Status OnInsert(std::string_view table_name, const Row &row, RID rid,
+                                Transaction *transaction);
   [[nodiscard]] Status OnDelete(std::string_view table_name, const Row &row, RID rid);
+  [[nodiscard]] Status OnDelete(std::string_view table_name, const Row &row, RID rid,
+                                Transaction *transaction);
   [[nodiscard]] Status OnUpdate(std::string_view table_name, const Row &old_row,
                                 RID old_rid, const Row &new_row, RID new_rid);
+  [[nodiscard]] Status OnUpdate(std::string_view table_name, const Row &old_row,
+                                RID old_rid, const Row &new_row, RID new_rid,
+                                Transaction *transaction);
 
   [[nodiscard]] Result<std::vector<RID>> Lookup(std::string_view index_name,
                                                 index_key_t key) const;
@@ -39,11 +54,12 @@ class IndexManager {
 
  private:
   [[nodiscard]] Result<std::unique_ptr<BPlusTree>> OpenTree(
-      const IndexMetadata &metadata) const;
+      const IndexMetadata &metadata, Transaction *transaction = nullptr) const;
   [[nodiscard]] Result<std::size_t> IndexedColumn(const IndexMetadata &metadata) const;
   [[nodiscard]] Status PersistRootIfChanged(const IndexMetadata &metadata,
                                             const BPlusTree &tree,
-                                            page_id_t old_root);
+                                            page_id_t old_root,
+                                            Transaction *transaction);
 
   Catalog *catalog_{nullptr};
   BufferPoolManager *buffer_pool_{nullptr};

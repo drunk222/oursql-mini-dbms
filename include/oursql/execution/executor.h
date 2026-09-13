@@ -45,7 +45,8 @@ class InsertExecutor {
       : catalog_(catalog), buffer_pool_(buffer_pool) {}
 
   // 调用者：ExecutionEngine；作用：按表 Schema 插入一行；返回：影响行数和新 RID。
-  [[nodiscard]] Result<ExecutionResult> Execute(const InsertPlan &plan) const;
+  [[nodiscard]] Result<ExecutionResult> Execute(const InsertPlan &plan,
+                                                Transaction *transaction = nullptr) const;
 
  private:
   Catalog *catalog_{nullptr};
@@ -101,7 +102,8 @@ class DeleteExecutor {
       : catalog_(catalog), buffer_pool_(buffer_pool) {}
 
   // 调用者：ExecutionEngine；作用：扫描并删除满足条件的行；返回：删除行数或错误。
-  [[nodiscard]] Result<ExecutionResult> Execute(const DeletePlan &plan) const;
+  [[nodiscard]] Result<ExecutionResult> Execute(const DeletePlan &plan,
+                                                Transaction *transaction = nullptr) const;
 
  private:
   Catalog *catalog_{nullptr};
@@ -114,7 +116,8 @@ class UpdateExecutor {
       : catalog_(catalog), buffer_pool_(buffer_pool) {}
 
   // 调用者：ExecutionEngine；作用：扫描并替换满足条件的行；返回影响行数和新 RID。
-  [[nodiscard]] Result<ExecutionResult> Execute(const UpdatePlan &plan) const;
+  [[nodiscard]] Result<ExecutionResult> Execute(const UpdatePlan &plan,
+                                                Transaction *transaction = nullptr) const;
 
  private:
   Catalog *catalog_{nullptr};
@@ -128,6 +131,8 @@ class ExecutionEngine {
 
   // 调用者：DatabaseEngine；作用：分派结构化逻辑计划；返回：结果集或影响行数。
   [[nodiscard]] Result<ExecutionResult> Execute(const Plan &plan) const;
+  [[nodiscard]] Result<ExecutionResult> Execute(const Plan &plan,
+                                                const ExecutionContext &context) const;
 
  private:
   struct SourcePlan {

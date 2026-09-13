@@ -281,7 +281,8 @@ Result<ExecutionResult> CreateTableExecutor::Execute(const CreateTablePlan &plan
   return Result<ExecutionResult>(ExecutionResult{});
 }
 
-Result<ExecutionResult> InsertExecutor::Execute(const InsertPlan &plan) const {
+Result<ExecutionResult> InsertExecutor::Execute(const InsertPlan &plan,
+                                                Transaction *transaction) const {
   if (buffer_pool_ == nullptr) {
     return Result<ExecutionResult>(Status::InvalidArgument("InsertExecutor 缺少 BufferPoolManager"));
   }
@@ -297,13 +298,17 @@ Result<ExecutionResult> InsertExecutor::Execute(const InsertPlan &plan) const {
   }
 
   HeapTable table(buffer_pool_, *metadata.value());
-  auto rid = table.InsertRow(plan.rows.front());
+  auto rid = table.InsertRow(plan.rows.front(), transaction);
   if (!rid.ok()) return Result<ExecutionResult>(Contextualize("InsertExecutor", rid.status()));
   IndexManager index_manager(catalog_, buffer_pool_);
   auto index_status =
-      index_manager.OnInsert(plan.table_name, plan.rows.front(), rid.value());
+      index_manager.OnInsert(plan.table_name, plan.rows.front(), rid.value(), transaction);
   if (!index_status.ok()) {
-    (void)table.DeleteRow(rid.value());
+    if (transaction == nullptr) {
+      (void)table.DeleteRow(rid.value());
+    } else {
+      transaction->MarkFailed();
+    }
     return Result<ExecutionResult>(
         Contextualize("InsertExecutor", index_status));
   }
@@ -434,7 +439,8 @@ Result<std::unique_ptr<RowSource>> OrderByExecutor::Execute(
   return Result<std::unique_ptr<RowSource>>(std::move(source));
 }
 
-Result<ExecutionResult> DeleteExecutor::Execute(const DeletePlan &plan) const {
+Result<ExecutionResult> DeleteExecutor::Execute(const DeletePlan &plan,
+                                                Transaction *transaction) const {
   if (buffer_pool_ == nullptr) {
     return Result<ExecutionResult>(Status::InvalidArgument("DeleteExecutor 缺少 BufferPoolManager"));
   }
@@ -468,15 +474,19 @@ Result<ExecutionResult> DeleteExecutor::Execute(const DeletePlan &plan) const {
     if (!matches) continue;
     auto index_status =
         index_manager.OnDelete(plan.table_name, row_entry.second,
-                               row_entry.first);
+                               row_entry.first, transaction);
     if (!index_status.ok()) {
       return Result<ExecutionResult>(
           Contextualize("DeleteExecutor", index_status));
     }
-    auto status = table.DeleteRow(row_entry.first);
+    auto status = table.DeleteRow(row_entry.first, transaction);
     if (!status.ok()) {
-      (void)index_manager.OnInsert(plan.table_name, row_entry.second,
-                                   row_entry.first);
+      if (transaction != nullptr) {
+        transaction->MarkFailed();
+      } else {
+        (void)index_manager.OnInsert(plan.table_name, row_entry.second,
+                                     row_entry.first);
+      }
       return Result<ExecutionResult>(Contextualize("DeleteExecutor", status));
     }
     ++result.affected_rows;
@@ -484,7 +494,8 @@ Result<ExecutionResult> DeleteExecutor::Execute(const DeletePlan &plan) const {
   return Result<ExecutionResult>(std::move(result));
 }
 
-Result<ExecutionResult> UpdateExecutor::Execute(const UpdatePlan &plan) const {
+Result<ExecutionResult> UpdateExecutor::Execute(const UpdatePlan &plan,
+                                                Transaction *transaction) const {
   if (buffer_pool_ == nullptr) {
     return Result<ExecutionResult>(
         Status::InvalidArgument("UpdateExecutor 缺少 BufferPoolManager"));
@@ -562,7 +573,7 @@ Result<ExecutionResult> UpdateExecutor::Execute(const UpdatePlan &plan) const {
   ExecutionResult result;
   IndexManager index_manager(catalog_, buffer_pool_);
   for (const auto &replacement : replacements) {
-    auto new_rid = table.InsertRow(replacement.new_row);
+    auto new_rid = table.InsertRow(replacement.new_row, transaction);
     if (!new_rid.ok()) {
       return Result<ExecutionResult>(
           Contextualize("UpdateExecutor", new_rid.status()));
@@ -570,18 +581,26 @@ Result<ExecutionResult> UpdateExecutor::Execute(const UpdatePlan &plan) const {
     auto index_status =
         index_manager.OnUpdate(plan.table_name, replacement.old_row,
                                replacement.old_rid, replacement.new_row,
-                               new_rid.value());
+                               new_rid.value(), transaction);
     if (!index_status.ok()) {
-      (void)table.DeleteRow(new_rid.value());
+      if (transaction != nullptr) {
+        transaction->MarkFailed();
+      } else {
+        (void)table.DeleteRow(new_rid.value());
+      }
       return Result<ExecutionResult>(
           Contextualize("UpdateExecutor", index_status));
     }
-    auto delete_status = table.DeleteRow(replacement.old_rid);
+    auto delete_status = table.DeleteRow(replacement.old_rid, transaction);
     if (!delete_status.ok()) {
-      (void)index_manager.OnUpdate(plan.table_name, replacement.new_row,
-                                   new_rid.value(), replacement.old_row,
-                                   replacement.old_rid);
-      (void)table.DeleteRow(new_rid.value());
+      if (transaction != nullptr) {
+        transaction->MarkFailed();
+      } else {
+        (void)index_manager.OnUpdate(plan.table_name, replacement.new_row,
+                                     new_rid.value(), replacement.old_row,
+                                     replacement.old_rid);
+        (void)table.DeleteRow(new_rid.value());
+      }
       return Result<ExecutionResult>(
           Contextualize("UpdateExecutor", delete_status));
     }
@@ -733,6 +752,11 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
 }
 
 Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
+  return Execute(plan, ExecutionContext{});
+}
+
+Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan,
+                                                 const ExecutionContext &context) const {
   if (catalog_ == nullptr || buffer_pool_ == nullptr) {
     return Result<ExecutionResult>(Status::InvalidArgument("ExecutionEngine 缺少存储依赖"));
   }
@@ -743,7 +767,8 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
         if constexpr (std::is_same_v<Type, CreateTablePlan>) {
           return CreateTableExecutor(catalog_).Execute(operation);
         } else if constexpr (std::is_same_v<Type, InsertPlan>) {
-          return InsertExecutor(catalog_, buffer_pool_).Execute(operation);
+          return InsertExecutor(catalog_, buffer_pool_).Execute(operation,
+                                                                  context.transaction);
         } else if constexpr (std::is_same_v<Type, SelectPlan>) {
           auto source = BuildSource(operation);
           if (!source.ok()) return Result<ExecutionResult>(source.status());
@@ -806,7 +831,8 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
           result.rows.push_back({Value(ToString(operation.select))});
           return Result<ExecutionResult>(std::move(result));
         } else if constexpr (std::is_same_v<Type, UpdatePlan>) {
-          return UpdateExecutor(catalog_, buffer_pool_).Execute(operation);
+          return UpdateExecutor(catalog_, buffer_pool_).Execute(operation,
+                                                                  context.transaction);
         } else if constexpr (std::is_same_v<Type, AlterTablePlan>) {
           return Result<ExecutionResult>(Status::NotImplemented(
               "ALTER TABLE 当前仅完成编译层计划生成，执行器尚未接入"));
@@ -814,7 +840,8 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {
           return Result<ExecutionResult>(Status::NotImplemented(
               "事务控制当前仅完成编译层计划生成，执行器尚未接入"));
         } else {
-          return DeleteExecutor(catalog_, buffer_pool_).Execute(operation);
+          return DeleteExecutor(catalog_, buffer_pool_).Execute(operation,
+                                                                  context.transaction);
         }
       },
       plan);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "oursql/index/b_plus_tree_page.h"
+#include "oursql/transaction/transaction.h"
 
 #include <cstdint>
 #include <memory>
@@ -15,16 +16,19 @@ class BPlusTree {
   explicit BPlusTree(BufferPoolManager *buffer_pool,
                      page_id_t root_page_id = INVALID_PAGE_ID,
                      std::uint32_t leaf_max_size = BPlusTreeLeafPage::kPhysicalMaxSize,
-                     std::uint32_t internal_max_size = BPlusTreeInternalPage::kPhysicalMaxSize)
+                     std::uint32_t internal_max_size = BPlusTreeInternalPage::kPhysicalMaxSize,
+                     Transaction *transaction = nullptr)
       noexcept;
 
   // 持久化入口：CreatePersistent 创建索引元数据页，OpenPersistent 仅凭该页编号恢复树。
   [[nodiscard]] static Result<std::unique_ptr<BPlusTree>> CreatePersistent(
       BufferPoolManager *buffer_pool,
       std::uint32_t leaf_max_size = BPlusTreeLeafPage::kPhysicalMaxSize,
-      std::uint32_t internal_max_size = BPlusTreeInternalPage::kPhysicalMaxSize);
+      std::uint32_t internal_max_size = BPlusTreeInternalPage::kPhysicalMaxSize,
+      Transaction *transaction = nullptr);
   [[nodiscard]] static Result<std::unique_ptr<BPlusTree>> OpenPersistent(
-      BufferPoolManager *buffer_pool, page_id_t header_page_id);
+      BufferPoolManager *buffer_pool, page_id_t header_page_id,
+      Transaction *transaction = nullptr);
 
   [[nodiscard]] bool IsEmpty() const noexcept;
   [[nodiscard]] page_id_t GetRootPageId() const noexcept;
@@ -32,7 +36,9 @@ class BPlusTree {
 
   // 相同 Key 可对应多个 RID；完全相同的 Key/RID 对只保存一次。
   [[nodiscard]] Status Insert(index_key_t key, RID rid);
+  [[nodiscard]] Status Insert(index_key_t key, RID rid, Transaction *transaction);
   [[nodiscard]] Status Remove(index_key_t key, RID rid);
+  [[nodiscard]] Status Remove(index_key_t key, RID rid, Transaction *transaction);
   [[nodiscard]] Result<std::vector<RID>> GetValue(index_key_t key) const;
   // 闭区间扫描 [lower, upper]，结果按 Key、RID 排序。
   [[nodiscard]] Result<std::vector<std::pair<index_key_t, RID>>> RangeScan(
@@ -64,6 +70,7 @@ class BPlusTree {
   [[nodiscard]] Result<index_key_t> SubtreeMinimum(page_id_t page_id) const;
 
   BufferPoolManager *buffer_pool_{nullptr};
+  Transaction *transaction_{nullptr};
   page_id_t root_page_id_{INVALID_PAGE_ID};
   page_id_t header_page_id_{INVALID_PAGE_ID};
   std::uint32_t leaf_max_size_{BPlusTreeLeafPage::kPhysicalMaxSize};

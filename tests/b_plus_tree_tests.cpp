@@ -1,6 +1,9 @@
 #include "oursql/index/b_plus_tree.h"
+#include "oursql/storage/log_manager.h"
+#include "oursql/transaction/transaction_manager.h"
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -237,6 +240,90 @@ bool TestDeleteReclaimsPagesAcrossRestart() {
   }
 }
 
+bool TestTransactionalStructuralChanges() {
+  TempDatabase temp;
+  oursql::page_id_t header = oursql::INVALID_PAGE_ID;
+  {
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!Check(disk.Open(temp.path).ok(), "transactional tree database open") ||
+        !Check(log.Open(temp.path).ok(), "transactional tree WAL open")) {
+      return false;
+    }
+    oursql::BufferPoolManager buffer_pool(8, &disk);
+    if (!Check(buffer_pool.SetLogManager(&log).ok(), "transactional tree WAL binding")) {
+      return false;
+    }
+    auto created = oursql::BPlusTree::CreatePersistent(&buffer_pool, 3, 3);
+    if (!Check(created.ok(), "transactional tree persistent setup")) return false;
+    header = created.value()->GetHeaderPageId();
+    if (!Check(buffer_pool.FlushAllPages().ok(), "transactional tree setup flush")) return false;
+    oursql::TransactionManager transactions(&log, &buffer_pool, &disk);
+
+    auto insert_begin = transactions.Begin(true);
+    if (!Check(insert_begin.ok(), "transactional structural insert begin")) return false;
+    auto inserting = oursql::BPlusTree::OpenPersistent(&buffer_pool, header,
+                                                        insert_begin.value());
+    if (!Check(inserting.ok(), "transactional structural insert open")) return false;
+    for (std::int64_t key = 1; key <= 40; ++key) {
+      if (!Check(inserting.value()->Insert(
+                     key, oursql::RID{static_cast<oursql::page_id_t>(key), 1})
+                     .ok(),
+                 "transactional structural insert")) return false;
+    }
+    if (!Check(transactions.Commit().ok() && buffer_pool.FlushAllPages().ok(),
+               "transactional structural insert commit")) return false;
+
+    auto committed_tree = oursql::BPlusTree::OpenPersistent(&buffer_pool, header);
+    if (!Check(committed_tree.ok(), "committed structural tree reopen")) return false;
+    auto committed_range = committed_tree.value()->RangeScan(1, 40);
+    if (!Check(committed_range.ok() && committed_range.value().size() == 40,
+               "committed split tree contents")) return false;
+
+    auto rollback_begin = transactions.Begin(true);
+    if (!Check(rollback_begin.ok(), "transactional structural delete begin")) return false;
+    auto deleting = oursql::BPlusTree::OpenPersistent(&buffer_pool, header,
+                                                       rollback_begin.value());
+    if (!Check(deleting.ok(), "transactional structural delete open")) return false;
+    for (std::int64_t key = 1; key <= 40; ++key) {
+      if (!Check(deleting.value()->Remove(
+                     key, oursql::RID{static_cast<oursql::page_id_t>(key), 1})
+                     .ok(),
+                 "transactional structural delete")) return false;
+    }
+    if (!Check(transactions.Rollback().ok(), "transactional structural delete rollback")) {
+      return false;
+    }
+    auto restored_tree = oursql::BPlusTree::OpenPersistent(&buffer_pool, header);
+    if (!Check(restored_tree.ok(), "rolled-back structural tree reopen")) return false;
+    auto restored_range = restored_tree.value()->RangeScan(1, 40);
+    if (!Check(restored_range.ok() && restored_range.value().size() == 40,
+               "rollback must restore merged tree contents")) return false;
+
+    auto final_begin = transactions.Begin(true);
+    if (!Check(final_begin.ok(), "transactional structural final delete begin")) return false;
+    auto deleting_final = oursql::BPlusTree::OpenPersistent(&buffer_pool, header,
+                                                              final_begin.value());
+    if (!Check(deleting_final.ok(), "transactional structural final delete open")) return false;
+    for (std::int64_t key = 1; key <= 40; ++key) {
+      if (!Check(deleting_final.value()->Remove(
+                     key, oursql::RID{static_cast<oursql::page_id_t>(key), 1})
+                     .ok(),
+                 "transactional structural final delete")) return false;
+    }
+    if (!Check(transactions.Commit().ok() && buffer_pool.FlushAllPages().ok(),
+               "transactional structural delete commit")) return false;
+    auto empty_tree = oursql::BPlusTree::OpenPersistent(&buffer_pool, header);
+    if (!Check(empty_tree.ok() && empty_tree.value()->IsEmpty(),
+               "committed root contraction must persist")) return false;
+    if (!Check(buffer_pool.Close().ok() && log.Close().ok() && disk.Close().ok(),
+               "transactional structural close")) return false;
+  }
+  std::filesystem::remove(temp.path);
+  std::filesystem::remove(temp.path.string() + ".wal");
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -253,5 +340,6 @@ int main() {
   run("duplicate keys and reopen", &TestDuplicateKeysAndReopen);
   run("delete rebalance and root contraction", &TestDeleteRebalanceAndRootContraction);
   run("delete reclaims pages across restart", &TestDeleteReclaimsPagesAcrossRestart);
+  run("transactional structural changes", &TestTransactionalStructuralChanges);
   return failures == 0 ? 0 : 1;
 }

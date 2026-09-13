@@ -2,6 +2,7 @@
 
 #include "oursql/common/status.h"
 #include "oursql/common/types.h"
+#include "oursql/transaction/transaction.h"
 
 #include <array>
 #include <cstddef>
@@ -22,6 +23,7 @@
 namespace oursql {
 
 class Catalog;
+class LogManager;
 
 class Page {
  public:
@@ -271,13 +273,16 @@ class WritePageGuard {
  private:
   friend class BufferPoolManager;
   WritePageGuard(BufferPoolManager *buffer_pool, frame_id_t frame_id, page_id_t page_id,
-                 std::shared_mutex *latch);
+                 std::shared_mutex *latch, Transaction *transaction = nullptr);
   [[nodiscard]] Status Reset() noexcept;
 
   BufferPoolManager *buffer_pool_{nullptr};
   frame_id_t frame_id_{0};
   page_id_t page_id_{INVALID_PAGE_ID};
   bool dirty_{false};
+  Transaction *transaction_{nullptr};
+  std::array<std::byte, Page::kSize> before_image_{};
+  bool has_before_image_{false};
   std::unique_lock<std::shared_mutex> latch_;
 };
 
@@ -365,6 +370,12 @@ class BufferPoolManager {
   [[nodiscard]] Result<WritePageGuard> NewPage();
   // 调用者：HeapTable 或页面创建流程；作用：申请并获取新的写 guard 页面；返回：guard 或错误状态。
   [[nodiscard]] Result<WritePageGuard> NewPageGuarded() { return NewPage(); }
+  [[nodiscard]] Status SetLogManager(LogManager *log_manager);
+  [[nodiscard]] Status RestorePage(page_id_t page_id, const Page &page,
+                                    bool write_disk = true);
+  [[nodiscard]] Result<WritePageGuard> FetchPageWrite(page_id_t page_id,
+                                                       Transaction *transaction);
+  [[nodiscard]] Result<WritePageGuard> NewPage(Transaction *transaction);
   // 调用者：不使用 guard 的存储代码；作用：释放一次页面 pin 并更新 dirty；返回：操作状态。
   [[nodiscard]] Status UnpinPage(page_id_t page_id, bool is_dirty);
   // 调用者：刷盘或测试；作用：写回一个脏页；返回：操作状态。
@@ -373,8 +384,11 @@ class BufferPoolManager {
   [[nodiscard]] Status FlushAllPages();
   // 调用者：删除流程；作用：释放未 pin 页面并从缓冲池移除；返回：操作状态。
   [[nodiscard]] Status DeletePage(page_id_t page_id);
+  [[nodiscard]] Status DeletePage(page_id_t page_id, Transaction *transaction);
   // 调用者：表或索引释放流程；作用：预检查后批量释放页面；返回：成功或错误状态。
   [[nodiscard]] Status DeletePages(const std::vector<page_id_t> &page_ids);
+  [[nodiscard]] Status DeletePages(const std::vector<page_id_t> &page_ids,
+                                   Transaction *transaction);
   // 调用者：关闭流程；作用：刷新并关闭缓冲池；返回：操作状态。
   [[nodiscard]] Status Close();
   // 调用者：启动流程；作用：查询构造期间的配置状态；返回：成功或明确错误。
@@ -408,6 +422,7 @@ class BufferPoolManager {
     page_id_t page_id{INVALID_PAGE_ID};
     std::uint32_t pin_count{0};
     bool is_dirty{false};
+    lsn_t page_lsn{kInvalidLsn};
     FrameState state{FrameState::Empty};
     mutable std::shared_mutex latch;
   };
@@ -421,12 +436,21 @@ class BufferPoolManager {
   void RestoreSelectionUnlocked(const FrameSelection &selection);
   [[nodiscard]] Status ReturnFreeFrameUnlocked(frame_id_t frame_id);
   [[nodiscard]] Status ReleaseGuard(frame_id_t frame_id, page_id_t page_id, bool is_dirty) noexcept;
+  [[nodiscard]] Status RecordGuardUpdate(frame_id_t frame_id, page_id_t page_id,
+                                         Transaction *transaction, bool dirty,
+                                         const std::array<std::byte, Page::kSize> &before,
+                                         bool *logged) noexcept;
+  [[nodiscard]] Status AppendPageFreeLog(page_id_t page_id, Transaction *transaction);
+  [[nodiscard]] Status FlushFrameToDisk(page_id_t page_id, const Page &page,
+                                        lsn_t page_lsn);
   [[nodiscard]] Status EnsureReadyUnlocked() const;
   [[nodiscard]] Status ValidateDataPageId(page_id_t page_id) const;
   void NotifyStateChange() noexcept;
 
   std::size_t pool_size_{0};
   DiskManager *disk_manager_{nullptr};
+  LogManager *log_manager_{nullptr};
+  bool log_manager_bound_{false};
   ReplacementPolicy replacement_policy_{ReplacementPolicy::FIFO};
   FlushPolicy flush_policy_{FlushPolicy::WriteBack};
   Status init_status_;

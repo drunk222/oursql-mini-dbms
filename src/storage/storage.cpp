@@ -1378,8 +1378,20 @@ Status BufferPoolManager::RecordGuardUpdate(
     const std::array<std::byte, Page::kSize> &before, bool *logged) noexcept {
   if (logged != nullptr) *logged = false;
   if (!dirty || transaction == nullptr) return Status::Ok();
+
+  const auto restore_before_image = [&]() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (frame_id >= frames_.size() || frames_[frame_id].page_id != page_id) return false;
+    std::copy(before.begin(), before.end(), frames_[frame_id].page.Data());
+    return true;
+  };
+
   if (log_manager_ == nullptr) {
+    const bool restored = restore_before_image();
     transaction->MarkFailed();
+    if (!restored) {
+      return Status::InternalError("transactional page write failed and before image restore failed");
+    }
     return Status::InvalidArgument("transactional page write requires a bound LogManager");
   }
 
@@ -1403,17 +1415,31 @@ Status BufferPoolManager::RecordGuardUpdate(
   record.after_image.assign(after.begin(), after.end());
   auto append = log_manager_->Append(std::move(record));
   if (!append.ok()) {
-    std::copy(before.begin(), before.end(), frames_[frame_id].page.Data());
+    const bool restored = restore_before_image();
     transaction->MarkFailed();
+    if (!restored) {
+      return Status::InternalError("page WAL append failed and before image restore failed: " +
+                                  append.status().message());
+    }
     return Status::IOError("page WAL append failed: " + append.status().message());
   }
+
+  bool frame_matches = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (frame_id >= frames_.size() || frames_[frame_id].page_id != page_id) {
-      transaction->MarkFailed();
-      return Status::InternalError("WritePageGuard frame changed after WAL append");
+    frame_matches = frame_id < frames_.size() && frames_[frame_id].page_id == page_id;
+    if (frame_matches) {
+      frames_[frame_id].page_lsn = append.value();
     }
-    frames_[frame_id].page_lsn = append.value();
+  }
+  if (!frame_matches) {
+    const bool restored = restore_before_image();
+    transaction->MarkFailed();
+    if (!restored) {
+      return Status::InternalError(
+          "WritePageGuard frame changed after WAL append and before image restore failed");
+    }
+    return Status::InternalError("WritePageGuard frame changed after WAL append");
   }
   transaction->SetLastLsn(append.value());
   if (logged != nullptr) *logged = true;

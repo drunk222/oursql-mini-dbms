@@ -198,6 +198,69 @@ bool TestStorageSnapshotsAndConcurrentReads() {
   return log_copy_ok && frame_copy_ok && concurrent_ok && close_ok;
 }
 
+bool TestTransactionalWriteWithoutWalRestoresBeforeImage() {
+  TempDb temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "before-image test database should open")) return false;
+
+  oursql::BufferPoolManager pool(1, &disk);
+  auto new_page = pool.NewPage();
+  if (!Check(new_page.ok(), "before-image test should allocate a page")) {
+    (void)pool.Close();
+    (void)disk.Close();
+    return false;
+  }
+
+  const auto page_id = new_page.value().PageId();
+  auto initial_guard = std::move(new_page.value());
+  const std::byte original{0x2A};
+  initial_guard.Data()[0] = original;
+  if (!Check(initial_guard.MarkDirty().ok() && initial_guard.Release().ok(),
+             "before-image test should persist an initial byte in the frame")) {
+    (void)pool.Close();
+    (void)disk.Close();
+    return false;
+  }
+  if (!Check(pool.FlushPage(page_id).ok(), "before-image test should flush the initial page")) {
+    (void)pool.Close();
+    (void)disk.Close();
+    return false;
+  }
+
+  oursql::Transaction transaction(7, true);
+  auto write_page = pool.FetchPageWrite(page_id, &transaction);
+  if (!Check(write_page.ok(), "before-image test should fetch a transactional write guard")) {
+    (void)pool.Close();
+    (void)disk.Close();
+    return false;
+  }
+  auto write_guard = std::move(write_page.value());
+  write_guard.Data()[0] = std::byte{0x7B};
+  const bool marked = Check(write_guard.MarkDirty().ok(),
+                            "before-image test should mark the transactional update dirty");
+  const auto release_status = write_guard.Release();
+  const bool failed = Check(!release_status.ok() &&
+                                release_status.code() == oursql::ErrorCode::InvalidArgument,
+                            "transactional write without WAL should fail explicitly");
+  const bool transaction_failed = Check(
+      transaction.state() == oursql::TransactionState::Failed,
+      "transaction should be marked failed when WAL is not bound");
+
+  auto reread = pool.FetchPage(page_id);
+  const bool restored = Check(reread.ok() && reread.value().Data()[0] == original,
+                              "failed transactional write should restore the before image");
+  if (reread.ok()) {
+    auto read_guard = std::move(reread.value());
+  }
+  const auto snapshots = pool.GetFrameSnapshots();
+  const bool clean = Check(!snapshots.empty() && snapshots[0].page_id == page_id &&
+                               !snapshots[0].is_dirty,
+                           "before-image restoration should not leave the frame dirty");
+  const bool close_ok = Check(pool.Close().ok() && disk.Close().ok(),
+                              "before-image test resources should close cleanly");
+  return marked && failed && transaction_failed && restored && clean && close_ok;
+}
+
 bool TestFlushFailureIsReportedAndRetryable() {
   TempDb temp;
   oursql::DiskManager disk;
@@ -268,6 +331,8 @@ int main() {
 
   run("Database observability and restart", &TestDatabaseObservabilityAndRestart);
   run("Storage snapshots and concurrent reads", &TestStorageSnapshotsAndConcurrentReads);
+  run("Transactional write restores before image without WAL",
+      &TestTransactionalWriteWithoutWalRestoresBeforeImage);
   run("Flush failure is reported and retryable", &TestFlushFailureIsReportedAndRetryable);
 
   if (failures == 0) {

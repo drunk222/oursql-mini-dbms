@@ -1,5 +1,6 @@
 #include "oursql/storage/storage.h"
 #include "oursql/storage/log_manager.h"
+#include "oursql/transaction/lock_manager.h"
 
 #include <algorithm>
 #include <array>
@@ -1334,6 +1335,38 @@ Status BufferPoolManager::SetLogManager(LogManager *log_manager) {
   return Status::Ok();
 }
 
+Status BufferPoolManager::SetLockManager(LockManager *lock_manager) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (lock_manager == nullptr) {
+    return Status::InvalidArgument("BufferPoolManager requires a LockManager");
+  }
+  if (lock_manager_bound_ && lock_manager_ != lock_manager) {
+    return Status::InvalidArgument("BufferPoolManager lock binding cannot be changed");
+  }
+  lock_manager_ = lock_manager;
+  lock_manager_bound_ = true;
+  return Status::Ok();
+}
+
+Status BufferPoolManager::AcquirePageLock(page_id_t page_id, Transaction *transaction,
+                                           LockMode mode) {
+  if (transaction == nullptr) return Status::Ok();
+  if (!transaction->IsUsableForWork()) {
+    return Status::InvalidArgument("transactional page access requires an Active transaction");
+  }
+
+  LockManager *lock_manager = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (lock_manager_bound_) lock_manager = lock_manager_;
+  }
+  // Keep the legacy single-threaded transactional API usable until its caller
+  // explicitly binds a LockManager. Once bound, every transactional page
+  // access goes through the same manager.
+  if (lock_manager == nullptr) return Status::Ok();
+  return lock_manager->LockPage(transaction, page_id, mode);
+}
+
 Status BufferPoolManager::RestorePage(page_id_t page_id, const Page &page,
                                       bool write_disk) {
   if (page_id == INVALID_PAGE_ID || page_id == 0) {
@@ -1407,13 +1440,20 @@ Status BufferPoolManager::RecordGuardUpdate(
   }
 
   LogRecord record;
-  record.type = LogRecordType::PageUpdate;
-  record.txn_id = transaction->id();
-  record.prev_lsn = transaction->last_lsn();
-  record.page_id = page_id;
-  record.before_image.assign(before.begin(), before.end());
-  record.after_image.assign(after.begin(), after.end());
-  auto append = log_manager_->Append(std::move(record));
+  Result<lsn_t> append(Status::InternalError("PageUpdate WAL was not attempted"));
+  {
+    // A transaction may hold several write guards at once. Serializing only
+    // its log-chain update keeps prev_lsn correct without serializing peers.
+    std::lock_guard<std::mutex> transaction_lock(transaction->mutex_);
+    record.type = LogRecordType::PageUpdate;
+    record.txn_id = transaction->id_;
+    record.prev_lsn = transaction->last_lsn_;
+    record.page_id = page_id;
+    record.before_image.assign(before.begin(), before.end());
+    record.after_image.assign(after.begin(), after.end());
+    append = log_manager_->Append(std::move(record));
+    if (append.ok()) transaction->last_lsn_ = append.value();
+  }
   if (!append.ok()) {
     const bool restored = restore_before_image();
     transaction->MarkFailed();
@@ -1441,7 +1481,6 @@ Status BufferPoolManager::RecordGuardUpdate(
     }
     return Status::InternalError("WritePageGuard frame changed after WAL append");
   }
-  transaction->SetLastLsn(append.value());
   if (logged != nullptr) *logged = true;
   return Status::Ok();
 }
@@ -1463,23 +1502,29 @@ Status BufferPoolManager::AppendPageFreeLog(page_id_t page_id, Transaction *tran
   if (!transaction->IsUsableForWork()) {
     return Status::InvalidArgument("page deletion requires an Active transaction");
   }
-  if (std::find(transaction->deferred_free_pages().begin(),
-                transaction->deferred_free_pages().end(), page_id) !=
-      transaction->deferred_free_pages().end()) {
-    return Status::AlreadyExists("page deletion is already logged: " + std::to_string(page_id));
-  }
   LogRecord record;
-  record.type = LogRecordType::PageFree;
-  record.txn_id = transaction->id();
-  record.prev_lsn = transaction->last_lsn();
-  record.page_id = page_id;
-  auto append = log_manager_->Append(std::move(record));
+  Result<lsn_t> append(Status::InternalError("PageFree WAL was not attempted"));
+  {
+    std::lock_guard<std::mutex> transaction_lock(transaction->mutex_);
+    if (std::find(transaction->deferred_free_pages_.begin(),
+                  transaction->deferred_free_pages_.end(), page_id) !=
+        transaction->deferred_free_pages_.end()) {
+      return Status::AlreadyExists("page deletion is already logged: " + std::to_string(page_id));
+    }
+    record.type = LogRecordType::PageFree;
+    record.txn_id = transaction->id_;
+    record.prev_lsn = transaction->last_lsn_;
+    record.page_id = page_id;
+    append = log_manager_->Append(std::move(record));
+    if (append.ok()) {
+      transaction->last_lsn_ = append.value();
+      transaction->deferred_free_pages_.push_back(page_id);
+    }
+  }
   if (!append.ok()) {
     transaction->MarkFailed();
     return append.status();
   }
-  transaction->SetLastLsn(append.value());
-  transaction->AddDeferredFreePage(page_id);
   return Status::Ok();
 }
 
@@ -1755,12 +1800,21 @@ Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id) {
     return Result<ReadPageGuard>(ReadPageGuard(this, frame_id, page_id, &frame.latch));
   }
   }
+Result<ReadPageGuard> BufferPoolManager::FetchPage(page_id_t page_id,
+                                                    Transaction *transaction) {
+  const auto lock_status = AcquirePageLock(page_id, transaction, LockMode::S);
+  if (!lock_status.ok()) return Result<ReadPageGuard>(lock_status);
+  return FetchPage(page_id);
+}
+
 Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id) {
   return FetchPageWrite(page_id, nullptr);
 }
 
 Result<WritePageGuard> BufferPoolManager::FetchPageWrite(page_id_t page_id,
                                                          Transaction *transaction) {
+  const auto lock_status = AcquirePageLock(page_id, transaction, LockMode::X);
+  if (!lock_status.ok()) return Result<WritePageGuard>(lock_status);
   std::unique_lock<std::mutex> lock(mutex_);
   auto ready = EnsureReadyUnlocked();
   if (!ready.ok()) return Result<WritePageGuard>(ready);
@@ -1933,6 +1987,19 @@ Result<WritePageGuard> BufferPoolManager::NewPage(Transaction *transaction) {
   }
 
   if (write_status.ok() && allocated.ok() && transaction != nullptr) {
+    const auto page_lock = AcquirePageLock(allocated.value(), transaction, LockMode::X);
+    if (!page_lock.ok()) {
+      const auto release_status = disk_manager_->DeallocatePage(allocated.value());
+      allocated = release_status.ok()
+                      ? Result<page_id_t>(page_lock)
+                      : Result<page_id_t>(Status::IOError(
+                            "new page lock failed and page cleanup failed: " +
+                            page_lock.message() + "; " + release_status.message()));
+      transaction->MarkFailed();
+    }
+  }
+
+  if (write_status.ok() && allocated.ok() && transaction != nullptr) {
     if (log_manager_ == nullptr) {
       (void)disk_manager_->DeallocatePage(allocated.value());
       allocated = Result<page_id_t>(Status::InvalidArgument(
@@ -1940,18 +2007,29 @@ Result<WritePageGuard> BufferPoolManager::NewPage(Transaction *transaction) {
       transaction->MarkFailed();
     } else {
       LogRecord record;
-      record.type = LogRecordType::PageAllocate;
-      record.txn_id = transaction->id();
-      record.prev_lsn = transaction->last_lsn();
-      record.page_id = allocated.value();
-      auto append = log_manager_->Append(std::move(record));
+      Result<lsn_t> append(Status::InternalError("PageAllocate WAL was not attempted"));
+      {
+        // Keep this transaction's prev_lsn chain contiguous while allowing
+        // other transactions to append their own records concurrently.
+        std::lock_guard<std::mutex> transaction_lock(transaction->mutex_);
+        record.type = LogRecordType::PageAllocate;
+        record.txn_id = transaction->id_;
+        record.prev_lsn = transaction->last_lsn_;
+        record.page_id = allocated.value();
+        append = log_manager_->Append(std::move(record));
+        if (append.ok()) {
+          transaction->last_lsn_ = append.value();
+          transaction->allocated_pages_.push_back(allocated.value());
+        }
+      }
       if (!append.ok()) {
-        (void)disk_manager_->DeallocatePage(allocated.value());
-        allocated = Result<page_id_t>(append.status());
+        const auto release_status = disk_manager_->DeallocatePage(allocated.value());
+        allocated = release_status.ok()
+                        ? Result<page_id_t>(append.status())
+                        : Result<page_id_t>(Status::IOError(
+                              "PageAllocate WAL failed and page cleanup failed: " +
+                              append.status().message() + "; " + release_status.message()));
         transaction->MarkFailed();
-      } else {
-        transaction->SetLastLsn(append.value());
-        transaction->AddAllocatedPage(allocated.value());
       }
     }
   }
@@ -2137,15 +2215,16 @@ Status BufferPoolManager::DeletePage(page_id_t page_id) {
 
 Status BufferPoolManager::DeletePage(page_id_t page_id, Transaction *transaction) {
   if (transaction == nullptr) return DeletePage(page_id);
-  if (!transaction->IsUsableForWork()) {
-    return Status::InvalidArgument("DeletePage requires an Active transaction");
-  }
+  const auto lock_status = AcquirePageLock(page_id, transaction, LockMode::X);
+  if (!lock_status.ok()) return lock_status;
+  bool deletion_pending = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (delete_pending_pages_.find(page_id) != delete_pending_pages_.end()) {
-      // HeapTable may reserve a page while its last guard is still held.
-      return AppendPageFreeLog(page_id, transaction);
-    }
+    deletion_pending = delete_pending_pages_.find(page_id) != delete_pending_pages_.end();
+  }
+  if (deletion_pending) {
+    // HeapTable may reserve a page while its last guard is still held.
+    return AppendPageFreeLog(page_id, transaction);
   }
   auto begin = BeginPageDeletion(page_id);
   if (!begin.ok()) return begin;
@@ -2304,17 +2383,18 @@ Status BufferPoolManager::DeletePages(const std::vector<page_id_t> &page_ids,
   std::unordered_set<page_id_t> seen;
   for (const auto page_id : page_ids) {
     if (!seen.insert(page_id).second) {
+      transaction->MarkFailed();
       return Status::InvalidArgument("DeletePages contains a duplicate page");
     }
   }
-  std::vector<page_id_t> reserved;
   for (const auto page_id : page_ids) {
     auto status = DeletePage(page_id, transaction);
     if (!status.ok()) {
-      for (const auto reserved_id : reserved) (void)CancelPageDeletion(reserved_id);
+      // PageFree records and DeletePending state for earlier pages belong to
+      // this transaction. Keep them until Abort can undo the whole batch.
+      transaction->MarkFailed();
       return status;
     }
-    reserved.push_back(page_id);
   }
   return Status::Ok();
 }

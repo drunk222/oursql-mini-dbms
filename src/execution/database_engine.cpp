@@ -149,9 +149,11 @@ Status DatabaseEngine::Close() {
   }
   Status first_error = Status::Ok();
   if (transaction_manager_.HasActive()) {
-    if (transaction_manager_.Active()->state() == TransactionState::Committed) {
-      // COMMIT is irreversible. Keep the WAL available if deferred cleanup still fails.
-      first_error = transaction_manager_.FinalizeCommittedCleanup();
+    const auto state = transaction_manager_.Active()->state();
+    if (state == TransactionState::Committed || state == TransactionState::CommitUncertain) {
+      // COMMIT is irreversible. Commit() retries uncertain WAL durability or
+      // only retries deferred cleanup for an already committed transaction.
+      first_error = transaction_manager_.Commit();
     } else {
       first_error = RollbackAndReloadCatalog();
     }
@@ -197,9 +199,8 @@ Status DatabaseEngine::Flush() {
 Status DatabaseEngine::Checkpoint() {
   if (!init_status_.ok()) return Contextualize("DatabaseEngine", init_status_);
   if (closed_) return Status::InvalidArgument("DatabaseEngine is closed");
-  if (transaction_manager_.HasActive()) {
-    return Status::InvalidArgument("checkpoint requires no active transaction");
-  }
+  const auto transaction_status = transaction_manager_.ValidateCheckpointAllowed();
+  if (!transaction_status.ok()) return transaction_status;
   auto status = log_manager_.Flush(log_manager_.GetAppendLsn());
   if (!status.ok()) return status;
   status = buffer_pool_.FlushAllPages();
@@ -287,7 +288,7 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
           return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
               "failed transaction only allows ROLLBACK"));
         }
-        if (state == TransactionState::Committed &&
+        if ((state == TransactionState::Committed || state == TransactionState::CommitUncertain) &&
             transaction_command != TransactionCommand::Commit) {
           return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
               "committed transaction cleanup only allows COMMIT retry"));
@@ -377,7 +378,8 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
       if (!commit.ok()) {
         const Status commit_error = Contextualize("Transaction", commit);
         if (transaction_manager_.HasActive() &&
-            transaction_manager_.Active()->state() != TransactionState::Committed) {
+            transaction_manager_.Active()->state() != TransactionState::Committed &&
+            transaction_manager_.Active()->state() != TransactionState::CommitUncertain) {
           auto rollback = RollbackAndReloadCatalog();
           if (!rollback.ok()) {
             return Result<std::vector<ExecutionResult>>(

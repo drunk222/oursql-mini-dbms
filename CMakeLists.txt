@@ -29,6 +29,7 @@ add_library(oursql_core
   src/storage/storage.cpp
   src/storage/log_manager.cpp
   src/transaction/transaction.cpp
+  src/transaction/lock_manager.cpp
   src/transaction/transaction_manager.cpp
   src/recovery/recovery_manager.cpp
   src/index/b_plus_tree_page.cpp
@@ -81,6 +82,9 @@ target_link_libraries(oursql_b_plus_tree_tests PRIVATE oursql_core)
 add_executable(oursql_transaction_tests tests/transaction_tests.cpp)
 target_link_libraries(oursql_transaction_tests PRIVATE oursql_core)
 
+add_executable(oursql_concurrent_transaction_tests tests/concurrent_transaction_tests.cpp)
+target_link_libraries(oursql_concurrent_transaction_tests PRIVATE oursql_core)
+
 add_executable(oursql_benchmark benchmarks/storage_benchmark.cpp)
 target_link_libraries(oursql_benchmark PRIVATE oursql_core)
 
@@ -99,3 +103,4 @@ add_test(NAME oursql_execution_tests COMMAND oursql_execution_tests)
 add_test(NAME oursql_edge_case_tests COMMAND oursql_edge_case_tests)
 add_test(NAME oursql_b_plus_tree_tests COMMAND oursql_b_plus_tree_tests)
 add_test(NAME oursql_transaction_tests COMMAND oursql_transaction_tests)
+add_test(NAME oursql_concurrent_transaction_tests COMMAND oursql_concurrent_transaction_tests)

@@ -640,9 +640,10 @@ bool TestCommitUncertain(const std::filesystem::path &database) {
   oursql::BufferPoolManager pool(2, &disk);
   if (!Check(pool.SetLogManager(&log).ok(), "CommitUncertain WAL binding")) return false;
   oursql::TransactionManager transactions(&log, &pool, &disk);
-  auto begin = transactions.Begin(true);
+  auto begin = transactions.Begin();
   if (!Check(begin.ok(), "CommitUncertain begin")) return false;
-  auto page = pool.NewPage(begin.value());
+  const auto transaction = begin.value();
+  auto page = pool.NewPage(transaction.get());
   if (!Check(page.ok(), "CommitUncertain page allocation")) return false;
   page.value().Data()[0] = std::byte{0x7a};
   if (!Check(page.value().MarkDirty().ok() && page.value().Release().ok(),
@@ -651,23 +652,23 @@ bool TestCommitUncertain(const std::filesystem::path &database) {
   }
 
   log.FailNextFlushForTesting();
-  const auto first_commit = transactions.Commit(begin.value());
+  const auto first_commit = transactions.Commit(transaction);
   const bool uncertain = Check(!first_commit.ok(), "CommitUncertain first commit fails") &&
-                         Check(begin.value()->state() == oursql::TransactionState::CommitUncertain,
+                         Check(transaction->state() == oursql::TransactionState::CommitUncertain,
                                "failed COMMIT flush enters CommitUncertain") &&
-                         Check(begin.value()->commit_lsn() != oursql::kInvalidLsn,
+                         Check(transaction->commit_lsn() != oursql::kInvalidLsn,
                                "CommitUncertain preserves commit LSN") &&
-                         Check(!transactions.Abort(begin.value()).ok(),
+                         Check(!transactions.Abort(transaction).ok(),
                                "CommitUncertain cannot be aborted") &&
-                         Check(transactions.GetTransaction(begin.value()->id()) != nullptr,
+                         Check(transactions.GetTransaction(transaction->id()) != nullptr,
                                "CommitUncertain remains owned for retry");
   if (!uncertain) return false;
 
-  const auto retry = transactions.Commit(begin.value());
+  const auto retry = transactions.Commit(transaction);
   if (!Check(retry.ok(), "CommitUncertain COMMIT retry succeeds") ||
-      !Check(begin.value()->state() == oursql::TransactionState::Committed,
+      !Check(transaction->state() == oursql::TransactionState::Committed,
              "successful retry enters Committed") ||
-      !Check(transactions.GetTransaction(begin.value()->id()) == nullptr,
+      !Check(transactions.GetTransaction(transaction->id()) == nullptr,
              "committed transaction cleanup removes transaction")) {
     return false;
   }
@@ -675,7 +676,7 @@ bool TestCommitUncertain(const std::filesystem::path &database) {
   std::size_t commit_count = 0;
   if (records.ok()) {
     for (const auto &record : records.value()) {
-      if (record.txn_id == begin.value()->id() &&
+      if (record.txn_id == transaction->id() &&
           record.type == oursql::LogRecordType::Commit) {
         ++commit_count;
       }

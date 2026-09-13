@@ -5,12 +5,18 @@
 #include "oursql/planner/planner.h"
 #include "oursql/recovery/recovery_manager.h"
 #include "oursql/storage/log_manager.h"
+#include "oursql/transaction/lock_manager.h"
 #include "oursql/transaction/transaction_manager.h"
 
-#include <filesystem>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace oursql {
@@ -23,6 +29,22 @@ struct DatabaseStatistics {
   std::uint64_t evictions{0};
   std::uint64_t disk_reads{0};
   std::uint64_t disk_writes{0};
+};
+
+using session_id_t = std::uint64_t;
+
+// 调用者：DatabaseEngine 和会话客户端；作用：保存一个客户端的执行串行化状态
+// 与当前事务；返回：可跨线程传递的会话句柄。current_transaction 只在持有
+// execute_mutex 时读写。
+struct SessionContext {
+  session_id_t session_id{0};
+  std::shared_ptr<Transaction> current_transaction;
+  // A 层记录已申请的表锁强度，用于安全执行 S->SIX/IX->SIX 等合法升级。
+  // 该表只在持有 execute_mutex 时读写，并在事务终结后清空。
+  std::unordered_map<table_id_t, TableLockMode> table_lock_modes;
+  std::optional<TableLockMode> schema_lock_mode;
+  std::mutex execute_mutex;
+  std::atomic<bool> closed{false};
 };
 
 class DatabaseEngine {
@@ -61,12 +83,31 @@ class DatabaseEngine {
   [[nodiscard]] Result<std::vector<ExecutionResult>> ExecuteSqlBatch(std::string_view sql);
   // 调用者：命令行或客户端；作用：编译并执行多条 SQL；返回：最后一条结果或执行错误。
   [[nodiscard]] Result<ExecutionResult> ExecuteSql(std::string_view sql);
+  // 调用者：并发客户端；作用：创建一个独立 Session；返回：会话句柄或引擎错误。
+  [[nodiscard]] Result<std::shared_ptr<SessionContext>> CreateSession();
+  // 调用者：并发客户端；作用：结束 Session 并回滚/终结其事务；返回：关闭状态。
+  [[nodiscard]] Status CloseSession(const std::shared_ptr<SessionContext> &session);
+  // 调用者：并发客户端；作用：在指定 Session 内编译并执行多条 SQL；返回：结果序列。
+  [[nodiscard]] Result<std::vector<ExecutionResult>> ExecuteSqlBatch(
+      const std::shared_ptr<SessionContext> &session, std::string_view sql);
+  // 调用者：并发客户端；作用：在指定 Session 内执行 SQL；返回：最后一条结果。
+  [[nodiscard]] Result<ExecutionResult> ExecuteSql(
+      const std::shared_ptr<SessionContext> &session, std::string_view sql);
 
  private:
-  [[nodiscard]] Status RollbackAndReloadCatalog();
+  [[nodiscard]] Result<std::vector<ExecutionResult>> ExecuteSqlBatchLocked(
+      const std::shared_ptr<SessionContext> &session, std::string_view sql);
+  [[nodiscard]] Status FinishSessionTransaction(
+      const std::shared_ptr<SessionContext> &session);
+  [[nodiscard]] Status AcquireStatementLocks(
+      const std::shared_ptr<SessionContext> &session, const Plan &plan,
+      Transaction *transaction);
+  [[nodiscard]] bool IsSessionOpen(
+      const std::shared_ptr<SessionContext> &session) const;
 
   DiskManager disk_manager_;
   LogManager log_manager_;
+  LockManager lock_manager_;
   BufferPoolManager buffer_pool_;
   TransactionManager transaction_manager_;
   RecoveryManager recovery_manager_;
@@ -75,7 +116,11 @@ class DatabaseEngine {
   Planner planner_;
   ExecutionEngine execution_engine_;
   Status init_status_;
-  bool closed_{false};
+  std::atomic<bool> closed_{false};
+  mutable std::mutex sessions_mutex_;
+  session_id_t next_session_id_{1};
+  std::unordered_map<session_id_t, std::shared_ptr<SessionContext>> sessions_;
+  std::shared_ptr<SessionContext> default_session_;
 };
 
 }  // namespace oursql

@@ -1,8 +1,10 @@
+#include "oursql/execution/database_engine.h"
 #include "oursql/storage/log_manager.h"
 #include "oursql/storage/storage.h"
 #include "oursql/transaction/lock_manager.h"
 #include "oursql/transaction/transaction_manager.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -782,6 +784,526 @@ bool TestConcurrentWalFlush() {
   return flushed && closed;
 }
 
+bool TestSessionLifecycleAndAutocommit() {
+  TempFiles files;
+  oursql::DatabaseEngine engine(files.database, 8);
+  if (!Check(engine.GetInitStatus().ok(), "session test engine should open") ||
+      !Check(engine.ExecuteSql(
+                 "CREATE TABLE first_table(id INT, name VARCHAR(32));"
+                 "CREATE TABLE second_table(id INT, name VARCHAR(32));")
+                 .ok(),
+             "session test table setup")) {
+    return false;
+  }
+
+  auto first = engine.CreateSession();
+  auto second = engine.CreateSession();
+  if (!Check(first.ok() && second.ok(), "two sessions should be created") ||
+      !Check(first.value()->session_id != second.value()->session_id,
+             "sessions should have unique ids")) {
+    return false;
+  }
+
+  std::vector<oursql::Status> begin_status(
+      2, oursql::Status::InternalError("session begin not finished"));
+  StartGate begin_gate(2);
+  std::thread first_begin([&] {
+    begin_gate.Wait();
+    auto result = engine.ExecuteSql(first.value(), "BEGIN;");
+    begin_status[0] = result.ok() ? oursql::Status::Ok() : result.status();
+  });
+  std::thread second_begin([&] {
+    begin_gate.Wait();
+    auto result = engine.ExecuteSql(second.value(), "BEGIN;");
+    begin_status[1] = result.ok() ? oursql::Status::Ok() : result.status();
+  });
+  first_begin.join();
+  second_begin.join();
+  if (!Check(begin_status[0].ok() && begin_status[1].ok(),
+             "two sessions should begin independently") ||
+      !Check(first.value()->current_transaction != nullptr &&
+                 second.value()->current_transaction != nullptr &&
+                 first.value()->current_transaction->id() !=
+                     second.value()->current_transaction->id(),
+             "two sessions should own distinct transactions")) {
+    return false;
+  }
+
+  auto nested = engine.ExecuteSql(first.value(), "BEGIN;");
+  if (!Check(!nested.ok() &&
+                 nested.status().code() == oursql::ErrorCode::AlreadyExists,
+             "same session nested BEGIN should be rejected")) {
+    return false;
+  }
+  if (!Check(engine.ExecuteSql(first.value(), "ROLLBACK;").ok() &&
+                 engine.ExecuteSql(second.value(), "ROLLBACK;").ok(),
+             "session transactions should roll back")) {
+    return false;
+  }
+
+  // Hold the session execution mutex while another worker calls ExecuteSql.
+  // This verifies that one session cannot run two SQL statements in parallel.
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  bool started = false;
+  bool finished = false;
+  oursql::Result<oursql::ExecutionResult> serialized =
+      oursql::Result<oursql::ExecutionResult>(
+          oursql::Status::InternalError("serialized query not finished"));
+  std::unique_lock<std::mutex> session_guard(first.value()->execute_mutex);
+  std::thread serialized_worker([&] {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      started = true;
+      state_changed.notify_all();
+    }
+    serialized = engine.ExecuteSql(first.value(), "SELECT * FROM first_table;");
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      finished = true;
+      state_changed.notify_all();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    if (!Check(state_changed.wait_for(lock, 1s, [&] { return started; }),
+               "serialized session worker should start")) {
+      session_guard.unlock();
+      serialized_worker.join();
+      return false;
+    }
+    const bool finished_early =
+        state_changed.wait_for(lock, 50ms, [&] { return finished; });
+    if (!Check(!finished_early,
+               "same-session SQL must wait for execute_mutex")) {
+      session_guard.unlock();
+      serialized_worker.join();
+      return false;
+    }
+  }
+  session_guard.unlock();
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    if (!Check(state_changed.wait_for(lock, 1s, [&] { return finished; }),
+               "serialized session worker should finish after unlock")) {
+      serialized_worker.join();
+      return false;
+    }
+  }
+  serialized_worker.join();
+  if (!Check(serialized.ok(), "serialized session SELECT should succeed")) {
+    return false;
+  }
+
+  std::vector<oursql::Status> write_status(
+      2, oursql::Status::InternalError("autocommit write not finished"));
+  StartGate write_gate(2);
+  std::thread first_write([&] {
+    write_gate.Wait();
+    write_status[0] =
+        engine.ExecuteSql(first.value(),
+                          "INSERT INTO first_table VALUES(1, 'first');")
+                .ok()
+            ? oursql::Status::Ok()
+            : oursql::Status::InternalError("first autocommit failed");
+  });
+  std::thread second_write([&] {
+    write_gate.Wait();
+    write_status[1] =
+        engine.ExecuteSql(second.value(),
+                          "INSERT INTO second_table VALUES(1, 'second');")
+                .ok()
+            ? oursql::Status::Ok()
+            : oursql::Status::InternalError("second autocommit failed");
+  });
+  first_write.join();
+  second_write.join();
+  const bool writes_ok =
+      Check(write_status[0].ok() && write_status[1].ok(),
+            "autocommit writes to different tables should both finish") &&
+      Check(first.value()->current_transaction == nullptr &&
+                second.value()->current_transaction == nullptr,
+            "autocommit should clear each session transaction");
+  const auto first_rows =
+      engine.ExecuteSql(first.value(), "SELECT * FROM first_table;");
+  const auto second_rows =
+      engine.ExecuteSql(second.value(), "SELECT * FROM second_table;");
+  const bool rows_ok =
+      Check(first_rows.ok() && first_rows.value().rows.size() == 1,
+            "first autocommit row should be visible") &&
+      Check(second_rows.ok() && second_rows.value().rows.size() == 1,
+            "second autocommit row should be visible");
+  const bool closed = Check(engine.CloseSession(first.value()).ok() &&
+                                engine.CloseSession(second.value()).ok(),
+                            "sessions should close") &&
+                      Check(engine.Close().ok(), "session test engine close");
+  return writes_ok && rows_ok && closed;
+}
+
+bool TestFailedSessionAndAutocommitRollback() {
+  TempFiles files;
+  oursql::DatabaseEngine engine(files.database, 8);
+  if (!Check(engine.GetInitStatus().ok(), "failed-session engine should open") ||
+      !Check(engine.ExecuteSql(
+                 "CREATE TABLE student(id INT, name VARCHAR(32));"
+                 "INSERT INTO student VALUES(1, 'Alice');"
+                 "CREATE UNIQUE INDEX idx_student_id ON student(id);")
+                 .ok(),
+             "failed-session setup")) {
+    return false;
+  }
+  auto session = engine.CreateSession();
+  if (!Check(session.ok(), "failed-session create")) return false;
+
+  if (!Check(engine.ExecuteSql(session.value(), "BEGIN;").ok(),
+             "failed-session begin")) {
+    return false;
+  }
+  auto bad = engine.ExecuteSql(session.value(), "SELECT FROM student;");
+  if (!Check(!bad.ok(), "parser error should fail the session transaction") ||
+      !Check(session.value()->current_transaction->state() ==
+                 oursql::TransactionState::Failed,
+             "failed-session state should be Failed")) {
+    return false;
+  }
+  const auto select_failed =
+      engine.ExecuteSql(session.value(), "SELECT * FROM student;");
+  const auto insert_failed = engine.ExecuteSql(
+      session.value(), "INSERT INTO student VALUES(2, 'blocked');");
+  const auto ddl_failed =
+      engine.ExecuteSql(session.value(), "CREATE TABLE blocked(id INT);");
+  const auto commit_failed = engine.ExecuteSql(session.value(), "COMMIT;");
+  const auto begin_failed = engine.ExecuteSql(session.value(), "BEGIN;");
+  if (!Check(!select_failed.ok() && !insert_failed.ok() && !ddl_failed.ok() &&
+                 !commit_failed.ok() && !begin_failed.ok(),
+             "Failed transaction should reject SQL, DDL, COMMIT and BEGIN") ||
+      !Check(engine.ExecuteSql(session.value(), "ROLLBACK;").ok(),
+             "Failed transaction should allow ROLLBACK")) {
+    return false;
+  }
+
+  auto duplicate = engine.ExecuteSql(
+      session.value(), "INSERT INTO student VALUES(1, 'duplicate');");
+  if (!Check(!duplicate.ok() &&
+                 duplicate.status().code() == oursql::ErrorCode::AlreadyExists,
+             "autocommit index failure should be reported") ||
+      !Check(session.value()->current_transaction == nullptr,
+             "failed autocommit transaction should be cleaned up")) {
+    return false;
+  }
+  auto rows = engine.ExecuteSql(session.value(), "SELECT id, name FROM student;");
+  const bool rolled_back =
+      Check(rows.ok() && rows.value().rows.size() == 1 &&
+                rows.value().rows[0][0].AsInt() == 1,
+            "autocommit failure must roll back both Heap and index");
+  return rolled_back && Check(engine.CloseSession(session.value()).ok(),
+                              "failed-session close") &&
+         Check(engine.Close().ok(), "failed-session engine close");
+}
+
+bool TestExactIndexUpdateLocks() {
+  TempFiles files;
+  oursql::DatabaseEngine engine(files.database, 32);
+  const std::string payload(2800, 'x');
+  if (!Check(engine.GetInitStatus().ok(), "exact-index engine should open") ||
+      !Check(engine.ExecuteSql(
+                 "CREATE TABLE student(id INT, payload VARCHAR(3000));")
+                 .ok(),
+             "exact-index table setup") ||
+      !Check(engine.ExecuteSql(
+                 "INSERT INTO student VALUES(1, '" + payload + "');")
+                 .ok(),
+             "exact-index first row") ||
+      !Check(engine.ExecuteSql(
+                 "INSERT INTO student VALUES(2, '" + payload + "');")
+                 .ok(),
+             "exact-index second row") ||
+      !Check(engine.ExecuteSql(
+                 "CREATE UNIQUE INDEX idx_student_id ON student(id);")
+                 .ok(),
+             "exact-index index setup")) {
+    return false;
+  }
+
+  auto first_rid = engine.ExecuteSql("SELECT id FROM student WHERE id = 1;");
+  auto second_rid = engine.ExecuteSql("SELECT id FROM student WHERE id = 2;");
+  if (!Check(first_rid.ok() && second_rid.ok() &&
+                 first_rid.value().rids.size() == 1 &&
+                 second_rid.value().rids.size() == 1 &&
+                 first_rid.value().rids[0].page_id !=
+                     second_rid.value().rids[0].page_id,
+             "fixture rows should reside on different data pages")) {
+    return false;
+  }
+  auto first = engine.CreateSession();
+  auto second = engine.CreateSession();
+  if (!Check(first.ok() && second.ok(), "exact-index sessions should be created") ||
+      !Check(engine.ExecuteSql(first.value(), "BEGIN;").ok() &&
+                 engine.ExecuteSql(second.value(), "BEGIN;").ok(),
+             "exact-index sessions should begin")) {
+    return false;
+  }
+
+  std::vector<oursql::Status> parallel_status(
+      2, oursql::Status::InternalError("parallel update not finished"));
+  std::mutex parallel_mutex;
+  std::condition_variable parallel_changed;
+  std::size_t parallel_completed = 0;
+  std::vector<bool> parallel_done(2, false);
+  StartGate parallel_gate(2);
+  std::thread first_update([&] {
+    parallel_gate.Wait();
+    auto result = engine.ExecuteSql(
+        first.value(), "UPDATE student SET payload = 'first' WHERE id = 1;");
+    parallel_status[0] = result.ok() ? oursql::Status::Ok() : result.status();
+    {
+      std::lock_guard<std::mutex> lock(parallel_mutex);
+      parallel_done[0] = true;
+      ++parallel_completed;
+      parallel_changed.notify_all();
+    }
+  });
+  std::thread second_update([&] {
+    parallel_gate.Wait();
+    auto result = engine.ExecuteSql(
+        second.value(), "UPDATE student SET payload = 'second' WHERE id = 2;");
+    parallel_status[1] = result.ok() ? oursql::Status::Ok() : result.status();
+    {
+      std::lock_guard<std::mutex> lock(parallel_mutex);
+      parallel_done[1] = true;
+      ++parallel_completed;
+      parallel_changed.notify_all();
+    }
+  });
+  const auto has_key_and_page_locks = [](const std::shared_ptr<oursql::Transaction> &transaction) {
+    bool has_key = false;
+    bool has_page = false;
+    for (const auto &lock : transaction->GrantedLocksSnapshot()) {
+      if (lock.type == oursql::LockResourceType::IndexKey) has_key = true;
+      if (lock.type == oursql::LockResourceType::Page) has_page = true;
+    }
+    return has_key && has_page;
+  };
+  const auto lock_deadline = std::chrono::steady_clock::now() + 2s;
+  while ((!has_key_and_page_locks(first.value()->current_transaction) ||
+          !has_key_and_page_locks(second.value()->current_transaction)) &&
+         std::chrono::steady_clock::now() < lock_deadline) {
+    std::this_thread::yield();
+  }
+  if (!Check(has_key_and_page_locks(first.value()->current_transaction) &&
+                 has_key_and_page_locks(second.value()->current_transaction),
+             "different-page updates should concurrently hold key and page locks")) {
+    return false;
+  }
+  {
+    std::unique_lock<std::mutex> lock(parallel_mutex);
+    if (!Check(parallel_changed.wait_for(
+                   lock, 1s, [&] { return parallel_completed != 0; }),
+               "one exact-index update should finish without a table X lock")) {
+      return false;
+    }
+  }
+  bool first_completed_first = false;
+  {
+    std::lock_guard<std::mutex> lock(parallel_mutex);
+    first_completed_first = parallel_done[0];
+  }
+  if (first_completed_first) {
+    if (!Check(engine.ExecuteSql(first.value(), "COMMIT;").ok(),
+               "first parallel exact-index update commit")) {
+      return false;
+    }
+  } else if (!Check(engine.ExecuteSql(second.value(), "COMMIT;").ok(),
+                    "second parallel exact-index update commit")) {
+    return false;
+  }
+  {
+    std::unique_lock<std::mutex> lock(parallel_mutex);
+    if (!Check(parallel_changed.wait_for(
+                   lock, 1s, [&] { return parallel_completed == 2; }),
+               "both exact-index updates should finish after first commit")) {
+      return false;
+    }
+  }
+  if (first_completed_first) {
+    if (!Check(engine.ExecuteSql(second.value(), "COMMIT;").ok(),
+               "second parallel exact-index update commit")) {
+      return false;
+    }
+  } else if (!Check(engine.ExecuteSql(first.value(), "COMMIT;").ok(),
+                    "first parallel exact-index update commit")) {
+    return false;
+  }
+  first_update.join();
+  second_update.join();
+  if (!Check(parallel_status[0].ok() && parallel_status[1].ok(),
+             "different data-page updates should both complete")) {
+    return false;
+  }
+  if (!Check(engine.ExecuteSql(first.value(), "BEGIN;").ok() &&
+                 engine.ExecuteSql(second.value(), "BEGIN;").ok(),
+             "conflict sessions should begin")) {
+    return false;
+  }
+  auto holding = engine.ExecuteSql(
+      first.value(), "UPDATE student SET payload = 'holder' WHERE id = 1;");
+  if (!Check(holding.ok(), "conflict holder update should succeed")) return false;
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  bool waiter_started = false;
+  bool waiter_finished = false;
+  oursql::Status waiter_status =
+      oursql::Status::InternalError("conflict waiter not finished");
+  std::thread waiter([&] {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      waiter_started = true;
+      state_changed.notify_all();
+    }
+    auto result = engine.ExecuteSql(
+        second.value(), "UPDATE student SET payload = 'waiter' WHERE id = 1;");
+    waiter_status = result.ok() ? oursql::Status::Ok() : result.status();
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      waiter_finished = true;
+      state_changed.notify_all();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    if (!Check(state_changed.wait_for(lock, 1s, [&] { return waiter_started; }),
+               "conflict waiter should start")) {
+      (void)engine.ExecuteSql(first.value(), "ROLLBACK;");
+      (void)engine.ExecuteSql(second.value(), "ROLLBACK;");
+      waiter.join();
+      return false;
+    }
+    const bool finished_early =
+        state_changed.wait_for(lock, 75ms, [&] { return waiter_finished; });
+    if (!Check(!finished_early,
+               "same index key update should wait for the first transaction")) {
+      (void)engine.ExecuteSql(first.value(), "ROLLBACK;");
+      waiter.join();
+      (void)engine.ExecuteSql(second.value(), "ROLLBACK;");
+      return false;
+    }
+  }
+  if (!Check(engine.ExecuteSql(first.value(), "COMMIT;").ok(),
+             "conflict holder should commit")) {
+    (void)engine.ExecuteSql(first.value(), "ROLLBACK;");
+    waiter.join();
+    (void)engine.ExecuteSql(second.value(), "ROLLBACK;");
+    return false;
+  }
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    if (!Check(state_changed.wait_for(lock, 1s, [&] { return waiter_finished; }),
+               "conflict waiter should resume after COMMIT")) {
+      waiter.join();
+      (void)engine.ExecuteSql(second.value(), "ROLLBACK;");
+      return false;
+    }
+  }
+  waiter.join();
+  const bool waiter_ok = Check(waiter_status.ok(),
+                               "conflict waiter update should succeed") &&
+                         Check(engine.ExecuteSql(second.value(), "COMMIT;").ok(),
+                               "conflict waiter should commit");
+  auto final_rows =
+      engine.ExecuteSql(second.value(), "SELECT payload FROM student WHERE id = 1;");
+  const bool final_ok =
+      Check(final_rows.ok() && final_rows.value().rows.size() == 1 &&
+                final_rows.value().rows[0][0].AsVarchar() == "waiter",
+            "committed waiter value should be visible");
+
+  const bool closed = Check(engine.CloseSession(first.value()).ok() &&
+                                engine.CloseSession(second.value()).ok(),
+                            "exact-index sessions should close") &&
+                      Check(engine.Close().ok(), "exact-index engine close");
+  return waiter_ok && final_ok && closed;
+}
+
+bool TestDdlWaitsForTargetDml() {
+  TempFiles files;
+  oursql::DatabaseEngine engine(files.database, 8);
+  if (!Check(engine.GetInitStatus().ok(), "DDL/DML engine should open") ||
+      !Check(engine.ExecuteSql("CREATE TABLE target(id INT);").ok(),
+             "DDL/DML table setup")) {
+    return false;
+  }
+  auto dml_session = engine.CreateSession();
+  auto ddl_session = engine.CreateSession();
+  if (!Check(dml_session.ok() && ddl_session.ok(), "DDL/DML sessions should be created") ||
+      !Check(engine.ExecuteSql(dml_session.value(), "BEGIN;").ok() &&
+                 engine.ExecuteSql(dml_session.value(),
+                                   "INSERT INTO target VALUES(1);")
+                     .ok(),
+             "DDL/DML holder transaction should start")) {
+    return false;
+  }
+
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  bool ddl_started = false;
+  bool ddl_finished = false;
+  oursql::Status ddl_status =
+      oursql::Status::InternalError("DDL worker not finished");
+  std::thread ddl_worker([&] {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      ddl_started = true;
+      state_changed.notify_all();
+    }
+    auto result = engine.ExecuteSql(ddl_session.value(), "DROP TABLE target;");
+    ddl_status = result.ok() ? oursql::Status::Ok() : result.status();
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      ddl_finished = true;
+      state_changed.notify_all();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    if (!Check(state_changed.wait_for(lock, 1s, [&] { return ddl_started; }),
+               "DDL worker should start")) {
+      (void)engine.ExecuteSql(dml_session.value(), "ROLLBACK;");
+      ddl_worker.join();
+      return false;
+    }
+    const bool finished_early =
+        state_changed.wait_for(lock, 75ms, [&] { return ddl_finished; });
+    if (!Check(!finished_early, "DDL should wait for target-table DML locks")) {
+      (void)engine.ExecuteSql(dml_session.value(), "ROLLBACK;");
+      ddl_worker.join();
+      return false;
+    }
+  }
+  if (!Check(engine.ExecuteSql(dml_session.value(), "COMMIT;").ok(),
+             "DDL holder transaction should commit")) {
+    (void)engine.ExecuteSql(dml_session.value(), "ROLLBACK;");
+    ddl_worker.join();
+    return false;
+  }
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    if (!Check(state_changed.wait_for(lock, 1s, [&] { return ddl_finished; }),
+               "DDL should resume after DML commit")) {
+      ddl_worker.join();
+      return false;
+    }
+  }
+  ddl_worker.join();
+  const bool dropped =
+      Check(ddl_status.ok(), "DDL should eventually succeed") &&
+      Check(!engine.ExecuteSql(ddl_session.value(), "SELECT * FROM target;").ok(),
+            "dropped table should no longer exist");
+  const bool closed = Check(engine.CloseSession(dml_session.value()).ok() &&
+                                engine.CloseSession(ddl_session.value()).ok(),
+                            "DDL/DML sessions should close") &&
+                      Check(engine.Close().ok(), "DDL/DML engine close");
+  return dropped && closed;
+}
+
 }  // namespace
 
 int main() {
@@ -793,6 +1315,10 @@ int main() {
   if (!TestBufferPoolPageLockIntegration()) ++failures;
   if (!TestInterleavedWalChains()) ++failures;
   if (!TestConcurrentWalFlush()) ++failures;
+  if (!TestSessionLifecycleAndAutocommit()) ++failures;
+  if (!TestFailedSessionAndAutocommitRollback()) ++failures;
+  if (!TestExactIndexUpdateLocks()) ++failures;
+  if (!TestDdlWaitsForTargetDml()) ++failures;
   if (failures == 0) {
     std::cout << "concurrent transaction tests passed\n";
     return 0;

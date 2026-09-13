@@ -28,6 +28,8 @@ class TransactionManager {
 
   // Caller: a Session coordinator. Starts one independent transaction.
   [[nodiscard]] Result<std::shared_ptr<Transaction>> Begin();
+  // Caller: a Session coordinator. Starts an implicit short transaction.
+  [[nodiscard]] Result<std::shared_ptr<Transaction>> BeginAutocommit();
   // Caller: the legacy single-session adapter. Starts a transaction and returns its pointer.
   [[nodiscard]] Result<Transaction *> Begin(bool explicit_transaction);
   // Caller: recovery/bootstrap. Sets the next id only while no transaction is active.

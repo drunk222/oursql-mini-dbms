@@ -1195,46 +1195,64 @@ bool TestTransactionCompilePlan() {
              "事务控制多语句应解析成功")) {
     return false;
   }
-  const std::vector<oursql::TransactionAction> expected{
-      oursql::TransactionAction::Begin,
-      oursql::TransactionAction::Commit,
-      oursql::TransactionAction::Rollback,
-  };
-  for (std::size_t i = 0; i < expected.size(); ++i) {
-    const auto &statement =
-        std::get<oursql::TransactionStatement>(parsed.value()[i]);
-    if (!Check(statement.action == expected[i],
-               "事务控制 AST action 应正确")) {
-      return false;
-    }
-    auto plan = planner.Build(parsed.value()[i], oursql::Catalog{});
-    if (!Check(plan.ok() &&
-                   std::holds_alternative<oursql::TransactionPlan>(
-                       plan.value()),
-               "事务控制应生成 TransactionPlan")) {
-      return false;
-    }
-    const auto &transaction = std::get<oursql::TransactionPlan>(plan.value());
-    if (!Check(transaction.action == expected[i],
-               "事务控制 Plan action 应正确")) {
-      return false;
-    }
+  const auto &begin =
+      std::get<oursql::BeginStatement>(parsed.value()[0]);
+  const auto &commit =
+      std::get<oursql::CommitStatement>(parsed.value()[1]);
+  const auto &rollback =
+      std::get<oursql::RollbackStatement>(parsed.value()[2]);
+  if (!Check(begin.location.line == 1 && begin.location.column > 0 &&
+                 commit.location.column > begin.location.column &&
+                 rollback.location.column > commit.location.column,
+             "事务语句应分别生成独立 AST 并记录位置")) {
+    return false;
+  }
+  auto begin_plan = planner.Build(parsed.value()[0], oursql::Catalog{});
+  auto commit_plan = planner.Build(parsed.value()[1], oursql::Catalog{});
+  auto rollback_plan = planner.Build(parsed.value()[2], oursql::Catalog{});
+  if (!Check(begin_plan.ok() &&
+                 std::holds_alternative<oursql::BeginPlan>(
+                     begin_plan.value()) &&
+                 commit_plan.ok() &&
+                 std::holds_alternative<oursql::CommitPlan>(
+                     commit_plan.value()) &&
+                 rollback_plan.ok() &&
+                 std::holds_alternative<oursql::RollbackPlan>(
+                     rollback_plan.value()),
+             "事务 Statement 应一一映射到 BeginPlan/CommitPlan/RollbackPlan")) {
+    return false;
+  }
+  if (!Check(oursql::ToString(begin_plan.value()) == "BeginPlan()" &&
+                 oursql::ToString(commit_plan.value()) == "CommitPlan()" &&
+                 oursql::ToString(rollback_plan.value()) == "RollbackPlan()",
+             "事务 Plan 文本格式应稳定")) {
+    return false;
   }
   if (!Check(oursql::ToString(parsed.value()[0]) ==
-                 "TransactionStatement(action=begin)" &&
+                 "BeginStatement()" &&
                  oursql::ToString(parsed.value()[1]) ==
-                     "TransactionStatement(action=commit)" &&
+                     "CommitStatement()" &&
                  oursql::ToString(parsed.value()[2]) ==
-                     "TransactionStatement(action=rollback)",
+                     "RollbackStatement()",
              "事务 AST 文本格式应稳定")) {
     return false;
   }
 
-  auto invalid = parser.Parse("BEGIN TRANSACTION;");
-  return Check(!invalid.ok() &&
-                   invalid.status().message().find("位置") !=
+  const std::vector<std::string> invalid{
+      "BEGIN WORK;",
+      "COMMIT NOW;",
+      "ROLLBACK NOW;",
+  };
+  for (const auto &sql : invalid) {
+    auto parsed_invalid = parser.Parse(sql);
+    if (!Check(!parsed_invalid.ok() &&
+                   parsed_invalid.status().message().find("位置") !=
                        std::string::npos,
-               "BEGIN TRANSACTION 当前应返回带位置的语法错误");
+               "事务控制后的非法参数应返回带位置错误")) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool TestUpdateCompileOnly() {

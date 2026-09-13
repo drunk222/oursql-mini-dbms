@@ -793,6 +793,35 @@ bool TestHeapAndIndexTransactions() {
       return false;
     }
 
+    if (!Check(engine.ExecuteSql("BEGIN;").ok(), "index failure transaction begin")) {
+      return false;
+    }
+    auto index_failure =
+        engine.ExecuteSql("INSERT INTO student VALUES(1, 'duplicate');");
+    if (!Check(!index_failure.ok() &&
+                   index_failure.status().code() ==
+                       oursql::ErrorCode::AlreadyExists,
+               "Heap success followed by index failure must abort statement")) {
+      return false;
+    }
+    auto blocked_after_index_failure =
+        engine.ExecuteSql("SELECT * FROM student;");
+    if (!Check(!blocked_after_index_failure.ok(),
+               "Failed transaction after index error must reject normal SQL")) {
+      return false;
+    }
+    if (!Check(engine.ExecuteSql("ROLLBACK;").ok(),
+               "index failure transaction rollback")) {
+      return false;
+    }
+    auto after_index_failure =
+        engine.ExecuteSql("SELECT * FROM student WHERE id = 1;");
+    if (!Check(after_index_failure.ok() &&
+                   after_index_failure.value().rows.size() == 1,
+               "rollback after index failure must keep Heap and index consistent")) {
+      return false;
+    }
+
     if (!Check(engine.ExecuteSql("BEGIN;").ok() &&
                    engine.ExecuteSql("INSERT INTO student VALUES(30, 'committed');").ok() &&
                    engine.ExecuteSql("COMMIT;").ok(),
@@ -819,6 +848,93 @@ bool TestHeapAndIndexTransactions() {
                             thirty.ok() && thirty.value().rows.size() == 1,
                         "Heap and index must agree after restart");
   return reopened.Close().ok() && ok;
+}
+
+bool TestCloseRollsBackActiveTransaction() {
+  TempDb temp;
+  {
+    oursql::DatabaseEngine engine(temp.path, 3);
+    if (!Check(engine.GetInitStatus().ok(),
+               "Close rollback test database should open")) {
+      return false;
+    }
+    if (!Check(engine.ExecuteSql(
+                   "CREATE TABLE student(id INT, name VARCHAR);")
+                   .ok() &&
+                   engine.ExecuteSql("BEGIN;").ok() &&
+                   engine.ExecuteSql(
+                       "INSERT INTO student VALUES(1, 'Uncommitted');")
+                       .ok(),
+               "Close rollback test setup")) {
+      return false;
+    }
+    if (!Check(engine.Close().ok(),
+               "Close should automatically roll back active transaction")) {
+      return false;
+    }
+  }
+
+  oursql::DatabaseEngine reopened(temp.path, 3);
+  if (!Check(reopened.GetInitStatus().ok(),
+             "Close rollback database should reopen")) {
+    return false;
+  }
+  auto rows = reopened.ExecuteSql("SELECT * FROM student;");
+  return Check(rows.ok() && rows.value().rows.empty(),
+               "Close rollback must remove uncommitted row") &&
+         Check(reopened.Close().ok(), "Close rollback final close");
+}
+
+bool TestTransactionCommandStateErrors() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 3);
+  if (!Check(engine.GetInitStatus().ok(),
+             "transaction state-error database should open")) {
+    return false;
+  }
+
+  auto commit_without_begin = engine.ExecuteSql("COMMIT;");
+  auto rollback_without_begin = engine.ExecuteSql("ROLLBACK;");
+  if (!Check(!commit_without_begin.ok() &&
+                 commit_without_begin.status().code() ==
+                     oursql::ErrorCode::NotFound &&
+                 !rollback_without_begin.ok() &&
+                 rollback_without_begin.status().code() ==
+                     oursql::ErrorCode::NotFound,
+             "COMMIT/ROLLBACK without BEGIN must report no active transaction")) {
+    return false;
+  }
+
+  auto begin = engine.ExecuteSql("BEGIN;");
+  if (!Check(begin.ok() && begin.value().column_names ==
+                                  std::vector<std::string>{"status"} &&
+                 begin.value().rows.size() == 1 &&
+                 begin.value().rows[0][0].AsVarchar().find(
+                     "Transaction started") == 0,
+             "BEGIN must report transaction started")) {
+    return false;
+  }
+  auto nested_begin = engine.ExecuteSql("BEGIN;");
+  if (!Check(!nested_begin.ok() &&
+                 nested_begin.status().code() ==
+                     oursql::ErrorCode::AlreadyExists,
+             "nested BEGIN must be rejected")) {
+    return false;
+  }
+
+  auto commit = engine.ExecuteSql("COMMIT;");
+  if (!Check(commit.ok() && commit.value().rows.size() == 1 &&
+                 commit.value().rows[0][0].AsVarchar() ==
+                     "Transaction committed",
+             "COMMIT must report transaction committed")) {
+    return false;
+  }
+  auto commit_again = engine.ExecuteSql("COMMIT;");
+  return Check(!commit_again.ok() &&
+                   commit_again.status().code() ==
+                       oursql::ErrorCode::NotFound &&
+                   engine.Close().ok(),
+               "COMMIT after completed transaction must report no active transaction");
 }
 
 }  // namespace
@@ -881,6 +997,16 @@ int main() {
   }
   if (TestHeapAndIndexTransactions()) {
     std::cout << "[PASS] Heap and index transactions\n";
+  } else {
+    return 1;
+  }
+  if (TestCloseRollsBackActiveTransaction()) {
+    std::cout << "[PASS] Close rolls back active transaction\n";
+  } else {
+    return 1;
+  }
+  if (TestTransactionCommandStateErrors()) {
+    std::cout << "[PASS] Transaction command state errors\n";
   } else {
     return 1;
   }

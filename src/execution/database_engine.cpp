@@ -50,6 +50,50 @@ bool IsDdlPlan(const Plan &plan) {
       plan);
 }
 
+Status RebuildStatus(ErrorCode code, std::string message) {
+  switch (code) {
+    case ErrorCode::InvalidArgument: return Status::InvalidArgument(std::move(message));
+    case ErrorCode::NotFound: return Status::NotFound(std::move(message));
+    case ErrorCode::NotImplemented: return Status::NotImplemented(std::move(message));
+    case ErrorCode::AlreadyExists: return Status::AlreadyExists(std::move(message));
+    case ErrorCode::TypeMismatch: return Status::TypeMismatch(std::move(message));
+    case ErrorCode::OutOfSpace: return Status::OutOfSpace(std::move(message));
+    case ErrorCode::RecordTooLarge: return Status::RecordTooLarge(std::move(message));
+    case ErrorCode::IOError: return Status::IOError(std::move(message));
+    case ErrorCode::InternalError: return Status::InternalError(std::move(message));
+    case ErrorCode::Ok: return Status::InternalError(std::move(message));
+  }
+  return Status::InternalError(std::move(message));
+}
+
+Status CombineFailure(const Status &original, const Status &rollback) {
+  return RebuildStatus(
+      original.code(),
+      original.message() + "; rollback also failed: " + rollback.message());
+}
+
+ExecutionResult MakeTransactionMessage(std::string message) {
+  ExecutionResult result;
+  result.column_names = {"status"};
+  result.rows.push_back({Value(std::move(message))});
+  return result;
+}
+
+enum class TransactionCommand { None, Begin, Commit, Rollback };
+
+TransactionCommand GetTransactionCommand(const Plan &plan) {
+  if (std::holds_alternative<BeginPlan>(plan)) {
+    return TransactionCommand::Begin;
+  }
+  if (std::holds_alternative<CommitPlan>(plan)) {
+    return TransactionCommand::Commit;
+  }
+  if (std::holds_alternative<RollbackPlan>(plan)) {
+    return TransactionCommand::Rollback;
+  }
+  return TransactionCommand::None;
+}
+
 }  // namespace
 
 DatabaseEngine::DatabaseEngine(std::filesystem::path file_path, std::size_t pool_size,
@@ -233,33 +277,48 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
     }
     // 3. Plan 由执行器落实为 Catalog/HeapTable 操作或查询结果。
     const auto &compiled_plan = plan.value();
-    if (std::holds_alternative<TransactionPlan>(compiled_plan)) {
-      const auto action = std::get<TransactionPlan>(compiled_plan).action;
+    const TransactionCommand transaction_command =
+        GetTransactionCommand(compiled_plan);
+    if (transaction_command != TransactionCommand::None) {
       if (transaction_manager_.HasActive()) {
         const auto state = transaction_manager_.Active()->state();
-        if (state == TransactionState::Failed && action != TransactionAction::Rollback) {
+        if (state == TransactionState::Failed &&
+            transaction_command != TransactionCommand::Rollback) {
           return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
               "failed transaction only allows ROLLBACK"));
         }
-        if (state == TransactionState::Committed && action != TransactionAction::Commit) {
+        if (state == TransactionState::Committed &&
+            transaction_command != TransactionCommand::Commit) {
           return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
               "committed transaction cleanup only allows COMMIT retry"));
         }
       }
       Status transaction_status = Status::Ok();
-      if (action == TransactionAction::Begin) {
+      std::string transaction_message;
+      if (transaction_command == TransactionCommand::Begin) {
         auto begin = transaction_manager_.Begin(true);
-        if (!begin.ok()) transaction_status = begin.status();
-      } else if (action == TransactionAction::Commit) {
+        if (!begin.ok()) {
+          transaction_status = begin.status();
+        } else {
+          transaction_message = "Transaction started (txn_id=" +
+                                std::to_string(begin.value()->id()) + ")";
+        }
+      } else if (transaction_command == TransactionCommand::Commit) {
         transaction_status = transaction_manager_.Commit();
+        if (transaction_status.ok()) {
+          transaction_message = "Transaction committed";
+        }
       } else {
         transaction_status = RollbackAndReloadCatalog();
+        if (transaction_status.ok()) {
+          transaction_message = "Transaction rolled back";
+        }
       }
       if (!transaction_status.ok()) {
         return Result<std::vector<ExecutionResult>>(
             Contextualize("Transaction", transaction_status));
       }
-      results.push_back(ExecutionResult{});
+      results.push_back(MakeTransactionMessage(std::move(transaction_message)));
       continue;
     }
     if (transaction_manager_.HasActive() &&
@@ -286,40 +345,48 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
     auto result = execution_engine_.Execute(compiled_plan, ExecutionContext{transaction});
     if (!result.ok()) {
       if (transaction != nullptr) transaction->MarkFailed();
+      Status execution_error = Contextualize("Execution", result.status());
       if (autocommit) {
         auto rollback = RollbackAndReloadCatalog();
         if (!rollback.ok()) {
           return Result<std::vector<ExecutionResult>>(
-              Contextualize("Transaction rollback", rollback));
+              CombineFailure(execution_error,
+                             Contextualize("Transaction rollback",
+                                           rollback)));
         }
       }
-      return Result<std::vector<ExecutionResult>>(Contextualize("Execution", result.status()));
+      return Result<std::vector<ExecutionResult>>(std::move(execution_error));
     }
     if (transaction != nullptr && !transaction->IsUsableForWork()) {
-      const auto transaction_failure = Status::IOError(
-          "transaction became failed while recording a page update");
+      const auto transaction_failure = Contextualize(
+          "Transaction", Status::IOError(
+                             "transaction became failed while recording a page update"));
       if (autocommit) {
         auto rollback = RollbackAndReloadCatalog();
         if (!rollback.ok()) {
           return Result<std::vector<ExecutionResult>>(
-              Contextualize("Transaction rollback", rollback));
+              CombineFailure(transaction_failure,
+                             Contextualize("Transaction rollback",
+                                           rollback)));
         }
       }
-      return Result<std::vector<ExecutionResult>>(
-          Contextualize("Transaction", transaction_failure));
+      return Result<std::vector<ExecutionResult>>(transaction_failure);
     }
     if (autocommit) {
       auto commit = transaction_manager_.Commit();
       if (!commit.ok()) {
+        const Status commit_error = Contextualize("Transaction", commit);
         if (transaction_manager_.HasActive() &&
             transaction_manager_.Active()->state() != TransactionState::Committed) {
           auto rollback = RollbackAndReloadCatalog();
           if (!rollback.ok()) {
             return Result<std::vector<ExecutionResult>>(
-                Contextualize("Transaction rollback", rollback));
+                CombineFailure(commit_error,
+                               Contextualize("Transaction rollback",
+                                             rollback)));
           }
         }
-        return Result<std::vector<ExecutionResult>>(Contextualize("Transaction", commit));
+        return Result<std::vector<ExecutionResult>>(commit_error);
       }
     }
     results.push_back(std::move(result.value()));

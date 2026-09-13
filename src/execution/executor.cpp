@@ -836,9 +836,15 @@ Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan,
         } else if constexpr (std::is_same_v<Type, AlterTablePlan>) {
           return Result<ExecutionResult>(Status::NotImplemented(
               "ALTER TABLE 当前仅完成编译层计划生成，执行器尚未接入"));
-        } else if constexpr (std::is_same_v<Type, TransactionPlan>) {
+        } else if constexpr (std::is_same_v<Type, BeginPlan>) {
           return Result<ExecutionResult>(Status::NotImplemented(
-              "事务控制当前仅完成编译层计划生成，执行器尚未接入"));
+              "BEGIN 必须由 DatabaseEngine 事务协调器处理"));
+        } else if constexpr (std::is_same_v<Type, CommitPlan>) {
+          return Result<ExecutionResult>(Status::NotImplemented(
+              "COMMIT 必须由 DatabaseEngine 事务协调器处理"));
+        } else if constexpr (std::is_same_v<Type, RollbackPlan>) {
+          return Result<ExecutionResult>(Status::NotImplemented(
+              "ROLLBACK 必须由 DatabaseEngine 事务协调器处理"));
         } else {
           return DeleteExecutor(catalog_, buffer_pool_).Execute(operation,
                                                                   context.transaction);

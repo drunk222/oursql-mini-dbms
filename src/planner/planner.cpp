@@ -875,8 +875,12 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           // 为语义错误附加语句起始位置，同时保留原始错误码。
           return Result<Plan>(WithLocation(std::move(status), value.location));
         };
-        if constexpr (std::is_same_v<Type, TransactionStatement>) {
-          return Result<Plan>(TransactionPlan{value.action});
+        if constexpr (std::is_same_v<Type, BeginStatement>) {
+          return Result<Plan>(BeginPlan{});
+        } else if constexpr (std::is_same_v<Type, CommitStatement>) {
+          return Result<Plan>(CommitPlan{});
+        } else if constexpr (std::is_same_v<Type, RollbackStatement>) {
+          return Result<Plan>(RollbackPlan{});
         } else if constexpr (std::is_same_v<Type, CreateTableStatement>) {
           // 编译阶段只校验 Schema 和表名，真正登记发生在 CreateTable 执行器。
           auto schema_status = CheckSchema(value.schema);
@@ -1511,13 +1515,12 @@ std::string ToString(const Plan &plan) {
             }
           }
           return result + ")";
-        } else if constexpr (std::is_same_v<Type, TransactionPlan>) {
-          const char *action =
-              value.action == TransactionAction::Begin
-                  ? "begin"
-                  : value.action == TransactionAction::Commit ? "commit"
-                                                              : "rollback";
-          return "TransactionPlan(action=" + std::string(action) + ")";
+        } else if constexpr (std::is_same_v<Type, BeginPlan>) {
+          return "BeginPlan()";
+        } else if constexpr (std::is_same_v<Type, CommitPlan>) {
+          return "CommitPlan()";
+        } else if constexpr (std::is_same_v<Type, RollbackPlan>) {
+          return "RollbackPlan()";
         } else if constexpr (std::is_same_v<Type, CreateIndexPlan>) {
           return "CreateIndexPlan(index=" + value.index_name +
                  ",table=" + value.table_name +

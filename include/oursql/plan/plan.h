@@ -138,11 +138,10 @@ struct AlterTablePlan {
   std::optional<Value> default_value;
 };
 
-// 事务控制计划。DatabaseEngine 作为单会话协调器解释该节点，ExecutionEngine
-// 本身不保存事务状态。
-struct TransactionPlan {
-  TransactionAction action{TransactionAction::Begin};
-};
+// DatabaseEngine 调度的事务控制 Plan；ExecutionEngine 不维护事务状态。
+struct BeginPlan {};
+struct CommitPlan {};
+struct RollbackPlan {};
 
 // CREATE INDEX 计划，执行时交给 IndexManager 构建索引并登记元数据。
 struct CreateIndexPlan {
@@ -173,7 +172,7 @@ struct UpdatePlan {
 using Plan = std::variant<CreateTablePlan, InsertPlan, SelectPlan, DeletePlan,
                           DropTablePlan, CreateIndexPlan, DropIndexPlan,
                           ExplainPlan, UpdatePlan, AlterTablePlan,
-                          TransactionPlan>;
+                          BeginPlan, CommitPlan, RollbackPlan>;
 
 // 调用者：调试器或测试；作用：以稳定格式打印逻辑计划；返回：计划文本，不参与执行。
 [[nodiscard]] std::string ToString(const Plan &plan);

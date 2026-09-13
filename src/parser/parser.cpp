@@ -1139,21 +1139,20 @@ class ParserImpl {
   Result<Statement> ParseTransaction() {
     Token keyword = Peek();
     ++index_;
-    TransactionStatement statement;
-    if (keyword.type == TokenType::Begin) {
-      statement.action = TransactionAction::Begin;
-    } else if (keyword.type == TokenType::Commit) {
-      statement.action = TransactionAction::Commit;
-    } else if (keyword.type == TokenType::Rollback) {
-      statement.action = TransactionAction::Rollback;
-    } else {
-      return Result<Statement>(
-          Error("BEGIN, COMMIT or ROLLBACK", keyword));
-    }
     auto semicolon = Expect(TokenType::Semicolon, "';'");
     if (!semicolon.ok()) return Result<Statement>(semicolon.status());
-    statement.location = TokenPosition(keyword);
-    return Result<Statement>(std::move(statement));
+    const Position location = TokenPosition(keyword);
+    if (keyword.type == TokenType::Begin) {
+      return Result<Statement>(BeginStatement{location});
+    }
+    if (keyword.type == TokenType::Commit) {
+      return Result<Statement>(CommitStatement{location});
+    }
+    if (keyword.type == TokenType::Rollback) {
+      return Result<Statement>(RollbackStatement{location});
+    }
+    return Result<Statement>(
+        Error("BEGIN, COMMIT or ROLLBACK", keyword));
   }
 
   Result<Statement> ParseDrop() {
@@ -1391,13 +1390,12 @@ std::string ToString(const Statement &statement) {
             result += ",default=" + QuoteValue(*value.default_value);
           }
           return result + ")";
-        } else if constexpr (std::is_same_v<Type, TransactionStatement>) {
-          const char *action =
-              value.action == TransactionAction::Begin
-                  ? "begin"
-                  : value.action == TransactionAction::Commit ? "commit"
-                                                              : "rollback";
-          return "TransactionStatement(action=" + std::string(action) + ")";
+        } else if constexpr (std::is_same_v<Type, BeginStatement>) {
+          return "BeginStatement()";
+        } else if constexpr (std::is_same_v<Type, CommitStatement>) {
+          return "CommitStatement()";
+        } else if constexpr (std::is_same_v<Type, RollbackStatement>) {
+          return "RollbackStatement()";
         } else {
           std::string result = "UpdateStatement(table=" + value.table_name +
                                ",assignments=[";

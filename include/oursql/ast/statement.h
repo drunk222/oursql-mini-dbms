@@ -263,11 +263,16 @@ struct UpdateStatement {
 
 enum class AlterTableAction { RenameTable, RenameColumn, AddColumn };
 
-enum class TransactionAction { Begin, Commit, Rollback };
+// 事务控制语句分开建模，确保所有 variant 访问点显式处理每种动作。
+struct BeginStatement {
+  Position location;
+};
 
-// 事务控制语句不携带表或表达式；执行状态由单个 DatabaseEngine 会话维护。
-struct TransactionStatement {
-  TransactionAction action{TransactionAction::Begin};
+struct CommitStatement {
+  Position location;
+};
+
+struct RollbackStatement {
   Position location;
 };
 
@@ -289,7 +294,8 @@ using Statement = std::variant<CreateTableStatement, InsertStatement,
                                 SelectStatement, DeleteStatement, DropTableStatement,
                                 CreateIndexStatement, DropIndexStatement,
                                 ExplainStatement, UpdateStatement,
-                                AlterTableStatement, TransactionStatement>;
+                                AlterTableStatement, BeginStatement,
+                                CommitStatement, RollbackStatement>;
 
 // 调用者：调试器或测试；作用：以稳定格式打印 AST；返回：AST 文本，不参与执行。
 [[nodiscard]] std::string ToString(const Statement &statement);

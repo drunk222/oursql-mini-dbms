@@ -588,11 +588,31 @@ bool TestTransactions(const std::filesystem::path &database, const char *argv0) 
     auto rollback = engine.ExecuteSqlBatch(
         "BEGIN; INSERT INTO student VALUES(1, 'RuntimeUndo'); ROLLBACK;");
     if (!Check(rollback.ok() && rollback.value().size() == 3, "runtime rollback batch")) return false;
+    if (!Check(rollback.value()[0].column_names ==
+                       std::vector<std::string>{"status"} &&
+                   rollback.value()[0].rows.size() == 1 &&
+                   rollback.value()[0].rows[0][0].AsVarchar().find(
+                       "Transaction started") == 0 &&
+                   rollback.value()[2].rows.size() == 1 &&
+                   rollback.value()[2].rows[0][0].AsVarchar() ==
+                       "Transaction rolled back",
+               "transaction messages")) {
+      return false;
+    }
     auto empty = engine.ExecuteSql("SELECT * FROM student;");
     if (!Check(empty.ok() && empty.value().rows.empty(), "runtime rollback removed row")) return false;
     auto commit = engine.ExecuteSqlBatch(
         "BEGIN; INSERT INTO student VALUES(2, 'Committed'); COMMIT;");
     if (!Check(commit.ok() && commit.value().size() == 3, "explicit commit batch")) return false;
+    if (!Check(commit.value()[0].rows.size() == 1 &&
+                   commit.value()[0].rows[0][0].AsVarchar().find(
+                       "Transaction started") == 0 &&
+                   commit.value()[2].rows.size() == 1 &&
+                   commit.value()[2].rows[0][0].AsVarchar() ==
+                       "Transaction committed",
+               "commit transaction messages")) {
+      return false;
+    }
     if (!Check(engine.ExecuteSql("CREATE UNIQUE INDEX idx_student_id ON student(id);").ok(),
                "create student index")) return false;
     if (!Check(engine.Close().ok(), "close after commit")) return false;

@@ -86,10 +86,13 @@ Result<std::shared_ptr<Transaction>> TransactionManager::Begin() {
   return BeginInternal(true);
 }
 
+Result<std::shared_ptr<Transaction>> TransactionManager::BeginAutocommit() {
+  return BeginInternal(false);
+}
+
 Result<Transaction *> TransactionManager::Begin(bool explicit_transaction) {
-  // This overload is retained for DatabaseEngine's one-session compatibility
-  // path. Do not create another transaction (or append another BEGIN record)
-  // while that adapter still owns one.
+  // This overload is retained for legacy raw-pointer callers. Do not create
+  // another transaction while that adapter still owns one.
   std::lock_guard<std::mutex> legacy_begin_lock(legacy_begin_mutex_);
   {
     std::lock_guard<std::mutex> lock(mutex_);

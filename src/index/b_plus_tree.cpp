@@ -38,6 +38,21 @@ bool EntryLess(const std::pair<index_key_t, RID> &left,
          (left.first == right.first && RidLess(left.second, right.second));
 }
 
+Status FinalizeWrite(WritePageGuard &guard) {
+  auto status = guard.MarkDirty();
+  if (!status.ok()) {
+    (void)guard.Release();
+    return status;
+  }
+  return guard.Release();
+}
+
+Status FinalizeWrites(WritePageGuard &first, WritePageGuard &second) {
+  const auto first_status = FinalizeWrite(first);
+  const auto second_status = FinalizeWrite(second);
+  return first_status.ok() ? second_status : first_status;
+}
+
 }  // namespace
 
 BPlusTree::BPlusTree(BufferPoolManager *buffer_pool, page_id_t root_page_id,
@@ -74,12 +89,13 @@ Result<std::unique_ptr<BPlusTree>> BPlusTree::CreatePersistent(
   StoreHeaderValue(guard.Data(), kHeaderRootOffset, INVALID_PAGE_ID);
   StoreHeaderValue(guard.Data(), kHeaderLeafMaxOffset, leaf_max_size);
   StoreHeaderValue(guard.Data(), kHeaderInternalMaxOffset, internal_max_size);
-  auto status = guard.MarkDirty();
+  const auto header_page_id = guard.PageId();
+  auto status = FinalizeWrite(guard);
   if (!status.ok()) return Result<std::unique_ptr<BPlusTree>>(status);
 
   auto tree = std::make_unique<BPlusTree>(buffer_pool, INVALID_PAGE_ID, leaf_max_size,
                                           internal_max_size, transaction);
-  tree->header_page_id_ = guard.PageId();
+  tree->header_page_id_ = header_page_id;
   return Result<std::unique_ptr<BPlusTree>>(std::move(tree));
 }
 
@@ -164,9 +180,9 @@ Status BPlusTree::Insert(index_key_t key, RID rid) {
       if (!status.ok()) return status;
       status = leaf.Insert(key, rid);
       if (!status.ok()) return status;
-      status = guard.MarkDirty();
-      if (!status.ok()) return status;
       root_page_id_ = guard.PageId();
+      status = FinalizeWrite(guard);
+      if (!status.ok()) return status;
     }
     return PersistRootPageId();
   }
@@ -199,7 +215,7 @@ Status BPlusTree::Insert(index_key_t key, RID rid, Transaction *transaction) {
   BPlusTree scoped(buffer_pool_, root_page_id_, leaf_max_size_, internal_max_size_, transaction);
   scoped.header_page_id_ = header_page_id_;
   auto status = scoped.Insert(key, rid);
-  root_page_id_ = scoped.root_page_id_;
+  if (status.ok()) root_page_id_ = scoped.root_page_id_;
   return status;
 }
 
@@ -221,7 +237,7 @@ Result<BPlusTree::SplitResult> BPlusTree::InsertIntoLeaf(page_id_t leaf_page_id,
   if (entries.size() < old_leaf.GetMaxSize()) {
     auto status = old_leaf.Insert(key, rid);
     if (!status.ok()) return Result<SplitResult>(status);
-    status = old_guard.MarkDirty();
+    status = FinalizeWrite(old_guard);
     if (!status.ok()) return Result<SplitResult>(status);
     return Result<SplitResult>(SplitResult{});
   }
@@ -242,12 +258,11 @@ Result<BPlusTree::SplitResult> BPlusTree::InsertIntoLeaf(page_id_t leaf_page_id,
   if (!status.ok()) return Result<SplitResult>(status);
   status = new_leaf.Assign(right);
   if (!status.ok()) return Result<SplitResult>(status);
-  old_leaf.SetNextPageId(new_guard.PageId());
-  status = old_guard.MarkDirty();
+  const auto new_page_id = new_guard.PageId();
+  old_leaf.SetNextPageId(new_page_id);
+  status = FinalizeWrites(old_guard, new_guard);
   if (!status.ok()) return Result<SplitResult>(status);
-  status = new_guard.MarkDirty();
-  if (!status.ok()) return Result<SplitResult>(status);
-  return Result<SplitResult>(SplitResult{right.front().first, new_guard.PageId()});
+  return Result<SplitResult>(SplitResult{right.front().first, new_page_id});
 }
 
 Result<std::optional<BPlusTree::SplitResult>> BPlusTree::InsertIntoInternal(
@@ -278,7 +293,7 @@ Result<std::optional<BPlusTree::SplitResult>> BPlusTree::InsertIntoInternal(
     if (entries.size() <= old_page.GetMaxSize()) {
       auto status = old_page.Assign(entries);
       if (!status.ok()) return Result<std::optional<SplitResult>>(status);
-      status = old_guard.MarkDirty();
+      status = FinalizeWrite(old_guard);
       if (!status.ok()) return Result<std::optional<SplitResult>>(status);
       // 在 guard 释放后更新孩子，避免小缓冲池中同时 pin 过多页面。
     } else {
@@ -304,9 +319,7 @@ Result<std::optional<BPlusTree::SplitResult>> BPlusTree::InsertIntoInternal(
       if (!status.ok()) return Result<std::optional<SplitResult>>(status);
       status = new_page.Assign(right_entries);
       if (!status.ok()) return Result<std::optional<SplitResult>>(status);
-      status = old_guard.MarkDirty();
-      if (!status.ok()) return Result<std::optional<SplitResult>>(status);
-      status = new_guard.MarkDirty();
+      status = FinalizeWrites(old_guard, new_guard);
       if (!status.ok()) return Result<std::optional<SplitResult>>(status);
     }
   }
@@ -337,7 +350,7 @@ Status BPlusTree::CreateNewRoot(page_id_t left_child, index_key_t separator,
     if (!status.ok()) return status;
     status = root.Assign({{0, left_child}, {separator, right_child}});
     if (!status.ok()) return status;
-    status = guard.MarkDirty();
+    status = FinalizeWrite(guard);
     if (!status.ok()) return status;
   }
   auto status = SetParent(left_child, new_root_id);
@@ -360,7 +373,7 @@ Status BPlusTree::PersistRootPageId() {
     return Status::InternalError("B+树元数据页损坏，无法更新根页面编号");
   }
   StoreHeaderValue(guard.Data(), kHeaderRootOffset, root_page_id_);
-  return guard.MarkDirty();
+  return FinalizeWrite(guard);
 }
 
 Status BPlusTree::SetParent(page_id_t child_page_id, page_id_t parent_page_id) {
@@ -370,13 +383,13 @@ Status BPlusTree::SetParent(page_id_t child_page_id, page_id_t parent_page_id) {
   BPlusTreeLeafPage leaf(guard.Data());
   if (leaf.Validate().ok()) {
     leaf.SetParentPageId(parent_page_id);
-    return guard.MarkDirty();
+    return FinalizeWrite(guard);
   }
   BPlusTreeInternalPage internal(guard.Data());
   auto valid = internal.Validate();
   if (!valid.ok()) return valid;
   internal.SetParentPageId(parent_page_id);
-  return guard.MarkDirty();
+  return FinalizeWrite(guard);
 }
 
 Status BPlusTree::Remove(index_key_t key, RID rid) {
@@ -421,12 +434,12 @@ Status BPlusTree::Remove(index_key_t key, RID rid) {
     entries.erase(found);
     auto status = leaf.Assign(entries);
     if (!status.ok()) return status;
-    status = guard.MarkDirty();
-    if (!status.ok()) return status;
     size = leaf.GetSize();
     max_size = leaf.GetMaxSize();
     root_became_empty = target == root_page_id_ && entries.empty();
     if (!entries.empty()) new_minimum = entries.front().first;
+    status = FinalizeWrite(guard);
+    if (!status.ok()) return status;
   }
   if (target == root_page_id_) {
     if (!root_became_empty) return Status::Ok();
@@ -474,7 +487,7 @@ Status BPlusTree::PropagateMinimumChange(page_id_t page_id, index_key_t new_mini
       entries[index].first = new_minimum;
       auto status = parent.Assign(entries);
       if (!status.ok()) return status;
-      return guard.MarkDirty();
+      return FinalizeWrite(guard);
     }
     current = parent_id;
   }
@@ -553,7 +566,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
         BPlusTreeLeafPage page(write_result.value().Data());
         auto status = page.Assign(left_entries);
         if (!status.ok()) return status;
-        if (!(status = write_result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
       }
       {
         auto write_result = buffer_pool_->FetchPageWrite(leaf_page_id, transaction_);
@@ -561,7 +574,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
         BPlusTreeLeafPage page(write_result.value().Data());
         auto status = page.Assign(leaf_entries);
         if (!status.ok()) return status;
-        if (!(status = write_result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
       }
       parent_entries[child_index].first = leaf_entries.front().first;
       auto write_result = buffer_pool_->FetchPageWrite(parent_id, transaction_);
@@ -569,7 +582,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
       BPlusTreeInternalPage page(write_result.value().Data());
       auto status = page.Assign(parent_entries);
       if (!status.ok()) return status;
-      return write_result.value().MarkDirty();
+      return FinalizeWrite(write_result.value());
     }
   }
 
@@ -593,7 +606,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
         BPlusTreeLeafPage page(write_result.value().Data());
         auto status = page.Assign(leaf_entries);
         if (!status.ok()) return status;
-        if (!(status = write_result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
       }
       {
         auto write_result = buffer_pool_->FetchPageWrite(right_id, transaction_);
@@ -601,7 +614,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
         BPlusTreeLeafPage page(write_result.value().Data());
         auto status = page.Assign(right_entries);
         if (!status.ok()) return status;
-        if (!(status = write_result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
       }
       parent_entries[child_index + 1].first = right_entries.front().first;
       auto write_result = buffer_pool_->FetchPageWrite(parent_id, transaction_);
@@ -609,7 +622,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
       BPlusTreeInternalPage page(write_result.value().Data());
       auto status = page.Assign(parent_entries);
       if (!status.ok()) return status;
-      return write_result.value().MarkDirty();
+      return FinalizeWrite(write_result.value());
     }
 
     if (left_id == INVALID_PAGE_ID) {
@@ -622,7 +635,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
         auto status = page.Assign(leaf_entries);
         if (!status.ok()) return status;
         page.SetNextPageId(right_next);
-        if (!(status = write_result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
       }
       parent_entries.erase(parent_entries.begin() + child_index + 1);
       {
@@ -631,7 +644,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
         BPlusTreeInternalPage page(write_result.value().Data());
         auto status = page.Assign(parent_entries);
         if (!status.ok()) return status;
-        if (!(status = write_result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
       }
       auto status = buffer_pool_->DeletePage(right_id, transaction_);
       if (!status.ok()) return status;
@@ -656,7 +669,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
     auto status = page.Assign(left_entries);
     if (!status.ok()) return status;
     page.SetNextPageId(leaf_next);
-    if (!(status = write_result.value().MarkDirty()).ok()) return status;
+    if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
   }
   parent_entries.erase(parent_entries.begin() + child_index);
   {
@@ -665,7 +678,7 @@ Status BPlusTree::RebalanceLeaf(page_id_t leaf_page_id) {
     BPlusTreeInternalPage page(write_result.value().Data());
     auto status = page.Assign(parent_entries);
     if (!status.ok()) return status;
-    if (!(status = write_result.value().MarkDirty()).ok()) return status;
+    if (!(status = FinalizeWrite(write_result.value())).ok()) return status;
   }
   auto status = buffer_pool_->DeletePage(leaf_page_id, transaction_);
   if (!status.ok()) return status;
@@ -744,7 +757,7 @@ Status BPlusTree::RebalanceInternal(page_id_t page_id) {
         BPlusTreeInternalPage page(result.value().Data());
         auto status = page.Assign(target.second);
         if (!status.ok()) return status;
-        if (!(status = result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(result.value())).ok()) return status;
       }
       return SetParent(borrowed.second, page_id);
     }
@@ -774,7 +787,7 @@ Status BPlusTree::RebalanceInternal(page_id_t page_id) {
         BPlusTreeInternalPage page(result.value().Data());
         auto status = page.Assign(target.second);
         if (!status.ok()) return status;
-        if (!(status = result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(result.value())).ok()) return status;
       }
       return SetParent(borrowed.second, page_id);
     }
@@ -792,7 +805,7 @@ Status BPlusTree::RebalanceInternal(page_id_t page_id) {
         BPlusTreeInternalPage page(result.value().Data());
         auto status = page.Assign(target.second);
         if (!status.ok()) return status;
-        if (!(status = result.value().MarkDirty()).ok()) return status;
+        if (!(status = FinalizeWrite(result.value())).ok()) return status;
       }
       auto status = buffer_pool_->DeletePage(right_id, transaction_);
       if (!status.ok()) return status;
@@ -823,7 +836,7 @@ Status BPlusTree::RebalanceInternal(page_id_t page_id) {
     BPlusTreeInternalPage page(result.value().Data());
     auto status = page.Assign(target.second);
     if (!status.ok()) return status;
-    if (!(status = result.value().MarkDirty()).ok()) return status;
+    if (!(status = FinalizeWrite(result.value())).ok()) return status;
   }
   auto status = buffer_pool_->DeletePage(page_id, transaction_);
   if (!status.ok()) return status;
@@ -870,7 +883,7 @@ Status BPlusTree::Remove(index_key_t key, RID rid, Transaction *transaction) {
   BPlusTree scoped(buffer_pool_, root_page_id_, leaf_max_size_, internal_max_size_, transaction);
   scoped.header_page_id_ = header_page_id_;
   auto status = scoped.Remove(key, rid);
-  root_page_id_ = scoped.root_page_id_;
+  if (status.ok()) root_page_id_ = scoped.root_page_id_;
   return status;
 }
 

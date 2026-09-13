@@ -1,4 +1,5 @@
 #include "oursql/execution/database_engine.h"
+#include "oursql/index/b_plus_tree.h"
 #include "oursql/recovery/recovery_manager.h"
 #include "oursql/storage/log_manager.h"
 #include "oursql/storage/storage.h"
@@ -47,6 +48,55 @@ int CrashChild(const std::string &mode, const std::filesystem::path &database) {
   } else {
     auto commit = engine.ExecuteSql("COMMIT;");
     if (!commit.ok()) return 6;
+  }
+  std::_Exit(0);
+}
+
+int StructuralCrashChild(const std::string &mode,
+                         const std::filesystem::path &database,
+                         oursql::page_id_t header_page_id) {
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  if (!disk.Open(database).ok() || !log.Open(database).ok()) return 2;
+  oursql::BufferPoolManager buffer_pool(8, &disk);
+  if (!buffer_pool.SetLogManager(&log).ok()) return 3;
+  oursql::TransactionManager transactions(&log, &buffer_pool, &disk);
+  auto begin = transactions.Begin(true);
+  if (!begin.ok()) return 4;
+  auto tree = oursql::BPlusTree::OpenPersistent(&buffer_pool, header_page_id,
+                                                 begin.value());
+  if (!tree.ok()) return 5;
+
+  if (mode == "split-uncommitted") {
+    for (std::int64_t key = 4; key <= 40; ++key) {
+      if (!tree.value()
+               ->Insert(key,
+                        oursql::RID{static_cast<oursql::page_id_t>(key), 1})
+               .ok()) {
+        return 6;
+      }
+    }
+    if (!buffer_pool.FlushAllPages().ok()) return 7;
+  } else if (mode == "merge-committed") {
+    for (std::int64_t key = 2; key <= 40; ++key) {
+      if (!tree.value()
+               ->Remove(key,
+                        oursql::RID{static_cast<oursql::page_id_t>(key), 1})
+               .ok()) {
+        return 8;
+      }
+    }
+    // Persist the commit point without calling TransactionManager::Commit(),
+    // which would immediately finalize deferred page frees. This models a
+    // crash after COMMIT is durable and before cleanup starts.
+    oursql::LogRecord commit;
+    commit.type = oursql::LogRecordType::Commit;
+    commit.txn_id = begin.value()->id();
+    commit.prev_lsn = begin.value()->last_lsn();
+    auto commit_lsn = log.Append(std::move(commit));
+    if (!commit_lsn.ok() || !log.Flush(commit_lsn.value()).ok()) return 9;
+  } else {
+    return 10;
   }
   std::_Exit(0);
 }
@@ -684,9 +734,175 @@ bool TestTransactions(const std::filesystem::path &database, const char *argv0) 
   return true;
 }
 
+bool TestStructuralCrashRecovery(const std::filesystem::path &split_database,
+                                 const std::filesystem::path &merge_database,
+                                 const char *argv0) {
+  const auto setup_tree = [](const std::filesystem::path &database,
+                             std::int64_t key_count,
+                             oursql::page_id_t *header,
+                             std::uintmax_t *logical_page_count) {
+    std::filesystem::remove(database);
+    std::filesystem::remove(database.string() + ".wal");
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!disk.Open(database).ok() || !log.Open(database).ok()) return false;
+    oursql::BufferPoolManager buffer_pool(8, &disk);
+    if (!buffer_pool.SetLogManager(&log).ok()) return false;
+    auto tree = oursql::BPlusTree::CreatePersistent(&buffer_pool, 3, 3);
+    if (!tree.ok()) return false;
+    *header = tree.value()->GetHeaderPageId();
+    for (std::int64_t key = 1; key <= key_count; ++key) {
+      if (!tree.value()
+               ->Insert(key,
+                        oursql::RID{static_cast<oursql::page_id_t>(key), 1})
+               .ok()) {
+        return false;
+      }
+    }
+    if (!buffer_pool.FlushAllPages().ok()) return false;
+    *logical_page_count = std::filesystem::file_size(database) / oursql::Page::kSize;
+    return buffer_pool.Close().ok() && log.Close().ok() && disk.Close().ok();
+  };
+
+  const auto executable = std::filesystem::absolute(argv0).string();
+  const auto run_child = [&](const char *mode,
+                             const std::filesystem::path &database,
+                             oursql::page_id_t header) {
+    const std::string child_mode = std::string("--crash-") + mode;
+    const std::string database_text = database.string();
+    const std::string header_text = std::to_string(header);
+#ifdef _WIN32
+    const char *arguments[] = {executable.c_str(), child_mode.c_str(),
+                               database_text.c_str(), header_text.c_str(), nullptr};
+    return _spawnv(_P_WAIT, executable.c_str(), arguments);
+#else
+    const std::string command = "\"" + executable + "\" " + child_mode +
+                                " \"" + database_text + "\" " + header_text;
+    return std::system(command.c_str());
+#endif
+  };
+
+  oursql::page_id_t split_header = oursql::INVALID_PAGE_ID;
+  std::uintmax_t split_baseline_pages = 0;
+  if (!Check(setup_tree(split_database, 3, &split_header,
+                        &split_baseline_pages),
+             "structural split crash setup") ||
+      !Check(run_child("split-uncommitted", split_database, split_header) == 0,
+             "uncommitted structural split crash child")) {
+    return false;
+  }
+  const auto split_crash_pages =
+      std::filesystem::file_size(split_database) / oursql::Page::kSize;
+  {
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!Check(disk.Open(split_database).ok() && log.Open(split_database).ok(),
+               "structural split recovery open")) {
+      return false;
+    }
+    oursql::RecoveryManager recovery(&log, &disk);
+    if (!Check(recovery.Recover().ok(), "structural split recovery undo")) {
+      return false;
+    }
+    oursql::BufferPoolManager buffer_pool(8, &disk);
+    if (!Check(buffer_pool.SetLogManager(&log).ok(),
+               "structural split recovery WAL binding")) {
+      return false;
+    }
+    auto tree = oursql::BPlusTree::OpenPersistent(&buffer_pool, split_header);
+    auto range = tree.ok() ? tree.value()->RangeScan(1, 40)
+                           : oursql::Result<std::vector<std::pair<oursql::index_key_t,
+                                                                  oursql::RID>>>(tree.status());
+    if (!Check(range.ok() && range.value().size() == 3 &&
+                   range.value()[0].first == 1 && range.value()[2].first == 3,
+               "recovery must undo split keys and restore the old tree")) {
+      return false;
+    }
+    auto reused = buffer_pool.NewPage();
+    if (!Check(reused.ok(), "recovery should reuse an uncommitted split page")) {
+      return false;
+    }
+    const auto reused_page = reused.value().PageId();
+    if (!Check(reused.value().Release().ok() &&
+                   reused_page >= split_baseline_pages &&
+                   reused_page < split_crash_pages,
+               "uncommitted split allocations must return to the Free List")) {
+      return false;
+    }
+    if (!Check(buffer_pool.Close().ok() && log.Close().ok() && disk.Close().ok(),
+               "structural split recovery close")) {
+      return false;
+    }
+  }
+
+  oursql::page_id_t merge_header = oursql::INVALID_PAGE_ID;
+  std::uintmax_t merge_baseline_pages = 0;
+  if (!Check(setup_tree(merge_database, 40, &merge_header,
+                        &merge_baseline_pages),
+             "structural merge crash setup") ||
+      !Check(run_child("merge-committed", merge_database, merge_header) == 0,
+             "committed structural merge crash child")) {
+    return false;
+  }
+  {
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!Check(disk.Open(merge_database).ok() && log.Open(merge_database).ok(),
+               "structural merge recovery open")) {
+      return false;
+    }
+    oursql::RecoveryManager recovery(&log, &disk);
+    if (!Check(recovery.Recover().ok(), "structural merge recovery redo")) {
+      return false;
+    }
+    oursql::BufferPoolManager buffer_pool(8, &disk);
+    if (!Check(buffer_pool.SetLogManager(&log).ok(),
+               "structural merge recovery WAL binding")) {
+      return false;
+    }
+    auto tree = oursql::BPlusTree::OpenPersistent(&buffer_pool, merge_header);
+    auto range = tree.ok() ? tree.value()->RangeScan(1, 40)
+                           : oursql::Result<std::vector<std::pair<oursql::index_key_t,
+                                                                  oursql::RID>>>(tree.status());
+    if (!Check(range.ok() && range.value().size() == 1 &&
+                   range.value()[0].first == 1,
+               "recovery must redo the committed merge and root contraction")) {
+      return false;
+    }
+    auto reused = buffer_pool.NewPage();
+    if (!Check(reused.ok(), "recovery should reuse a committed merged page")) {
+      return false;
+    }
+    const auto reused_page = reused.value().PageId();
+    if (!Check(reused.value().Release().ok() &&
+                   reused_page < merge_baseline_pages,
+               "committed deferred B+ tree frees must reach the Free List")) {
+      return false;
+    }
+    if (!Check(buffer_pool.Close().ok() && log.Close().ok() && disk.Close().ok(),
+               "structural merge recovery close")) {
+      return false;
+    }
+  }
+
+  std::filesystem::remove(split_database);
+  std::filesystem::remove(split_database.string() + ".wal");
+  std::filesystem::remove(merge_database);
+  std::filesystem::remove(merge_database.string() + ".wal");
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 4 && std::string(argv[1]) == "--crash-split-uncommitted") {
+    return StructuralCrashChild("split-uncommitted", argv[2],
+                                static_cast<oursql::page_id_t>(std::stoll(argv[3])));
+  }
+  if (argc == 4 && std::string(argv[1]) == "--crash-merge-committed") {
+    return StructuralCrashChild("merge-committed", argv[2],
+                                static_cast<oursql::page_id_t>(std::stoll(argv[3])));
+  }
   if (argc == 3 && std::string(argv[1]) == "--crash-uncommitted") {
     return CrashChild("uncommitted", argv[2]);
   }
@@ -702,13 +918,16 @@ int main(int argc, char **argv) {
   const auto crc_database = BuildPath(argv[0], "transaction-crc-tests.oursql");
   const auto id_database = BuildPath(argv[0], "transaction-id-tests.oursql");
   const auto fault_database = BuildPath(argv[0], "transaction-wal-fault-tests.oursql");
+  const auto split_database = BuildPath(argv[0], "transaction-split-crash-tests.oursql");
+  const auto merge_database = BuildPath(argv[0], "transaction-merge-crash-tests.oursql");
   bool ok = TestLogManager(database) &&
             TestWalCorruption(crc_database) &&
             TestTransactionIdSeed(id_database) &&
             TestWalBeforeDataFailures(fault_database) &&
             TestTransactionalPageLifecycle(page_lifecycle_database) &&
             TestCommittedPageFreeRecovery(page_free_database) &&
-            TestTransactions(database, argv[0]);
+            TestTransactions(database, argv[0]) &&
+            TestStructuralCrashRecovery(split_database, merge_database, argv[0]);
   std::cout << (ok ? "transaction tests passed\n" : "transaction tests failed\n");
   return ok ? 0 : 1;
 }

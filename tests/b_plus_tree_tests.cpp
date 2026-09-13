@@ -21,6 +21,7 @@ class TempDatabase {
   ~TempDatabase() {
     std::error_code error;
     std::filesystem::remove(path, error);
+    std::filesystem::remove(path.string() + ".wal", error);
   }
   std::filesystem::path path;
 };
@@ -324,6 +325,39 @@ bool TestTransactionalStructuralChanges() {
   return true;
 }
 
+bool TestTransactionalWriteReleaseFailurePropagates() {
+  TempDatabase temp;
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  if (!Check(disk.Open(temp.path).ok(), "release failure database open") ||
+      !Check(log.Open(temp.path).ok(), "release failure WAL open")) {
+    return false;
+  }
+  oursql::BufferPoolManager buffer_pool(3, &disk);
+  oursql::BPlusTree tree(&buffer_pool, oursql::INVALID_PAGE_ID, 3, 3);
+  const oursql::RID original_rid{1, 1};
+  if (!Check(tree.Insert(1, original_rid).ok(),
+             "release failure baseline insert")) {
+    return false;
+  }
+
+  // Deliberately leave the BufferPool without a LogManager binding. The
+  // transactional page update must fail when the write guard is released.
+  oursql::TransactionManager transactions(&log, &buffer_pool, &disk);
+  auto begin = transactions.Begin(true);
+  if (!Check(begin.ok(), "release failure transaction begin")) return false;
+  const auto insert = tree.Insert(2, oursql::RID{2, 1}, begin.value());
+  if (!Check(!insert.ok(),
+             "B+ tree must propagate transactional write guard release failure") ||
+      !Check(begin.value()->state() == oursql::TransactionState::Failed,
+             "WAL release failure must mark the transaction Failed")) {
+    return false;
+  }
+  if (!Check(transactions.Rollback().ok(), "release failure rollback")) return false;
+  return Check(buffer_pool.Close().ok() && log.Close().ok() && disk.Close().ok(),
+               "release failure resources close");
+}
+
 }  // namespace
 
 int main() {
@@ -341,5 +375,7 @@ int main() {
   run("delete rebalance and root contraction", &TestDeleteRebalanceAndRootContraction);
   run("delete reclaims pages across restart", &TestDeleteReclaimsPagesAcrossRestart);
   run("transactional structural changes", &TestTransactionalStructuralChanges);
+  run("transactional write release failure",
+      &TestTransactionalWriteReleaseFailurePropagates);
   return failures == 0 ? 0 : 1;
 }

@@ -79,7 +79,7 @@ std::uint32_t Crc32(const std::byte *data, std::size_t length,
 
 bool IsKnownType(std::uint16_t raw) {
   return raw >= static_cast<std::uint16_t>(LogRecordType::Begin) &&
-         raw <= static_cast<std::uint16_t>(LogRecordType::Checkpoint);
+         raw <= static_cast<std::uint16_t>(LogRecordType::Compensation);
 }
 
 std::string PathText(const std::filesystem::path &path) {
@@ -100,10 +100,17 @@ Status LogManager::EnsureOpenUnlocked() const {
 }
 
 Status LogManager::Open(const std::filesystem::path &database_path) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  // Serialize lifecycle changes with Append. Flush intentionally does not
+  // take this lock, so group commit can still run while records are appended.
+  std::lock_guard<std::mutex> append_lock(append_mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
+  flush_cv_.wait(lock, [&] { return !flush_in_progress_; });
   if (open_) {
-    file_.flush();
-    file_.close();
+    {
+      std::lock_guard<std::mutex> file_lock(file_mutex_);
+      file_.flush();
+      file_.close();
+    }
     open_ = false;
   }
 
@@ -115,6 +122,7 @@ Status LogManager::Open(const std::filesystem::path &database_path) {
     std::ofstream create(path_, std::ios::binary | std::ios::trunc);
     if (!create.is_open()) return Status::IOError("cannot create WAL: " + PathText(path_));
   }
+  std::lock_guard<std::mutex> file_lock(file_mutex_);
   file_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
   if (!file_.is_open()) return Status::IOError("cannot open WAL: " + PathText(path_));
   open_ = true;
@@ -127,16 +135,27 @@ Status LogManager::Open(const std::filesystem::path &database_path) {
   append_lsn_ = kInvalidLsn;
   for (const auto &record : records.value()) append_lsn_ = std::max(append_lsn_, record.lsn);
   durable_lsn_ = append_lsn_;
+  flush_target_lsn_ = durable_lsn_;
+  last_flush_status_ = Status::Ok();
   return Status::Ok();
 }
 
 Status LogManager::Close() {
+  std::lock_guard<std::mutex> append_lock(append_mutex_);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!open_) return Status::Ok();
+  }
+  const auto flush_status = Flush(GetAppendLsn());
+  if (!flush_status.ok()) return flush_status;
   std::lock_guard<std::mutex> lock(mutex_);
   if (!open_) return Status::Ok();
+  std::lock_guard<std::mutex> file_lock(file_mutex_);
   file_.flush();
   const bool good = static_cast<bool>(file_);
   file_.close();
   open_ = false;
+  flush_target_lsn_ = kInvalidLsn;
   return good ? Status::Ok() : Status::IOError("cannot close WAL: " + PathText(path_));
 }
 
@@ -147,12 +166,42 @@ Result<std::vector<std::byte>> LogManager::Encode(const LogRecord &record, lsn_t
       (record.before_image.size() != Page::kSize || record.after_image.size() != Page::kSize)) {
     return Result<std::vector<std::byte>>(Status::InvalidArgument("PageUpdate requires two full page images"));
   }
-  if (record.type != LogRecordType::PageUpdate &&
+  if (record.type == LogRecordType::Compensation && !record.before_image.empty()) {
+    return Result<std::vector<std::byte>>(
+        Status::InvalidArgument("Compensation cannot contain a before image"));
+  }
+  if (record.type == LogRecordType::Compensation &&
+      !record.after_image.empty() && record.after_image.size() != Page::kSize) {
+    return Result<std::vector<std::byte>>(
+        Status::InvalidArgument("Compensation page image must be one full page"));
+  }
+  if (record.type == LogRecordType::Compensation &&
+      record.compensation_type != LogRecordType::PageUpdate &&
+      record.compensation_type != LogRecordType::PageAllocate &&
+      record.compensation_type != LogRecordType::PageFree) {
+    return Result<std::vector<std::byte>>(
+        Status::InvalidArgument("Compensation target type is invalid"));
+  }
+  if (record.type == LogRecordType::Compensation &&
+      ((record.compensation_type == LogRecordType::PageUpdate &&
+        record.after_image.size() != Page::kSize) ||
+       (record.compensation_type != LogRecordType::PageUpdate &&
+        !record.after_image.empty()))) {
+    return Result<std::vector<std::byte>>(
+        Status::InvalidArgument("Compensation image does not match its target type"));
+  }
+  if (record.type != LogRecordType::PageUpdate && record.type != LogRecordType::Compensation &&
       (!record.before_image.empty() || !record.after_image.empty())) {
-    return Result<std::vector<std::byte>>(Status::InvalidArgument("only PageUpdate may contain images"));
+    return Result<std::vector<std::byte>>(
+        Status::InvalidArgument("only PageUpdate or Compensation may contain images"));
   }
   std::vector<std::byte> payload;
-  payload.reserve(record.before_image.size() + record.after_image.size());
+  payload.reserve(record.before_image.size() + record.after_image.size() + 12);
+  if (record.type == LogRecordType::Compensation) {
+    payload.resize(12, std::byte{0});
+    StoreU64(payload.data(), 0, record.undo_next_lsn);
+    StoreU16(payload.data(), 8, static_cast<std::uint16_t>(record.compensation_type));
+  }
   payload.insert(payload.end(), record.before_image.begin(), record.before_image.end());
   payload.insert(payload.end(), record.after_image.begin(), record.after_image.end());
   if (payload.size() > std::numeric_limits<std::uint32_t>::max() - LogManager::kHeaderSize) {
@@ -206,6 +255,21 @@ Result<LogRecord> LogManager::Decode(const std::byte *data, std::size_t length) 
     }
     record.before_image.assign(data + kHeaderSize, data + kHeaderSize + Page::kSize);
     record.after_image.assign(data + kHeaderSize + Page::kSize, data + length);
+  } else if (record.type == LogRecordType::Compensation) {
+    if (payload_length != 12 && payload_length != 12 + Page::kSize) {
+      return Result<LogRecord>(Status::IOError("Compensation payload length is invalid"));
+    }
+    record.undo_next_lsn = LoadU64(data, kHeaderSize);
+    const auto compensation_type = LoadU16(data, kHeaderSize + 8);
+    if (compensation_type != static_cast<std::uint16_t>(LogRecordType::PageUpdate) &&
+        compensation_type != static_cast<std::uint16_t>(LogRecordType::PageAllocate) &&
+        compensation_type != static_cast<std::uint16_t>(LogRecordType::PageFree)) {
+      return Result<LogRecord>(Status::IOError("Compensation target type is invalid"));
+    }
+    record.compensation_type = static_cast<LogRecordType>(compensation_type);
+    if (payload_length == 12 + Page::kSize) {
+      record.after_image.assign(data + kHeaderSize + 12, data + length);
+    }
   } else if (payload_length != 0) {
     return Result<LogRecord>(Status::IOError("non-update WAL record has a payload"));
   }
@@ -213,18 +277,22 @@ Result<LogRecord> LogManager::Decode(const std::byte *data, std::size_t length) 
 }
 
 Result<lsn_t> LogManager::Append(LogRecord record) {
+  std::lock_guard<std::mutex> append_lock(append_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   auto open_status = EnsureOpenUnlocked();
   if (!open_status.ok()) return Result<lsn_t>(open_status);
   const lsn_t lsn = append_lsn_ + 1;
   auto encoded = Encode(record, lsn);
   if (!encoded.ok()) return Result<lsn_t>(encoded.status());
-  file_.clear();
-  file_.seekp(0, std::ios::end);
-  if (!file_) return Result<lsn_t>(Status::IOError("cannot seek WAL append position"));
-  file_.write(reinterpret_cast<const char *>(encoded.value().data()),
-              static_cast<std::streamsize>(encoded.value().size()));
-  if (!file_) return Result<lsn_t>(Status::IOError("cannot append WAL record"));
+  {
+    std::lock_guard<std::mutex> file_lock(file_mutex_);
+    file_.clear();
+    file_.seekp(0, std::ios::end);
+    if (!file_) return Result<lsn_t>(Status::IOError("cannot seek WAL append position"));
+    file_.write(reinterpret_cast<const char *>(encoded.value().data()),
+                static_cast<std::streamsize>(encoded.value().size()));
+    if (!file_) return Result<lsn_t>(Status::IOError("cannot append WAL record"));
+  }
   append_lsn_ = lsn;
   return Result<lsn_t>(lsn);
 }
@@ -313,11 +381,13 @@ Result<std::vector<LogRecord>> LogManager::ScanUnlocked(bool repair_tail) const 
 
 Result<std::vector<LogRecord>> LogManager::Scan() const {
   std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> file_lock(file_mutex_);
   return ScanUnlocked(false);
 }
 
 Result<txn_id_t> LogManager::GetNextTransactionIdSeed() const {
   std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> file_lock(file_mutex_);
   auto records = ScanUnlocked(false);
   if (!records.ok()) return Result<txn_id_t>(records.status());
   txn_id_t max_txn_id = kInvalidTxnId;
@@ -331,18 +401,61 @@ Result<txn_id_t> LogManager::GetNextTransactionIdSeed() const {
 }
 
 Status LogManager::Flush(lsn_t target_lsn) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   auto open_status = EnsureOpenUnlocked();
   if (!open_status.ok()) return open_status;
-  if (target_lsn > append_lsn_) return Status::InvalidArgument("WAL flush target exceeds append LSN");
-  if (fail_next_flush_for_testing_) {
-    fail_next_flush_for_testing_ = false;
-    return Status::IOError("injected WAL flush failure");
+  if (target_lsn > append_lsn_) {
+    return Status::InvalidArgument("WAL flush target exceeds append LSN");
   }
-  file_.flush();
-  if (!file_) return Status::IOError("cannot flush WAL");
-  durable_lsn_ = std::max(durable_lsn_, target_lsn);
-  return Status::Ok();
+  if (durable_lsn_ >= target_lsn) return Status::Ok();
+  flush_target_lsn_ = std::max(flush_target_lsn_, target_lsn);
+  if (flush_in_progress_) {
+    const auto generation = flush_generation_;
+    flush_cv_.wait(lock, [&] {
+      return durable_lsn_ >= target_lsn ||
+             (!flush_in_progress_ && flush_generation_ != generation);
+    });
+    if (durable_lsn_ >= target_lsn) return Status::Ok();
+    return last_flush_status_;
+  }
+
+  flush_in_progress_ = true;
+  lock.unlock();
+  while (true) {
+    lock.lock();
+    const auto batch_target = flush_target_lsn_;
+    const bool inject_failure = fail_next_flush_for_testing_;
+    fail_next_flush_for_testing_ = false;
+    lock.unlock();
+
+    Status status = Status::Ok();
+    if (inject_failure) {
+      status = Status::IOError("injected WAL flush failure");
+    } else {
+      std::lock_guard<std::mutex> file_lock(file_mutex_);
+      file_.flush();
+      if (!file_) status = Status::IOError("cannot flush WAL");
+    }
+
+    lock.lock();
+    if (!status.ok()) {
+      last_flush_status_ = status;
+      flush_in_progress_ = false;
+      ++flush_generation_;
+      flush_cv_.notify_all();
+      return status;
+    }
+    durable_lsn_ = std::max(durable_lsn_, batch_target);
+    if (durable_lsn_ < flush_target_lsn_) {
+      lock.unlock();
+      continue;
+    }
+    last_flush_status_ = Status::Ok();
+    flush_in_progress_ = false;
+    ++flush_generation_;
+    flush_cv_.notify_all();
+    return Status::Ok();
+  }
 }
 
 void LogManager::FailNextFlushForTesting() noexcept {
@@ -351,9 +464,12 @@ void LogManager::FailNextFlushForTesting() noexcept {
 }
 
 Status LogManager::Truncate() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> append_lock(append_mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
+  flush_cv_.wait(lock, [&] { return !flush_in_progress_; });
   auto open_status = EnsureOpenUnlocked();
   if (!open_status.ok()) return open_status;
+  std::lock_guard<std::mutex> file_lock(file_mutex_);
   file_.flush();
   file_.close();
   std::error_code ec;
@@ -363,6 +479,8 @@ Status LogManager::Truncate() {
   if (!file_.is_open()) return Status::IOError("cannot reopen truncated WAL");
   append_lsn_ = kInvalidLsn;
   durable_lsn_ = kInvalidLsn;
+  flush_target_lsn_ = kInvalidLsn;
+  last_flush_status_ = Status::Ok();
   return Status::Ok();
 }
 

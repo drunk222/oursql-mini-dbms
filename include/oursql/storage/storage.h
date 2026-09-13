@@ -24,6 +24,7 @@ namespace oursql {
 
 class Catalog;
 class LogManager;
+class LockManager;
 
 class Page {
  public:
@@ -364,6 +365,8 @@ class BufferPoolManager {
 
   // 调用者：读查询；作用：获取页面的共享读 guard；返回：guard 或错误状态。
   [[nodiscard]] Result<ReadPageGuard> FetchPage(page_id_t page_id);
+  [[nodiscard]] Result<ReadPageGuard> FetchPage(page_id_t page_id,
+                                                  Transaction *transaction);
   // 调用者：写查询或存储层；作用：获取页面的独占写 guard；返回：guard 或错误状态。
   [[nodiscard]] Result<WritePageGuard> FetchPageWrite(page_id_t page_id);
   // 调用者：插入或页面创建流程；作用：申请并获取新的空白页面；返回：写 guard 或错误状态。
@@ -371,6 +374,7 @@ class BufferPoolManager {
   // 调用者：HeapTable 或页面创建流程；作用：申请并获取新的写 guard 页面；返回：guard 或错误状态。
   [[nodiscard]] Result<WritePageGuard> NewPageGuarded() { return NewPage(); }
   [[nodiscard]] Status SetLogManager(LogManager *log_manager);
+  [[nodiscard]] Status SetLockManager(LockManager *lock_manager);
   [[nodiscard]] Status RestorePage(page_id_t page_id, const Page &page,
                                     bool write_disk = true);
   [[nodiscard]] Result<WritePageGuard> FetchPageWrite(page_id_t page_id,
@@ -441,6 +445,8 @@ class BufferPoolManager {
                                          const std::array<std::byte, Page::kSize> &before,
                                          bool *logged) noexcept;
   [[nodiscard]] Status AppendPageFreeLog(page_id_t page_id, Transaction *transaction);
+  [[nodiscard]] Status AcquirePageLock(page_id_t page_id, Transaction *transaction,
+                                       LockMode mode);
   [[nodiscard]] Status FlushFrameToDisk(page_id_t page_id, const Page &page,
                                         lsn_t page_lsn);
   [[nodiscard]] Status EnsureReadyUnlocked() const;
@@ -450,7 +456,9 @@ class BufferPoolManager {
   std::size_t pool_size_{0};
   DiskManager *disk_manager_{nullptr};
   LogManager *log_manager_{nullptr};
+  LockManager *lock_manager_{nullptr};
   bool log_manager_bound_{false};
+  bool lock_manager_bound_{false};
   ReplacementPolicy replacement_policy_{ReplacementPolicy::FIFO};
   FlushPolicy flush_policy_{FlushPolicy::WriteBack};
   Status init_status_;

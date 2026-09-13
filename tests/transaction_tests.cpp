@@ -627,6 +627,218 @@ bool TestCommittedPageFreeRecovery(const std::filesystem::path &database) {
   return true;
 }
 
+bool TestCommitUncertain(const std::filesystem::path &database) {
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  if (!Check(disk.Open(database).ok(), "CommitUncertain database open") ||
+      !Check(log.Open(database).ok(), "CommitUncertain WAL open")) {
+    return false;
+  }
+  oursql::BufferPoolManager pool(2, &disk);
+  if (!Check(pool.SetLogManager(&log).ok(), "CommitUncertain WAL binding")) return false;
+  oursql::TransactionManager transactions(&log, &pool, &disk);
+  auto begin = transactions.Begin(true);
+  if (!Check(begin.ok(), "CommitUncertain begin")) return false;
+  auto page = pool.NewPage(begin.value());
+  if (!Check(page.ok(), "CommitUncertain page allocation")) return false;
+  page.value().Data()[0] = std::byte{0x7a};
+  if (!Check(page.value().MarkDirty().ok() && page.value().Release().ok(),
+             "CommitUncertain page release")) {
+    return false;
+  }
+
+  log.FailNextFlushForTesting();
+  const auto first_commit = transactions.Commit(begin.value());
+  const bool uncertain = Check(!first_commit.ok(), "CommitUncertain first commit fails") &&
+                         Check(begin.value()->state() == oursql::TransactionState::CommitUncertain,
+                               "failed COMMIT flush enters CommitUncertain") &&
+                         Check(begin.value()->commit_lsn() != oursql::kInvalidLsn,
+                               "CommitUncertain preserves commit LSN") &&
+                         Check(!transactions.Abort(begin.value()).ok(),
+                               "CommitUncertain cannot be aborted") &&
+                         Check(transactions.GetTransaction(begin.value()->id()) != nullptr,
+                               "CommitUncertain remains owned for retry");
+  if (!uncertain) return false;
+
+  const auto retry = transactions.Commit(begin.value());
+  if (!Check(retry.ok(), "CommitUncertain COMMIT retry succeeds") ||
+      !Check(begin.value()->state() == oursql::TransactionState::Committed,
+             "successful retry enters Committed") ||
+      !Check(transactions.GetTransaction(begin.value()->id()) == nullptr,
+             "committed transaction cleanup removes transaction")) {
+    return false;
+  }
+  auto records = log.Scan();
+  std::size_t commit_count = 0;
+  if (records.ok()) {
+    for (const auto &record : records.value()) {
+      if (record.txn_id == begin.value()->id() &&
+          record.type == oursql::LogRecordType::Commit) {
+        ++commit_count;
+      }
+    }
+  }
+  const bool result = Check(records.ok() && commit_count == 1,
+                            "CommitUncertain retry does not append a second COMMIT") &&
+                      Check(pool.Close().ok(), "CommitUncertain pool close") &&
+                      Check(log.Close().ok(), "CommitUncertain WAL close") &&
+                      Check(disk.Close().ok(), "CommitUncertain database close");
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+  return result;
+}
+
+bool TestCommitAbortRecovery(const std::filesystem::path &database) {
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+  oursql::page_id_t page_id = oursql::INVALID_PAGE_ID;
+  {
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!Check(disk.Open(database).ok(), "Commit-Abort database open") ||
+        !Check(log.Open(database).ok(), "Commit-Abort WAL open")) {
+      return false;
+    }
+    auto page = disk.AllocatePage();
+    if (!Check(page.ok(), "Commit-Abort page allocation")) return false;
+    page_id = page.value();
+    oursql::LogRecord begin;
+    begin.type = oursql::LogRecordType::Begin;
+    begin.txn_id = 501;
+    auto begin_lsn = log.Append(begin);
+    oursql::LogRecord update;
+    update.type = oursql::LogRecordType::PageUpdate;
+    update.txn_id = 501;
+    update.prev_lsn = begin_lsn.ok() ? begin_lsn.value() : oursql::kInvalidLsn;
+    update.page_id = page_id;
+    update.before_image.assign(oursql::Page::kSize, std::byte{0x00});
+    update.after_image.assign(oursql::Page::kSize, std::byte{0x5d});
+    auto update_lsn = log.Append(update);
+    oursql::LogRecord commit;
+    commit.type = oursql::LogRecordType::Commit;
+    commit.txn_id = 501;
+    commit.prev_lsn = update_lsn.ok() ? update_lsn.value() : oursql::kInvalidLsn;
+    auto commit_lsn = log.Append(commit);
+    oursql::LogRecord abort;
+    abort.type = oursql::LogRecordType::Abort;
+    abort.txn_id = 501;
+    abort.prev_lsn = commit_lsn.ok() ? commit_lsn.value() : oursql::kInvalidLsn;
+    auto abort_lsn = log.Append(abort);
+    if (!Check(begin_lsn.ok() && update_lsn.ok() && commit_lsn.ok() && abort_lsn.ok(),
+               "Commit-Abort WAL records") ||
+        !Check(log.Flush(abort_lsn.value()).ok(), "Commit-Abort WAL durable") ||
+        !Check(log.Close().ok() && disk.Close().ok(), "Commit-Abort setup close")) {
+      return false;
+    }
+  }
+
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  if (!Check(disk.Open(database).ok(), "Commit-Abort recovery database open") ||
+      !Check(log.Open(database).ok(), "Commit-Abort recovery WAL open")) {
+    return false;
+  }
+  oursql::RecoveryManager recovery(&log, &disk);
+  auto recovered = recovery.Recover();
+  auto page = disk.ReadPage(page_id);
+  const bool result = Check(recovered.ok(), "Commit-Abort recovery succeeds") &&
+                      Check(page.ok() && page.value().Data()[0] == std::byte{0x00},
+                            "Commit followed by Abort is not redone as a winner") &&
+                      Check(log.Close().ok() && disk.Close().ok(), "Commit-Abort recovery close");
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+  return result;
+}
+
+bool TestTransactionalDeletePagesFailure(const std::filesystem::path &database) {
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  if (!Check(disk.Open(database).ok(), "DeletePages failure database open") ||
+      !Check(log.Open(database).ok(), "DeletePages failure WAL open")) {
+    return false;
+  }
+  oursql::BufferPoolManager pool(4, &disk);
+  if (!Check(pool.SetLogManager(&log).ok(), "DeletePages failure WAL binding")) return false;
+  std::vector<oursql::page_id_t> pages;
+  for (int value = 1; value <= 3; ++value) {
+    auto page = disk.AllocatePage();
+    if (!Check(page.ok(), "DeletePages failure page allocation")) return false;
+    pages.push_back(page.value());
+    auto guard = pool.FetchPageWrite(page.value());
+    if (!Check(guard.ok(), "DeletePages failure page fetch")) return false;
+    guard.value().Data()[0] = std::byte{static_cast<unsigned char>(value)};
+    if (!Check(guard.value().MarkDirty().ok() && guard.value().Release().ok(),
+               "DeletePages failure page write")) {
+      return false;
+    }
+  }
+  if (!Check(pool.FlushAllPages().ok(), "DeletePages failure initial flush")) return false;
+
+  oursql::TransactionManager transactions(&log, &pool, &disk);
+  auto begin = transactions.Begin(true);
+  if (!Check(begin.ok(), "DeletePages failure transaction begin")) return false;
+  bool failed = false;
+  {
+    auto pinned = pool.FetchPage(pages[2]);
+    if (!Check(pinned.ok(), "DeletePages failure pin third page")) return false;
+    const auto failed_delete = pool.DeletePages(pages, begin.value());
+    failed = Check(!failed_delete.ok(), "DeletePages failure rejects pinned page") &&
+             Check(begin.value()->state() == oursql::TransactionState::Failed,
+                   "DeletePages failure marks transaction Failed") &&
+             Check(!transactions.Commit(begin.value()).ok(),
+                   "Failed DeletePages transaction cannot commit") &&
+             Check(transactions.Abort(begin.value()).ok(),
+                   "Failed DeletePages transaction aborts");
+  }
+  if (!failed) return false;
+  for (std::size_t i = 0; i < pages.size(); ++i) {
+    auto guard = pool.FetchPage(pages[i]);
+    if (!Check(guard.ok() && guard.value().Data()[0] ==
+                           std::byte{static_cast<unsigned char>(i + 1)},
+               "Abort restores every page after partial DeletePages")) {
+      return false;
+    }
+  }
+  bool result = true;
+  auto commit_begin = transactions.Begin(true);
+  if (!Check(commit_begin.ok(), "DeletePages retry transaction begin")) {
+    result = false;
+  } else {
+    const auto delete_status = pool.DeletePages(pages, commit_begin.value());
+    if (!Check(delete_status.ok(), "DeletePages retry reserves every page")) {
+      result = false;
+      (void)transactions.Abort(commit_begin.value());
+    } else if (!Check(transactions.Commit(commit_begin.value()).ok(),
+                      "DeletePages retry commits every page")) {
+      result = false;
+    }
+  }
+  auto reused = pool.NewPage();
+  const auto reused_id = reused.ok() ? reused.value().PageId() : oursql::INVALID_PAGE_ID;
+  const bool reused_page = reused.ok() &&
+                           (reused_id == pages[0] || reused_id == pages[1] ||
+                            reused_id == pages[2]);
+  if (!Check(reused_page, "committed page frees are reusable")) result = false;
+  if (reused.ok() && !Check(reused.value().Release().ok(), "release reused page")) {
+    result = false;
+  }
+  if (reused.ok() && !Check(pool.DeletePage(reused_id).ok(),
+                             "cleanup reused page")) {
+    result = false;
+  }
+  const bool closed = Check(pool.Close().ok(), "DeletePages failure pool close") &&
+                      Check(log.Close().ok(), "DeletePages failure WAL close") &&
+                      Check(disk.Close().ok(), "DeletePages failure database close");
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+  return result && closed;
+}
+
 bool TestTransactions(const std::filesystem::path &database, const char *argv0) {
   std::filesystem::remove(database);
   std::filesystem::remove(database.string() + ".wal");
@@ -892,6 +1104,118 @@ bool TestStructuralCrashRecovery(const std::filesystem::path &split_database,
   return true;
 }
 
+bool TestRecoveryResumesClr(const std::filesystem::path &database) {
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+
+  oursql::page_id_t page_id = oursql::INVALID_PAGE_ID;
+  oursql::lsn_t clr_lsn = oursql::kInvalidLsn;
+  {
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!Check(disk.Open(database).ok() && log.Open(database).ok(),
+               "CLR setup files should open")) {
+      return false;
+    }
+    auto allocated = disk.AllocatePage();
+    if (!Check(allocated.ok(), "CLR setup page allocation")) return false;
+    page_id = allocated.value();
+
+    oursql::Page before_page;
+    std::fill(before_page.Data(), before_page.Data() + oursql::Page::kSize,
+              std::byte{0x11});
+    if (!Check(disk.WritePage(page_id, before_page).ok(), "CLR setup before image write")) {
+      return false;
+    }
+
+    oursql::LogRecord begin;
+    begin.type = oursql::LogRecordType::Begin;
+    begin.txn_id = 77;
+    auto begin_lsn = log.Append(begin);
+    if (!Check(begin_lsn.ok(), "CLR setup begin log")) return false;
+
+    oursql::LogRecord update;
+    update.type = oursql::LogRecordType::PageUpdate;
+    update.txn_id = 77;
+    update.prev_lsn = begin_lsn.value();
+    update.page_id = page_id;
+    update.before_image.assign(oursql::Page::kSize, std::byte{0x11});
+    update.after_image.assign(oursql::Page::kSize, std::byte{0x22});
+    auto update_lsn = log.Append(update);
+    if (!Check(update_lsn.ok(), "CLR setup update log")) return false;
+
+    oursql::Page after_page;
+    std::fill(after_page.Data(), after_page.Data() + oursql::Page::kSize,
+              std::byte{0x22});
+    if (!Check(disk.WritePage(page_id, after_page).ok(), "CLR setup after image write")) {
+      return false;
+    }
+
+    oursql::LogRecord compensation;
+    compensation.type = oursql::LogRecordType::Compensation;
+    compensation.txn_id = 77;
+    compensation.prev_lsn = update_lsn.value();
+    compensation.page_id = page_id;
+    compensation.undo_next_lsn = begin_lsn.value();
+    compensation.compensation_type = oursql::LogRecordType::PageUpdate;
+    compensation.after_image.assign(oursql::Page::kSize, std::byte{0x11});
+    auto compensation_result = log.Append(std::move(compensation));
+    if (!Check(compensation_result.ok(), "CLR setup compensation log")) return false;
+    clr_lsn = compensation_result.value();
+    if (!Check(log.Flush(clr_lsn).ok(), "CLR setup flush")) return false;
+    if (!Check(log.Close().ok() && disk.Close().ok(), "CLR setup close")) return false;
+  }
+
+  bool page_restored = false;
+  bool clr_decoded = false;
+  {
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!Check(disk.Open(database).ok() && log.Open(database).ok(),
+               "CLR recovery files should reopen")) {
+      return false;
+    }
+    oursql::RecoveryManager recovery(&log, &disk);
+    if (!Check(recovery.Recover().ok(), "CLR recovery should complete")) return false;
+    auto page = disk.ReadPage(page_id);
+    if (page.ok()) {
+      page_restored = page.value().Data()[0] == std::byte{0x11};
+    }
+    auto records = log.Scan();
+    if (records.ok()) {
+      for (const auto &record : records.value()) {
+        if (record.lsn == clr_lsn && record.type == oursql::LogRecordType::Compensation &&
+            record.undo_next_lsn != oursql::kInvalidLsn &&
+            record.compensation_type == oursql::LogRecordType::PageUpdate &&
+            record.after_image.size() == oursql::Page::kSize) {
+          clr_decoded = true;
+        }
+      }
+    }
+    const bool first_close = Check(log.Close().ok() && disk.Close().ok(),
+                                   "CLR recovery close");
+    if (!first_close) return false;
+  }
+
+  {
+    oursql::DiskManager disk;
+    oursql::LogManager log;
+    if (!Check(disk.Open(database).ok() && log.Open(database).ok(),
+               "CLR repeat files should reopen")) {
+      return false;
+    }
+    oursql::RecoveryManager recovery(&log, &disk);
+    const bool repeat_ok = Check(recovery.Recover().ok(), "CLR recovery should be repeatable") &&
+                           Check(log.Close().ok() && disk.Close().ok(),
+                                 "CLR repeat close");
+    if (!repeat_ok) return false;
+  }
+  std::filesystem::remove(database);
+  std::filesystem::remove(database.string() + ".wal");
+  return Check(page_restored, "CLR redo should restore the page after an interrupted undo") &&
+         Check(clr_decoded, "CLR fields should survive WAL encode and decode");
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -918,12 +1242,20 @@ int main(int argc, char **argv) {
   const auto crc_database = BuildPath(argv[0], "transaction-crc-tests.oursql");
   const auto id_database = BuildPath(argv[0], "transaction-id-tests.oursql");
   const auto fault_database = BuildPath(argv[0], "transaction-wal-fault-tests.oursql");
+  const auto uncertain_database = BuildPath(argv[0], "transaction-uncertain-tests.oursql");
+  const auto commit_abort_database = BuildPath(argv[0], "transaction-commit-abort-tests.oursql");
+  const auto delete_pages_database = BuildPath(argv[0], "transaction-delete-pages-tests.oursql");
+  const auto clr_database = BuildPath(argv[0], "transaction-clr-tests.oursql");
   const auto split_database = BuildPath(argv[0], "transaction-split-crash-tests.oursql");
   const auto merge_database = BuildPath(argv[0], "transaction-merge-crash-tests.oursql");
   bool ok = TestLogManager(database) &&
             TestWalCorruption(crc_database) &&
             TestTransactionIdSeed(id_database) &&
             TestWalBeforeDataFailures(fault_database) &&
+            TestCommitUncertain(uncertain_database) &&
+            TestCommitAbortRecovery(commit_abort_database) &&
+            TestTransactionalDeletePagesFailure(delete_pages_database) &&
+            TestRecoveryResumesClr(clr_database) &&
             TestTransactionalPageLifecycle(page_lifecycle_database) &&
             TestCommittedPageFreeRecovery(page_free_database) &&
             TestTransactions(database, argv[0]) &&

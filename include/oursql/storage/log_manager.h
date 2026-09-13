@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -22,6 +23,7 @@ enum class LogRecordType : std::uint16_t {
   Commit = 5,
   Abort = 6,
   Checkpoint = 7,
+  Compensation = 8,
 };
 
 // A decoded WAL record. PageUpdate uses full before/after page images.
@@ -31,6 +33,10 @@ struct LogRecord {
   txn_id_t txn_id{kInvalidTxnId};
   lsn_t prev_lsn{kInvalidLsn};
   page_id_t page_id{INVALID_PAGE_ID};
+  // Compensation records point to the next original record to undo. When
+  // present, after_image is the page image produced by that undo.
+  lsn_t undo_next_lsn{kInvalidLsn};
+  LogRecordType compensation_type{LogRecordType::Checkpoint};
   std::vector<std::byte> before_image;
   std::vector<std::byte> after_image;
 };
@@ -80,8 +86,15 @@ class LogManager {
   std::filesystem::path path_;
   mutable std::fstream file_;
   mutable std::mutex mutex_;
+  mutable std::mutex file_mutex_;
+  mutable std::mutex append_mutex_;
+  std::condition_variable flush_cv_;
   bool open_{false};
   bool fail_next_flush_for_testing_{false};
+  bool flush_in_progress_{false};
+  lsn_t flush_target_lsn_{kInvalidLsn};
+  std::uint64_t flush_generation_{0};
+  Status last_flush_status_{Status::Ok()};
   lsn_t append_lsn_{kInvalidLsn};
   lsn_t durable_lsn_{kInvalidLsn};
 };

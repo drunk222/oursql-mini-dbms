@@ -207,6 +207,12 @@ Status DiskManager::CloseUnlocked() {
     file_.flush();
     file_.close();
     if (!file_) {
+      // Keep the logical state consistent when the stream reports a close error.
+      is_open_ = false;
+      page_count_ = 1;
+      free_list_head_ = INVALID_PAGE_ID;
+      catalog_head_ = INVALID_PAGE_ID;
+      free_pages_.clear();
       return Status::IOError("关闭数据库文件失败: " + PathToUtf8(file_path_));
     }
   }

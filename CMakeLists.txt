@@ -54,6 +54,9 @@ target_link_libraries(oursql_tests PRIVATE oursql_core)
 add_executable(oursql_storage_tests tests/storage_disk_manager_tests.cpp)
 target_link_libraries(oursql_storage_tests PRIVATE oursql_core)
 
+add_executable(oursql_storage_contract_tests tests/storage_contract_tests.cpp)
+target_link_libraries(oursql_storage_contract_tests PRIVATE oursql_core)
+
 add_executable(oursql_slotted_page_tests tests/slotted_page_tests.cpp)
 target_link_libraries(oursql_slotted_page_tests PRIVATE oursql_core)
 
@@ -87,6 +90,7 @@ target_link_libraries(oursql_index_benchmark PRIVATE oursql_core)
 enable_testing()
 add_test(NAME oursql_tests COMMAND oursql_tests)
 add_test(NAME oursql_storage_tests COMMAND oursql_storage_tests)
+add_test(NAME oursql_storage_contract_tests COMMAND oursql_storage_contract_tests)
 add_test(NAME oursql_slotted_page_tests COMMAND oursql_slotted_page_tests)
 add_test(NAME oursql_frontend_tests COMMAND oursql_frontend_tests)
 add_test(NAME oursql_optimizer_tests COMMAND oursql_optimizer_tests)

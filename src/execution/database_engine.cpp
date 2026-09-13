@@ -29,17 +29,58 @@ Status Contextualize(const char *layer, const Status &status) {
   return Status::InternalError(message);
 }
 
+bool IsDmlPlan(const Plan &plan) {
+  return std::visit(
+      [](const auto &operation) {
+        using Type = std::decay_t<decltype(operation)>;
+        return std::is_same_v<Type, InsertPlan> || std::is_same_v<Type, DeletePlan> ||
+               std::is_same_v<Type, UpdatePlan>;
+      },
+      plan);
+}
+
+bool IsDdlPlan(const Plan &plan) {
+  return std::visit(
+      [](const auto &operation) {
+        using Type = std::decay_t<decltype(operation)>;
+        return std::is_same_v<Type, CreateTablePlan> || std::is_same_v<Type, DropTablePlan> ||
+               std::is_same_v<Type, CreateIndexPlan> || std::is_same_v<Type, DropIndexPlan> ||
+               std::is_same_v<Type, AlterTablePlan>;
+      },
+      plan);
+}
+
 }  // namespace
 
 DatabaseEngine::DatabaseEngine(std::filesystem::path file_path, std::size_t pool_size,
                                ReplacementPolicy replacement_policy, FlushPolicy flush_policy)
-    : buffer_pool_(pool_size, &disk_manager_, replacement_policy, flush_policy),
+    : log_manager_(),
+      buffer_pool_(pool_size, &disk_manager_, replacement_policy, flush_policy),
+      transaction_manager_(&log_manager_, &buffer_pool_, &disk_manager_),
+      recovery_manager_(&log_manager_, &disk_manager_),
       catalog_(&buffer_pool_, &disk_manager_),
       execution_engine_(&catalog_, &buffer_pool_),
       init_status_(Status::Ok()) {
   init_status_ = buffer_pool_.GetInitStatus();
   if (!init_status_.ok()) return;
   init_status_ = disk_manager_.Open(file_path);
+  if (!init_status_.ok()) return;
+  init_status_ = log_manager_.Open(file_path);
+  if (!init_status_.ok()) return;
+  init_status_ = recovery_manager_.Recover();
+  if (!init_status_.ok()) return;
+  auto next_txn_id = log_manager_.GetNextTransactionIdSeed();
+  if (!next_txn_id.ok()) {
+    init_status_ = Contextualize("Transaction recovery", next_txn_id.status());
+    return;
+  }
+  // Recovery has completed all redo/undo writes. A static checkpoint now makes
+  // it safe to discard the WAL before the normal Catalog/SQL layers open.
+  init_status_ = Checkpoint();
+  if (!init_status_.ok()) return;
+  init_status_ = transaction_manager_.SetNextTxnId(next_txn_id.value());
+  if (!init_status_.ok()) return;
+  init_status_ = buffer_pool_.SetLogManager(&log_manager_);
   if (!init_status_.ok()) return;
   init_status_ = catalog_.Open();
 }
@@ -48,16 +89,43 @@ DatabaseEngine::~DatabaseEngine() {
   (void)Close();
 }
 
+Status DatabaseEngine::RollbackAndReloadCatalog() {
+  auto rollback = transaction_manager_.Rollback();
+  if (!rollback.ok()) return rollback;
+  return catalog_.Reload();
+}
+
 Status DatabaseEngine::Close() {
   if (closed_) return Status::Ok();
   if (!init_status_.ok()) {
+    (void)log_manager_.Close();
+    (void)disk_manager_.Close();
     closed_ = true;
     return init_status_;
   }
-  auto buffer_status = buffer_pool_.Close();
+  Status first_error = Status::Ok();
+  if (transaction_manager_.HasActive()) {
+    if (transaction_manager_.Active()->state() == TransactionState::Committed) {
+      // COMMIT is irreversible. Keep the WAL available if deferred cleanup still fails.
+      first_error = transaction_manager_.FinalizeCommittedCleanup();
+    } else {
+      first_error = RollbackAndReloadCatalog();
+    }
+  }
+  if (!first_error.ok()) return Contextualize("DatabaseEngine", first_error);
+
+  first_error = Checkpoint();
+  if (!first_error.ok()) return Contextualize("DatabaseEngine", first_error);
+
+  const auto buffer_status = buffer_pool_.Close();
   if (!buffer_status.ok()) return Contextualize("DatabaseEngine", buffer_status);
-  auto disk_status = disk_manager_.Close();
+
+  const auto disk_status = disk_manager_.Close();
   if (!disk_status.ok()) return Contextualize("DatabaseEngine", disk_status);
+
+  const auto log_status = log_manager_.Close();
+  if (!log_status.ok()) return Contextualize("DatabaseEngine", log_status);
+
   closed_ = true;
   return Status::Ok();
 }
@@ -80,6 +148,25 @@ Status DatabaseEngine::Flush() {
   if (!init_status_.ok()) return Contextualize("DatabaseEngine", init_status_);
   if (closed_) return Status::InvalidArgument("DatabaseEngine 已关闭");
   return buffer_pool_.FlushAllPages();
+}
+
+Status DatabaseEngine::Checkpoint() {
+  if (!init_status_.ok()) return Contextualize("DatabaseEngine", init_status_);
+  if (closed_) return Status::InvalidArgument("DatabaseEngine is closed");
+  if (transaction_manager_.HasActive()) {
+    return Status::InvalidArgument("checkpoint requires no active transaction");
+  }
+  auto status = log_manager_.Flush(log_manager_.GetAppendLsn());
+  if (!status.ok()) return status;
+  status = buffer_pool_.FlushAllPages();
+  if (!status.ok()) return status;
+  LogRecord checkpoint;
+  checkpoint.type = LogRecordType::Checkpoint;
+  auto checkpoint_lsn = log_manager_.Append(std::move(checkpoint));
+  if (!checkpoint_lsn.ok()) return checkpoint_lsn.status();
+  status = log_manager_.Flush(checkpoint_lsn.value());
+  if (!status.ok()) return status;
+  return log_manager_.Truncate();
 }
 
 DatabaseStatistics DatabaseEngine::GetStatistics() const {
@@ -126,6 +213,10 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
   // 1. 文本 SQL 变成 AST（Statement）。语法不合法会在此返回。
   auto statements = parser_.Parse(sql);
   if (!statements.ok()) {
+    if (transaction_manager_.HasActive() &&
+        transaction_manager_.Active()->state() == TransactionState::Active) {
+      transaction_manager_.Active()->MarkFailed();
+    }
     return Result<std::vector<ExecutionResult>>(Contextualize("Parser/Lexer", statements.status()));
   }
   std::vector<ExecutionResult> results;
@@ -133,10 +224,104 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(std::string
   for (const auto &statement : statements.value()) {
     // 2. AST 做表/列/类型等语义检查，并变成可执行的 Plan。
     auto plan = planner_.Build(statement, catalog_);
-    if (!plan.ok()) return Result<std::vector<ExecutionResult>>(Contextualize("Planner", plan.status()));
+    if (!plan.ok()) {
+      if (transaction_manager_.HasActive() &&
+          transaction_manager_.Active()->state() == TransactionState::Active) {
+        transaction_manager_.Active()->MarkFailed();
+      }
+      return Result<std::vector<ExecutionResult>>(Contextualize("Planner", plan.status()));
+    }
     // 3. Plan 由执行器落实为 Catalog/HeapTable 操作或查询结果。
-    auto result = execution_engine_.Execute(plan.value());
-    if (!result.ok()) return Result<std::vector<ExecutionResult>>(Contextualize("Execution", result.status()));
+    const auto &compiled_plan = plan.value();
+    if (std::holds_alternative<TransactionPlan>(compiled_plan)) {
+      const auto action = std::get<TransactionPlan>(compiled_plan).action;
+      if (transaction_manager_.HasActive()) {
+        const auto state = transaction_manager_.Active()->state();
+        if (state == TransactionState::Failed && action != TransactionAction::Rollback) {
+          return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
+              "failed transaction only allows ROLLBACK"));
+        }
+        if (state == TransactionState::Committed && action != TransactionAction::Commit) {
+          return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
+              "committed transaction cleanup only allows COMMIT retry"));
+        }
+      }
+      Status transaction_status = Status::Ok();
+      if (action == TransactionAction::Begin) {
+        auto begin = transaction_manager_.Begin(true);
+        if (!begin.ok()) transaction_status = begin.status();
+      } else if (action == TransactionAction::Commit) {
+        transaction_status = transaction_manager_.Commit();
+      } else {
+        transaction_status = RollbackAndReloadCatalog();
+      }
+      if (!transaction_status.ok()) {
+        return Result<std::vector<ExecutionResult>>(
+            Contextualize("Transaction", transaction_status));
+      }
+      results.push_back(ExecutionResult{});
+      continue;
+    }
+    if (transaction_manager_.HasActive() &&
+        transaction_manager_.Active()->state() != TransactionState::Active) {
+      return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
+          "transaction is not usable; issue ROLLBACK first"));
+    }
+    if (transaction_manager_.HasActive() && IsDdlPlan(compiled_plan)) {
+      transaction_manager_.Active()->MarkFailed();
+      return Result<std::vector<ExecutionResult>>(Status::InvalidArgument(
+          "DDL is not allowed inside an explicit transaction"));
+    }
+    const bool dml = IsDmlPlan(compiled_plan);
+    Transaction *transaction = transaction_manager_.Active();
+    bool autocommit = false;
+    if (dml && transaction == nullptr) {
+      auto begin = transaction_manager_.Begin(false);
+      if (!begin.ok()) {
+        return Result<std::vector<ExecutionResult>>(Contextualize("Transaction", begin.status()));
+      }
+      transaction = begin.value();
+      autocommit = true;
+    }
+    auto result = execution_engine_.Execute(compiled_plan, ExecutionContext{transaction});
+    if (!result.ok()) {
+      if (transaction != nullptr) transaction->MarkFailed();
+      if (autocommit) {
+        auto rollback = RollbackAndReloadCatalog();
+        if (!rollback.ok()) {
+          return Result<std::vector<ExecutionResult>>(
+              Contextualize("Transaction rollback", rollback));
+        }
+      }
+      return Result<std::vector<ExecutionResult>>(Contextualize("Execution", result.status()));
+    }
+    if (transaction != nullptr && !transaction->IsUsableForWork()) {
+      const auto transaction_failure = Status::IOError(
+          "transaction became failed while recording a page update");
+      if (autocommit) {
+        auto rollback = RollbackAndReloadCatalog();
+        if (!rollback.ok()) {
+          return Result<std::vector<ExecutionResult>>(
+              Contextualize("Transaction rollback", rollback));
+        }
+      }
+      return Result<std::vector<ExecutionResult>>(
+          Contextualize("Transaction", transaction_failure));
+    }
+    if (autocommit) {
+      auto commit = transaction_manager_.Commit();
+      if (!commit.ok()) {
+        if (transaction_manager_.HasActive() &&
+            transaction_manager_.Active()->state() != TransactionState::Committed) {
+          auto rollback = RollbackAndReloadCatalog();
+          if (!rollback.ok()) {
+            return Result<std::vector<ExecutionResult>>(
+                Contextualize("Transaction rollback", rollback));
+          }
+        }
+        return Result<std::vector<ExecutionResult>>(Contextualize("Transaction", commit));
+      }
+    }
     results.push_back(std::move(result.value()));
   }
   return Result<std::vector<ExecutionResult>>(std::move(results));

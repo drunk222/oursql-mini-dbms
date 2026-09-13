@@ -688,6 +688,139 @@ bool TestIndexSqlRestartAndConsistency() {
                "最终重启应恢复DROP后重建的索引元数据");
 }
 
+bool TestFailedTransactionState() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 3);
+  if (!Check(engine.GetInitStatus().ok(), "Failed transaction test engine should open")) {
+    return false;
+  }
+  if (!Check(engine.ExecuteSql("CREATE TABLE student(id INT, name VARCHAR);").ok(),
+             "Failed transaction test table setup")) {
+    return false;
+  }
+  if (!Check(engine.ExecuteSql("BEGIN;").ok(), "Failed transaction test begin")) return false;
+
+  auto parser_error = engine.ExecuteSql("SELECT FROM student;");
+  if (!Check(!parser_error.ok(), "parser error should be reported inside transaction")) {
+    return false;
+  }
+  auto select_while_failed = engine.ExecuteSql("SELECT * FROM student;");
+  auto insert_while_failed = engine.ExecuteSql("INSERT INTO student VALUES(1, 'blocked');");
+  auto commit_while_failed = engine.ExecuteSql("COMMIT;");
+  auto begin_while_failed = engine.ExecuteSql("BEGIN;");
+  if (!Check(!select_while_failed.ok() && !insert_while_failed.ok() &&
+                 !commit_while_failed.ok() && !begin_while_failed.ok(),
+             "Failed transaction must reject work, COMMIT, and BEGIN")) {
+    return false;
+  }
+  if (!Check(engine.ExecuteSql("ROLLBACK;").ok(),
+             "Failed transaction must allow ROLLBACK")) {
+    return false;
+  }
+  auto after_rollback = engine.ExecuteSql("SELECT * FROM student;");
+  if (!Check(after_rollback.ok() && after_rollback.value().rows.empty(),
+             "normal SQL should resume after ROLLBACK")) {
+    return false;
+  }
+
+  if (!Check(engine.ExecuteSql("BEGIN;").ok(), "planner failure transaction begin")) return false;
+  auto planner_error = engine.ExecuteSql("SELECT * FROM missing;");
+  if (!Check(!planner_error.ok(), "planner error should be reported inside transaction")) {
+    return false;
+  }
+  auto blocked_after_planner_error = engine.ExecuteSql("SELECT * FROM student;");
+  if (!Check(!blocked_after_planner_error.ok(),
+             "planner failure must put transaction into Failed state")) {
+    return false;
+  }
+  return Check(engine.ExecuteSql("ROLLBACK;").ok(),
+               "planner-failed transaction must be recoverable by ROLLBACK") &&
+         Check(engine.Close().ok(), "Failed transaction test close");
+}
+
+bool TestHeapAndIndexTransactions() {
+  TempDb temp;
+  {
+    oursql::DatabaseEngine engine(temp.path, 3);
+    if (!Check(engine.GetInitStatus().ok(), "Heap/index transaction engine should open")) {
+      return false;
+    }
+    if (!Check(engine.ExecuteSql(
+                   "CREATE TABLE student(id INT, name VARCHAR(16));"
+                   "INSERT INTO student VALUES(1, 'Alice');"
+                   "INSERT INTO student VALUES(2, 'Bob');"
+                   "CREATE UNIQUE INDEX idx_student_id ON student(id);")
+                   .ok(),
+               "Heap/index transaction setup")) {
+      return false;
+    }
+
+    if (!Check(engine.ExecuteSql("BEGIN;").ok() &&
+                   engine.ExecuteSql("INSERT INTO student VALUES(10, 'rolled_back');").ok() &&
+                   engine.ExecuteSql("ROLLBACK;").ok(),
+               "indexed INSERT rollback")) {
+      return false;
+    }
+    auto rolled_back_insert = engine.ExecuteSql("SELECT * FROM student WHERE id = 10;");
+    if (!Check(rolled_back_insert.ok() && rolled_back_insert.value().rows.empty(),
+               "rolled-back indexed INSERT must disappear from Heap and index")) {
+      return false;
+    }
+
+    if (!Check(engine.ExecuteSql("BEGIN;").ok() &&
+                   engine.ExecuteSql("UPDATE student SET id = 20 WHERE id = 1;").ok() &&
+                   engine.ExecuteSql("ROLLBACK;").ok(),
+               "indexed UPDATE rollback")) {
+      return false;
+    }
+    auto old_key = engine.ExecuteSql("SELECT * FROM student WHERE id = 1;");
+    auto new_key = engine.ExecuteSql("SELECT * FROM student WHERE id = 20;");
+    if (!Check(old_key.ok() && old_key.value().rows.size() == 1 &&
+                   new_key.ok() && new_key.value().rows.empty(),
+               "rolled-back indexed UPDATE must restore old key and row")) {
+      return false;
+    }
+
+    if (!Check(engine.ExecuteSql("BEGIN;").ok() &&
+                   engine.ExecuteSql("DELETE FROM student WHERE id = 2;").ok() &&
+                   engine.ExecuteSql("ROLLBACK;").ok(),
+               "indexed DELETE rollback")) {
+      return false;
+    }
+    auto restored_delete = engine.ExecuteSql("SELECT * FROM student WHERE id = 2;");
+    if (!Check(restored_delete.ok() && restored_delete.value().rows.size() == 1,
+               "rolled-back indexed DELETE must restore Heap and index entry")) {
+      return false;
+    }
+
+    if (!Check(engine.ExecuteSql("BEGIN;").ok() &&
+                   engine.ExecuteSql("INSERT INTO student VALUES(30, 'committed');").ok() &&
+                   engine.ExecuteSql("COMMIT;").ok(),
+               "indexed INSERT commit")) {
+      return false;
+    }
+    auto committed = engine.ExecuteSql("SELECT * FROM student WHERE id = 30;");
+    if (!Check(committed.ok() && committed.value().rows.size() == 1,
+               "committed indexed INSERT must be visible")) {
+      return false;
+    }
+    if (!Check(engine.Close().ok(), "Heap/index transaction first close")) return false;
+  }
+
+  oursql::DatabaseEngine reopened(temp.path, 3);
+  auto one = reopened.ExecuteSql("SELECT * FROM student WHERE id = 1;");
+  auto two = reopened.ExecuteSql("SELECT * FROM student WHERE id = 2;");
+  auto ten = reopened.ExecuteSql("SELECT * FROM student WHERE id = 10;");
+  auto thirty = reopened.ExecuteSql("SELECT * FROM student WHERE id = 30;");
+  const bool ok = Check(reopened.GetInitStatus().ok(), "Heap/index transaction restart") &&
+                  Check(one.ok() && one.value().rows.size() == 1 &&
+                            two.ok() && two.value().rows.size() == 1 &&
+                            ten.ok() && ten.value().rows.empty() &&
+                            thirty.ok() && thirty.value().rows.size() == 1,
+                        "Heap and index must agree after restart");
+  return reopened.Close().ok() && ok;
+}
+
 }  // namespace
 
 int main() {
@@ -738,6 +871,16 @@ int main() {
   }
   if (TestIndexSqlRestartAndConsistency()) {
     std::cout << "[PASS] Index SQL restart and consistency\n";
+  } else {
+    return 1;
+  }
+  if (TestFailedTransactionState()) {
+    std::cout << "[PASS] Failed transaction state\n";
+  } else {
+    return 1;
+  }
+  if (TestHeapAndIndexTransactions()) {
+    std::cout << "[PASS] Heap and index transactions\n";
   } else {
     return 1;
   }

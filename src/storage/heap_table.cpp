@@ -108,6 +108,10 @@ Result<HeapTable::ScanCursor> HeapTable::BeginScan() {
 }
 
 Result<RID> HeapTable::InsertRow(const Row &row) {
+  return InsertRow(row, nullptr);
+}
+
+Result<RID> HeapTable::InsertRow(const Row &row, Transaction *transaction) {
   if (buffer_pool_ == nullptr) return Result<RID>(Status::InvalidArgument("HeapTable 缺少 BufferPoolManager"));
   if (metadata_.first_data_page_id == INVALID_PAGE_ID || metadata_.first_data_page_id == 0) {
     return Result<RID>(Status::InvalidArgument("HeapTable 缺少首数据页"));
@@ -127,7 +131,7 @@ Result<RID> HeapTable::InsertRow(const Row &row) {
       return Result<RID>(Status::InvalidArgument("数据页链表损坏或成环"));
     }
     if (!current_guard.has_value()) {
-      auto page_result = buffer_pool_->FetchPageWrite(current);
+      auto page_result = buffer_pool_->FetchPageWrite(current, transaction);
       if (!page_result.ok()) return Result<RID>(page_result.status());
       current_guard.emplace(std::move(page_result.value()));
     }
@@ -141,7 +145,7 @@ Result<RID> HeapTable::InsertRow(const Row &row) {
     if (!next_result.ok()) return Result<RID>(next_result.status());
     const page_id_t next = next_result.value();
     if (next != INVALID_PAGE_ID) {
-      auto next_page_result = buffer_pool_->FetchPageWrite(next);
+      auto next_page_result = buffer_pool_->FetchPageWrite(next, transaction);
       if (!next_page_result.ok()) return Result<RID>(next_page_result.status());
       auto next_guard = std::move(next_page_result.value());
       const auto release_status = current_guard->Release();
@@ -153,26 +157,26 @@ Result<RID> HeapTable::InsertRow(const Row &row) {
     }
 
     // 尾页仍由当前 WriteGuard 保护，创建和链接新页期间不会出现两个后继。
-    auto new_page_result = buffer_pool_->NewPageGuarded();
+    auto new_page_result = buffer_pool_->NewPage(transaction);
     if (!new_page_result.ok()) return Result<RID>(new_page_result.status());
     auto new_page = std::move(new_page_result.value());
     const page_id_t new_page_id = new_page.PageId();
     auto init_status = SlottedPage::Initialize(new_page);
     if (!init_status.ok()) {
       (void)new_page.Release();
-      (void)buffer_pool_->DeletePage(new_page_id);
+      (void)buffer_pool_->DeletePage(new_page_id, transaction);
       return Result<RID>(init_status);
     }
     auto new_slot = SlottedPage::InsertRecord(new_page, encoded.value());
     if (!new_slot.ok()) {
       (void)new_page.Release();
-      (void)buffer_pool_->DeletePage(new_page_id);
+      (void)buffer_pool_->DeletePage(new_page_id, transaction);
       return Result<RID>(new_slot.status());
     }
     auto link_status = SlottedPage::SetNextPageId(*current_guard, new_page_id);
     if (!link_status.ok()) {
       (void)new_page.Release();
-      (void)buffer_pool_->DeletePage(new_page_id);
+      (void)buffer_pool_->DeletePage(new_page_id, transaction);
       return Result<RID>(link_status);
     }
     const auto release_status = current_guard->Release();
@@ -235,11 +239,15 @@ Result<Row> HeapTable::GetRow(const RID &rid) {
 }
 
 Status HeapTable::DeleteRow(const RID &rid) {
+  return DeleteRow(rid, nullptr);
+}
+
+Status HeapTable::DeleteRow(const RID &rid, Transaction *transaction) {
   if (buffer_pool_ == nullptr) return Status::InvalidArgument("HeapTable 缺少 BufferPoolManager");
   auto ownership = ValidateRidPage(rid.page_id);
   if (!ownership.ok()) return ownership;
 
-  auto target_result = buffer_pool_->FetchPageWrite(rid.page_id);
+  auto target_result = buffer_pool_->FetchPageWrite(rid.page_id, transaction);
   if (!target_result.ok()) return target_result.status();
   auto target_page = std::move(target_result.value());
   auto next_result = SlottedPage::NextPageId(target_page);
@@ -284,7 +292,7 @@ Status HeapTable::DeleteRow(const RID &rid) {
     return Status::InternalError("已确认归属的数据页找不到前驱: " + std::to_string(rid.page_id));
   }
 
-  auto predecessor_result = buffer_pool_->FetchPageWrite(predecessor);
+  auto predecessor_result = buffer_pool_->FetchPageWrite(predecessor, transaction);
   if (!predecessor_result.ok()) return predecessor_result.status();
   auto predecessor_page = std::move(predecessor_result.value());
   auto predecessor_next = SlottedPage::NextPageId(predecessor_page);
@@ -293,7 +301,7 @@ Status HeapTable::DeleteRow(const RID &rid) {
     return Status::InvalidArgument("删除空数据页时发现链表已变化");
   }
 
-  auto target_again_result = buffer_pool_->FetchPageWrite(rid.page_id);
+  auto target_again_result = buffer_pool_->FetchPageWrite(rid.page_id, transaction);
   if (!target_again_result.ok()) return target_again_result.status();
   auto target_again = std::move(target_again_result.value());
   auto target_next_again = SlottedPage::NextPageId(target_again);
@@ -320,7 +328,19 @@ Status HeapTable::DeleteRow(const RID &rid) {
   const auto target_release = target_again.Release();
   const auto predecessor_release = predecessor_page.Release();
   if (!target_release.ok() || !predecessor_release.ok()) {
+    const auto cancel_status = buffer_pool_->CancelPageDeletion(rid.page_id);
+    if (!cancel_status.ok() && cancel_status.code() != ErrorCode::NotFound) {
+      return Status::IOError("取消数据页删除预留失败: " + cancel_status.message());
+    }
     return !target_release.ok() ? target_release : predecessor_release;
+  }
+  if (transaction != nullptr) {
+    auto log_status = buffer_pool_->DeletePage(rid.page_id, transaction);
+    if (!log_status.ok()) {
+      (void)buffer_pool_->CancelPageDeletion(rid.page_id);
+      return log_status;
+    }
+    return Status::Ok();
   }
   return buffer_pool_->FinalizePageDeletion(rid.page_id);
 }

@@ -3,6 +3,9 @@
 #include "oursql/execution/executor.h"
 #include "oursql/parser/parser.h"
 #include "oursql/planner/planner.h"
+#include "oursql/recovery/recovery_manager.h"
+#include "oursql/storage/log_manager.h"
+#include "oursql/transaction/transaction_manager.h"
 
 #include <filesystem>
 #include <cstddef>
@@ -44,6 +47,7 @@ class DatabaseEngine {
   [[nodiscard]] Result<TableMetadata> GetTableMetadata(std::string_view table_name) const;
   // 调用者：CLI 或测试；作用：显式写回缓冲池脏页；返回：成功或 I/O 错误。
   [[nodiscard]] Status Flush();
+  [[nodiscard]] Status Checkpoint();
   // 调用者：CLI 或答辩基准；作用：读取当前存储统计；返回：统计快照。
   [[nodiscard]] DatabaseStatistics GetStatistics() const;
   // 调用者：CLI 或性能测试；作用：只清零存储统计、不清缓存；返回：成功或引擎状态错误。
@@ -59,8 +63,13 @@ class DatabaseEngine {
   [[nodiscard]] Result<ExecutionResult> ExecuteSql(std::string_view sql);
 
  private:
+  [[nodiscard]] Status RollbackAndReloadCatalog();
+
   DiskManager disk_manager_;
+  LogManager log_manager_;
   BufferPoolManager buffer_pool_;
+  TransactionManager transaction_manager_;
+  RecoveryManager recovery_manager_;
   Catalog catalog_;
   Parser parser_;
   Planner planner_;

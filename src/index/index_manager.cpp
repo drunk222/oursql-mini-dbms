@@ -6,14 +6,26 @@
 
 namespace oursql {
 
+namespace {
+
+Status MarkTransactionFailed(Transaction *transaction, Status status) {
+  if (transaction != nullptr) transaction->MarkFailed();
+  return status;
+}
+
+}  // namespace
+
 Result<std::unique_ptr<BPlusTree>> IndexManager::OpenTree(
-    const IndexMetadata &metadata) const {
+    const IndexMetadata &metadata, Transaction *transaction) const {
   if (buffer_pool_ == nullptr) {
     return Result<std::unique_ptr<BPlusTree>>(
         Status::InvalidArgument("IndexManager缺少BufferPoolManager"));
   }
   return Result<std::unique_ptr<BPlusTree>>(
-      std::make_unique<BPlusTree>(buffer_pool_, metadata.root_page_id));
+      std::make_unique<BPlusTree>(buffer_pool_, metadata.root_page_id,
+                                  BPlusTreeLeafPage::kPhysicalMaxSize,
+                                  BPlusTreeInternalPage::kPhysicalMaxSize,
+                                  transaction));
 }
 
 Result<std::size_t> IndexManager::IndexedColumn(const IndexMetadata &metadata) const {
@@ -32,9 +44,10 @@ Result<std::size_t> IndexManager::IndexedColumn(const IndexMetadata &metadata) c
 
 Status IndexManager::PersistRootIfChanged(const IndexMetadata &metadata,
                                           const BPlusTree &tree,
-                                          page_id_t old_root) {
+                                          page_id_t old_root,
+                                          Transaction *transaction) {
   if (tree.GetRootPageId() == old_root) return Status::Ok();
-  return catalog_->UpdateIndexRootPageId(metadata.name, tree.GetRootPageId());
+  return catalog_->UpdateIndexRootPageId(metadata.name, tree.GetRootPageId(), transaction);
 }
 
 Status IndexManager::CreateIndex(std::string_view index_name,
@@ -111,67 +124,108 @@ Status IndexManager::DropIndex(std::string_view index_name) {
 }
 
 Status IndexManager::InsertEntry(std::string_view index_name, index_key_t key, RID rid) {
-  if (catalog_ == nullptr) return Status::InvalidArgument("IndexManager缺少Catalog");
+  return InsertEntry(index_name, key, rid, nullptr);
+}
+
+Status IndexManager::InsertEntry(std::string_view index_name, index_key_t key, RID rid,
+                                 Transaction *transaction) {
+  if (catalog_ == nullptr) {
+    return MarkTransactionFailed(transaction,
+                                 Status::InvalidArgument("IndexManager缺少Catalog"));
+  }
   auto found = catalog_->FindIndex(index_name);
-  if (!found.ok()) return found.status();
+  if (!found.ok()) return MarkTransactionFailed(transaction, found.status());
   const auto metadata = *found.value();
-  auto tree_result = OpenTree(metadata);
-  if (!tree_result.ok()) return tree_result.status();
+  auto tree_result = OpenTree(metadata, transaction);
+  if (!tree_result.ok()) return MarkTransactionFailed(transaction, tree_result.status());
   auto &tree = *tree_result.value();
   if (metadata.is_unique) {
     auto existing = tree.GetValue(key);
-    if (!existing.ok()) return existing.status();
-    if (!existing.value().empty()) return Status::AlreadyExists("唯一索引Key已存在");
+    if (!existing.ok()) return MarkTransactionFailed(transaction, existing.status());
+    if (!existing.value().empty()) {
+      return MarkTransactionFailed(transaction, Status::AlreadyExists("唯一索引Key已存在"));
+    }
   }
   const auto old_root = tree.GetRootPageId();
   auto status = tree.Insert(key, rid);
-  if (!status.ok()) return status;
-  return PersistRootIfChanged(metadata, tree, old_root);
+  if (!status.ok()) return MarkTransactionFailed(transaction, status);
+  status = PersistRootIfChanged(metadata, tree, old_root, transaction);
+  if (!status.ok()) return MarkTransactionFailed(transaction, status);
+  return status;
 }
 
 Status IndexManager::DeleteEntry(std::string_view index_name, index_key_t key, RID rid) {
-  if (catalog_ == nullptr) return Status::InvalidArgument("IndexManager缺少Catalog");
+  return DeleteEntry(index_name, key, rid, nullptr);
+}
+
+Status IndexManager::DeleteEntry(std::string_view index_name, index_key_t key, RID rid,
+                                 Transaction *transaction) {
+  if (catalog_ == nullptr) {
+    return MarkTransactionFailed(transaction,
+                                 Status::InvalidArgument("IndexManager缺少Catalog"));
+  }
   auto found = catalog_->FindIndex(index_name);
-  if (!found.ok()) return found.status();
+  if (!found.ok()) return MarkTransactionFailed(transaction, found.status());
   const auto metadata = *found.value();
-  auto tree_result = OpenTree(metadata);
-  if (!tree_result.ok()) return tree_result.status();
+  auto tree_result = OpenTree(metadata, transaction);
+  if (!tree_result.ok()) return MarkTransactionFailed(transaction, tree_result.status());
   auto &tree = *tree_result.value();
   const auto old_root = tree.GetRootPageId();
   auto status = tree.Remove(key, rid);
-  if (!status.ok()) return status;
-  return PersistRootIfChanged(metadata, tree, old_root);
+  if (!status.ok()) return MarkTransactionFailed(transaction, status);
+  status = PersistRootIfChanged(metadata, tree, old_root, transaction);
+  if (!status.ok()) return MarkTransactionFailed(transaction, status);
+  return status;
 }
 
 Status IndexManager::UpdateEntry(std::string_view index_name, index_key_t old_key,
                                  RID old_rid, index_key_t new_key, RID new_rid) {
+  return UpdateEntry(index_name, old_key, old_rid, new_key, new_rid, nullptr);
+}
+
+Status IndexManager::UpdateEntry(std::string_view index_name, index_key_t old_key,
+                                 RID old_rid, index_key_t new_key, RID new_rid,
+                                 Transaction *transaction) {
   if (old_key == new_key && old_rid == new_rid) return Status::Ok();
-  if (catalog_ == nullptr) return Status::InvalidArgument("IndexManager缺少Catalog");
+  if (catalog_ == nullptr) {
+    return MarkTransactionFailed(transaction,
+                                 Status::InvalidArgument("IndexManager缺少Catalog"));
+  }
   auto found = catalog_->FindIndex(index_name);
-  if (!found.ok()) return found.status();
+  if (!found.ok()) return MarkTransactionFailed(transaction, found.status());
   const auto metadata = *found.value();
-  auto tree_result = OpenTree(metadata);
-  if (!tree_result.ok()) return tree_result.status();
+  auto tree_result = OpenTree(metadata, transaction);
+  if (!tree_result.ok()) return MarkTransactionFailed(transaction, tree_result.status());
   auto &tree = *tree_result.value();
   if (metadata.is_unique) {
     auto existing = tree.GetValue(new_key);
-    if (!existing.ok()) return existing.status();
+    if (!existing.ok()) return MarkTransactionFailed(transaction, existing.status());
     for (const auto &candidate : existing.value()) {
-      if (candidate != old_rid) return Status::AlreadyExists("唯一索引Key已存在");
+      if (candidate != old_rid) {
+        return MarkTransactionFailed(transaction,
+                                     Status::AlreadyExists("唯一索引Key已存在"));
+      }
     }
   }
   const auto old_root = tree.GetRootPageId();
   auto status = tree.Remove(old_key, old_rid);
-  if (!status.ok()) return status;
+  if (!status.ok()) return MarkTransactionFailed(transaction, status);
   status = tree.Insert(new_key, new_rid);
   if (!status.ok()) {
-    (void)tree.Insert(old_key, old_rid);
-    return status;
+    if (transaction == nullptr) (void)tree.Insert(old_key, old_rid);
+    return MarkTransactionFailed(transaction, status);
   }
-  return PersistRootIfChanged(metadata, tree, old_root);
+  status = PersistRootIfChanged(metadata, tree, old_root, transaction);
+  if (!status.ok()) return MarkTransactionFailed(transaction, status);
+  return status;
 }
 
 Status IndexManager::OnInsert(std::string_view table_name, const Row &row, RID rid) {
+  return OnInsert(table_name, row, rid, nullptr);
+}
+
+Status IndexManager::OnInsert(std::string_view table_name, const Row &row, RID rid,
+                              Transaction *transaction) {
   if (catalog_ == nullptr || buffer_pool_ == nullptr) {
     return Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager");
   }
@@ -182,23 +236,32 @@ Status IndexManager::OnInsert(std::string_view table_name, const Row &row, RID r
   std::vector<PreparedEntry> prepared;
   for (const auto &metadata : catalog_->ListTableIndexes(table_name)) {
     auto column = IndexedColumn(metadata);
-    if (!column.ok()) return column.status();
-    if (column.value() >= row.size()) return Status::InvalidArgument("索引维护行列数不足");
+    if (!column.ok()) return MarkTransactionFailed(transaction, column.status());
+    if (column.value() >= row.size()) {
+      return MarkTransactionFailed(transaction, Status::InvalidArgument("索引维护行列数不足"));
+    }
     const auto key = row[column.value()].AsInt();
     if (metadata.is_unique) {
       auto existing = Lookup(metadata.name, key);
-      if (!existing.ok()) return existing.status();
-      if (!existing.value().empty()) return Status::AlreadyExists("唯一索引Key已存在");
+      if (!existing.ok()) return MarkTransactionFailed(transaction, existing.status());
+      if (!existing.value().empty()) {
+        return MarkTransactionFailed(transaction, Status::AlreadyExists("唯一索引Key已存在"));
+      }
     }
     prepared.push_back({metadata, key});
   }
   std::size_t applied = 0;
   for (; applied < prepared.size(); ++applied) {
-    auto status = InsertEntry(prepared[applied].metadata.name, prepared[applied].key, rid);
+    auto status = InsertEntry(prepared[applied].metadata.name, prepared[applied].key, rid,
+                              transaction);
     if (!status.ok()) {
-      while (applied > 0) {
-        --applied;
-        (void)DeleteEntry(prepared[applied].metadata.name, prepared[applied].key, rid);
+      if (transaction == nullptr) {
+        while (applied > 0) {
+          --applied;
+          (void)DeleteEntry(prepared[applied].metadata.name, prepared[applied].key, rid);
+        }
+      } else {
+        transaction->MarkFailed();
       }
       return status;
     }
@@ -207,6 +270,11 @@ Status IndexManager::OnInsert(std::string_view table_name, const Row &row, RID r
 }
 
 Status IndexManager::OnDelete(std::string_view table_name, const Row &row, RID rid) {
+  return OnDelete(table_name, row, rid, nullptr);
+}
+
+Status IndexManager::OnDelete(std::string_view table_name, const Row &row, RID rid,
+                              Transaction *transaction) {
   if (catalog_ == nullptr || buffer_pool_ == nullptr) {
     return Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager");
   }
@@ -217,17 +285,24 @@ Status IndexManager::OnDelete(std::string_view table_name, const Row &row, RID r
   std::vector<PreparedEntry> prepared;
   for (const auto &metadata : catalog_->ListTableIndexes(table_name)) {
     auto column = IndexedColumn(metadata);
-    if (!column.ok()) return column.status();
-    if (column.value() >= row.size()) return Status::InvalidArgument("索引维护行列数不足");
+    if (!column.ok()) return MarkTransactionFailed(transaction, column.status());
+    if (column.value() >= row.size()) {
+      return MarkTransactionFailed(transaction, Status::InvalidArgument("索引维护行列数不足"));
+    }
     prepared.push_back({metadata, row[column.value()].AsInt()});
   }
   std::size_t applied = 0;
   for (; applied < prepared.size(); ++applied) {
-    auto status = DeleteEntry(prepared[applied].metadata.name, prepared[applied].key, rid);
+    auto status = DeleteEntry(prepared[applied].metadata.name, prepared[applied].key, rid,
+                              transaction);
     if (!status.ok()) {
-      while (applied > 0) {
-        --applied;
-        (void)InsertEntry(prepared[applied].metadata.name, prepared[applied].key, rid);
+      if (transaction == nullptr) {
+        while (applied > 0) {
+          --applied;
+          (void)InsertEntry(prepared[applied].metadata.name, prepared[applied].key, rid);
+        }
+      } else {
+        transaction->MarkFailed();
       }
       return status;
     }
@@ -237,6 +312,12 @@ Status IndexManager::OnDelete(std::string_view table_name, const Row &row, RID r
 
 Status IndexManager::OnUpdate(std::string_view table_name, const Row &old_row,
                               RID old_rid, const Row &new_row, RID new_rid) {
+  return OnUpdate(table_name, old_row, old_rid, new_row, new_rid, nullptr);
+}
+
+Status IndexManager::OnUpdate(std::string_view table_name, const Row &old_row,
+                              RID old_rid, const Row &new_row, RID new_rid,
+                              Transaction *transaction) {
   if (catalog_ == nullptr || buffer_pool_ == nullptr) {
     return Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager");
   }
@@ -248,17 +329,20 @@ Status IndexManager::OnUpdate(std::string_view table_name, const Row &old_row,
   std::vector<PreparedUpdate> prepared;
   for (const auto &metadata : catalog_->ListTableIndexes(table_name)) {
     auto column = IndexedColumn(metadata);
-    if (!column.ok()) return column.status();
+    if (!column.ok()) return MarkTransactionFailed(transaction, column.status());
     if (column.value() >= old_row.size() || column.value() >= new_row.size()) {
-      return Status::InvalidArgument("索引维护行列数不足");
+      return MarkTransactionFailed(transaction, Status::InvalidArgument("索引维护行列数不足"));
     }
     const auto old_key = old_row[column.value()].AsInt();
     const auto new_key = new_row[column.value()].AsInt();
     if (metadata.is_unique) {
       auto existing = Lookup(metadata.name, new_key);
-      if (!existing.ok()) return existing.status();
+      if (!existing.ok()) return MarkTransactionFailed(transaction, existing.status());
       for (const auto &candidate : existing.value()) {
-        if (candidate != old_rid) return Status::AlreadyExists("唯一索引Key已存在");
+        if (candidate != old_rid) {
+          return MarkTransactionFailed(transaction,
+                                       Status::AlreadyExists("唯一索引Key已存在"));
+        }
       }
     }
     prepared.push_back({metadata, old_key, new_key});
@@ -266,12 +350,16 @@ Status IndexManager::OnUpdate(std::string_view table_name, const Row &old_row,
   std::size_t applied = 0;
   for (; applied < prepared.size(); ++applied) {
     auto status = UpdateEntry(prepared[applied].metadata.name, prepared[applied].old_key,
-                              old_rid, prepared[applied].new_key, new_rid);
+                              old_rid, prepared[applied].new_key, new_rid, transaction);
     if (!status.ok()) {
-      while (applied > 0) {
-        --applied;
-        (void)UpdateEntry(prepared[applied].metadata.name, prepared[applied].new_key,
-                          new_rid, prepared[applied].old_key, old_rid);
+      if (transaction == nullptr) {
+        while (applied > 0) {
+          --applied;
+          (void)UpdateEntry(prepared[applied].metadata.name, prepared[applied].new_key,
+                            new_rid, prepared[applied].old_key, old_rid);
+        }
+      } else {
+        transaction->MarkFailed();
       }
       return status;
     }

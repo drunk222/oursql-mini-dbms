@@ -19,7 +19,8 @@
 - 全部成功后，该 HeapTable 对象的 `first_data_page_id` 副本变为 `INVALID_PAGE_ID`，对象不能继续扫描、插入或删除。
 - 它不删除 Catalog 表元数据，不删除索引，也不解析或执行 `DROP TABLE`。
 
-当前没有事务和 WAL。如果多页释放阶段发生 I/O 错误，可能已经释放部分页面；后续需要事务/WAL 才能保证整条 DDL 原子性。
+当前版本已经接入单活动事务、WAL 和启动恢复。事务路径会记录页面更新、页面分配和延迟页面释放；
+多页释放的跨页原子性仍由事务提交/回滚路径负责，非事务直接调用仍不应被包装成 DDL 原子操作。
 
 ### `DatabaseEngine::ResetStatistics()`
 
@@ -170,7 +171,7 @@ BufferPool。Guard 析构时先释放页锁，再减少 pin，避免形成 Frame
 脏页淘汰流程是：Replacer 选出 frame 后进入 `Evicting`，释放 BufferPool 锁，在 Frame latch
 下写旧 page，再读取新 page；两次 I/O 都成功后才发布新映射。`FlushPage()` 和 `FlushAllPages()`
 同样先做短暂状态登记，然后在全局锁外等待页锁和执行写盘；成功清除 dirty，失败保留 dirty、
-恢复 `Valid` 并返回错误。当前没有 WAL，因此没有跨页崩溃原子性。
+恢复 `Valid` 并返回错误。若页面带有 WAL LSN，写数据页前会先要求对应 WAL 刷到磁盘。
 
 空页回收失败时会保留 `DeletePending` 记录，页面链不会指向已进入 Free List 的页面；调用方可
 在修复 I/O 或结构条件后重试 `FinalizePageDeletion()`，也可调用 `CancelPageDeletion()` 恢复可访问状态。
@@ -180,13 +181,37 @@ BufferPool。Guard 析构时先释放页锁，再减少 pin，避免形成 Frame
 
 - 文件 I/O 仍只允许出现在 `DiskManager`；HeapTable、Catalog、索引和执行层通过 Guard 与
   BufferPoolManager 访问页面。
-- 当前没有事务、MVCC、WAL、后台刷脏线程、并发表级修改和完整 B+ 树算法扩展。
+- 当前支持单活动事务、WAL、启动恢复和静态 Checkpoint；仍没有 MVCC、后台刷脏线程、并发表级修改和
+  完整 B+ 树算法扩展。
 - B+ 树父子节点、兄弟节点的锁耦合、分裂、合并和根收缩不属于本轮，仍由索引模块负责；本轮只
   对 HeapTable 数据页链实现锁耦合。
-- 当前没有跨页操作的崩溃原子性；将来接入 WAL 时，淘汰、Flush、WriteThrough 和 Close 都必须
-  遵守日志先于数据页的顺序。
+- 当前跨页操作的原子性范围限于已经接入事务的路径；淘汰、Flush、WriteThrough 和 Close 对带 LSN 的
+  页面都遵守日志先于数据页的顺序，但这不等同于完整 ARIES。
 - 没有后台异步 I/O 线程池；DiskManager 仍以自身 mutex 串行保护同一数据库文件的访问。
 - 页级读写锁保护单个 frame 的字节访问；它与 `pin_count` 是两件事：锁防止同时读写，pin
   防止页面在使用期间被替换。
 - BufferPool 的并发测试使用条件变量协调两个读 guard 和读写等待，不依赖随意 sleep；多个
   ReadPageGuard 可以共享读锁，WritePageGuard 获取独占锁，guard 释放后等待者继续执行。
+
+## Web 集成可用的 C 契约
+
+C 侧不新增 Web、HTTP 或 JSON 类型。A 侧可以在自己的全局互斥范围内调用现有
+`DatabaseEngine::GetStatistics()`、`GetBufferSnapshots()`、`GetEvictionLog()`、`Flush()` 和
+`Close()`。这些返回值都是值类型或容器副本，不包含文件句柄、Page 指针、Frame 指针或 Guard。
+
+统计由 BufferPool 和 DiskManager 的受保护计数器组成；每个底层读取接口都持有对应内部锁。
+如果调用方要把一次 SQL、统计读取和刷盘视为一个服务请求，应像 Web Prompt 规定的那样在
+`DatabaseEngine` 外层使用同一把互斥锁。C 侧内部锁不能替代服务层的请求串行化，也不能把
+`pin_count` 当作页内容读写锁。
+
+`Flush()` 成功只表示当前可见脏页已经按 WAL-before-data 规则写回；任何 WAL 或数据页 I/O
+失败都会返回错误，失败后的 dirty 状态会保留以便重试。`Close()` 成功后 BufferPool 不再接受
+新的页面操作，重复 Close 返回成功；C 侧不替调用方关闭非拥有的 `DiskManager`，由
+`DatabaseEngine` 按 Checkpoint -> BufferPool -> DiskManager -> LogManager 顺序关闭。
+
+本轮存储契约测试命令为：
+
+```text
+cmake --build build --config Debug --target oursql_storage_contract_tests
+ctest --test-dir build -C Debug -R oursql_storage_contract_tests --output-on-failure
+```

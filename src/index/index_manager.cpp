@@ -227,7 +227,8 @@ Status IndexManager::OnInsert(std::string_view table_name, const Row &row, RID r
 Status IndexManager::OnInsert(std::string_view table_name, const Row &row, RID rid,
                               Transaction *transaction) {
   if (catalog_ == nullptr || buffer_pool_ == nullptr) {
-    return Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager");
+    return MarkTransactionFailed(
+        transaction, Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager"));
   }
   struct PreparedEntry {
     IndexMetadata metadata;
@@ -276,7 +277,8 @@ Status IndexManager::OnDelete(std::string_view table_name, const Row &row, RID r
 Status IndexManager::OnDelete(std::string_view table_name, const Row &row, RID rid,
                               Transaction *transaction) {
   if (catalog_ == nullptr || buffer_pool_ == nullptr) {
-    return Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager");
+    return MarkTransactionFailed(
+        transaction, Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager"));
   }
   struct PreparedEntry {
     IndexMetadata metadata;
@@ -319,7 +321,8 @@ Status IndexManager::OnUpdate(std::string_view table_name, const Row &old_row,
                               RID old_rid, const Row &new_row, RID new_rid,
                               Transaction *transaction) {
   if (catalog_ == nullptr || buffer_pool_ == nullptr) {
-    return Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager");
+    return MarkTransactionFailed(
+        transaction, Status::InvalidArgument("IndexManager需要Catalog和BufferPoolManager"));
   }
   struct PreparedUpdate {
     IndexMetadata metadata;

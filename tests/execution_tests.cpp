@@ -82,6 +82,94 @@ bool TestMinimumChainAndRestart() {
   return reopened.Close().ok() && ok;
 }
 
+bool TestWebFacingDatabaseContracts() {
+  TempDb temp;
+  {
+    oursql::DatabaseEngine engine(temp.path, 3);
+    if (!Check(engine.GetInitStatus().ok(),
+               "Web-facing contract database should open")) {
+      return false;
+    }
+    auto results = engine.ExecuteSqlBatch(
+        "CREATE TABLE zeta(id INT);"
+        "CREATE TABLE student(id INT, name VARCHAR);"
+        "INSERT INTO student VALUES(1, 'Alice');"
+        "INSERT INTO student VALUES(2, 'Bob');"
+        "SELECT * FROM student;"
+        "SELECT name FROM student WHERE id = 2;"
+        "DELETE FROM student WHERE id = 1;"
+        "SELECT * FROM student;");
+    if (!Check(results.ok() && results.value().size() == 8,
+               "Web-facing CRUD batch should return one result per statement")) {
+      return false;
+    }
+    const auto &projected = results.value()[5];
+    const auto &deleted = results.value()[6];
+    const auto &remaining = results.value()[7];
+    if (!Check(projected.column_names == std::vector<std::string>{"name"} &&
+                   projected.rows.size() == 1 &&
+                   projected.rows[0][0].AsVarchar() == "Bob",
+               "Web-facing projection should expose stable column names and values") ||
+        !Check(deleted.affected_rows == 1,
+               "Web-facing DELETE should expose the affected row count") ||
+        !Check(remaining.column_names == std::vector<std::string>{"id", "name"} &&
+                   remaining.rows.size() == 1 &&
+                   remaining.rows[0].size() == remaining.column_names.size() &&
+                   remaining.rows[0][0].AsInt() == 2 &&
+                   remaining.rows[0][1].AsVarchar() == "Bob",
+               "Web-facing final SELECT should contain only Bob")) {
+      return false;
+    }
+
+    auto tables = engine.ListTables();
+    if (!Check(tables.size() == 2 && tables[0].name == "student" &&
+                   tables[1].name == "zeta",
+               "ListTables should return stable name-sorted metadata copies")) {
+      return false;
+    }
+    tables[0].name = "mutated-client-copy";
+    const auto tables_again = engine.ListTables();
+    if (!Check(tables_again[0].name == "student",
+               "ListTables result should not expose mutable Catalog state")) {
+      return false;
+    }
+
+    auto metadata = engine.GetTableMetadata("student");
+    auto missing = engine.GetTableMetadata("missing");
+    if (!Check(metadata.ok() && metadata.value().schema.size() == 2 &&
+                   metadata.value().schema.At(0).name == "id" &&
+                   metadata.value().schema.At(0).type == oursql::DataType::Int &&
+                   metadata.value().schema.At(1).name == "name" &&
+                   metadata.value().schema.At(1).type == oursql::DataType::Varchar,
+               "GetTableMetadata should preserve column order and types") ||
+        !Check(!missing.ok() &&
+                   missing.status().code() == oursql::ErrorCode::NotFound,
+               "GetTableMetadata should report NotFound for a missing table")) {
+      return false;
+    }
+    metadata.value().name = "mutated-metadata-copy";
+    auto metadata_again = engine.GetTableMetadata("student");
+    if (!Check(metadata_again.ok() && metadata_again.value().name == "student",
+               "GetTableMetadata should return an independent value copy")) {
+      return false;
+    }
+    if (!Check(engine.Close().ok(), "Web-facing contract database should close")) {
+      return false;
+    }
+  }
+
+  oursql::DatabaseEngine reopened(temp.path, 3);
+  if (!Check(reopened.GetInitStatus().ok(),
+             "Web-facing contract database should reopen")) {
+    return false;
+  }
+  auto row = reopened.ExecuteSql("SELECT * FROM student WHERE id = 2;");
+  return Check(row.ok() && row.value().rows.size() == 1 &&
+                   row.value().rows[0][1].AsVarchar() == "Bob",
+               "Web-facing database results should persist across restart") &&
+         reopened.Close().ok();
+}
+
 bool TestFilterProjectionDeleteAndErrors() {
   TempDb temp;
   oursql::DatabaseEngine engine(temp.path, 3);
@@ -782,6 +870,23 @@ bool TestHeapAndIndexTransactions() {
     }
 
     if (!Check(engine.ExecuteSql("BEGIN;").ok() &&
+                   engine.ExecuteSql(
+                       "UPDATE student SET name = 'Temporary' WHERE id = 1;")
+                       .ok() &&
+                   engine.ExecuteSql("ROLLBACK;").ok(),
+               "same-key new-RID indexed UPDATE rollback")) {
+      return false;
+    }
+    auto same_key_restored =
+        engine.ExecuteSql("SELECT * FROM student WHERE id = 1;");
+    if (!Check(same_key_restored.ok() &&
+                   same_key_restored.value().rows.size() == 1 &&
+                   same_key_restored.value().rows[0][1].AsVarchar() == "Alice",
+               "rollback must restore an indexed row when only its RID changed")) {
+      return false;
+    }
+
+    if (!Check(engine.ExecuteSql("BEGIN;").ok() &&
                    engine.ExecuteSql("DELETE FROM student WHERE id = 2;").ok() &&
                    engine.ExecuteSql("ROLLBACK;").ok(),
                "indexed DELETE rollback")) {
@@ -942,6 +1047,11 @@ bool TestTransactionCommandStateErrors() {
 int main() {
   if (TestMinimumChainAndRestart()) {
     std::cout << "[PASS] Minimum execution chain and restart\n";
+  } else {
+    return 1;
+  }
+  if (TestWebFacingDatabaseContracts()) {
+    std::cout << "[PASS] Web-facing database contracts\n";
   } else {
     return 1;
   }

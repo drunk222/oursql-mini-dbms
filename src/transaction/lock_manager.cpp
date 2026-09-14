@@ -1,13 +1,42 @@
 #include "oursql/transaction/lock_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 namespace oursql {
 
 namespace {
+
+thread_local std::size_t current_event_session = 0;
+
+const char *ResourceName(LockResourceType type) noexcept {
+  switch (type) {
+    case LockResourceType::Schema: return "schema";
+    case LockResourceType::Table: return "table";
+    case LockResourceType::Page: return "page";
+    case LockResourceType::IndexKey: return "index_key";
+  }
+  return "unknown";
+}
+
+const char *TableModeName(TableLockMode mode) noexcept {
+  switch (mode) {
+    case TableLockMode::IS: return "IS";
+    case TableLockMode::IX: return "IX";
+    case TableLockMode::S: return "S";
+    case TableLockMode::SIX: return "SIX";
+    case TableLockMode::X: return "X";
+  }
+  return "?";
+}
+
+const char *LockModeName(LockMode mode) noexcept {
+  return mode == LockMode::X ? "X" : "S";
+}
 
 Status ValidateTransaction(Transaction *transaction) {
   if (transaction == nullptr) {
@@ -85,6 +114,7 @@ Status LockManager::LockInternal(Transaction *transaction, LockId lock_id,
     request = std::prev(queue.requests.end());
   }
 
+  bool wait_recorded = false;
   while (true) {
     if (request->cancelled) {
       queue.requests.erase(request);
@@ -102,8 +132,15 @@ Status LockManager::LockInternal(Transaction *transaction, LockId lock_id,
       request->granted = true;
       request->upgrading = false;
       transaction->AddGrantedLock(lock_id);
+      EmitEventUnlocked("GRANTED", lock_id, TableModeName(mode),
+                        transaction->id());
       queue.cv.notify_all();
       return Status::Ok();
+    }
+    if (!wait_recorded) {
+      EmitEventUnlocked("WAIT", lock_id, TableModeName(mode),
+                        transaction->id());
+      wait_recorded = true;
     }
     queue.cv.wait(lock);
   }
@@ -146,6 +183,7 @@ Status LockManager::LockInternal(Transaction *transaction, LockId lock_id,
     request = std::prev(queue.requests.end());
   }
 
+  bool wait_recorded = false;
   while (true) {
     if (request->cancelled) {
       queue.requests.erase(request);
@@ -163,8 +201,15 @@ Status LockManager::LockInternal(Transaction *transaction, LockId lock_id,
       request->granted = true;
       request->upgrading = false;
       transaction->AddGrantedLock(lock_id);
+      EmitEventUnlocked("GRANTED", lock_id, LockModeName(mode),
+                        transaction->id());
       queue.cv.notify_all();
       return Status::Ok();
+    }
+    if (!wait_recorded) {
+      EmitEventUnlocked("WAIT", lock_id, LockModeName(mode),
+                        transaction->id());
+      wait_recorded = true;
     }
     queue.cv.wait(lock);
   }
@@ -270,6 +315,11 @@ Status LockManager::Unlock(Transaction *transaction, const LockId &lock_id) {
     request->granted = false;
     request->upgrading = false;
   } else {
+    EmitEventUnlocked(
+        "RELEASE", lock_id,
+        request->table_mode ? TableModeName(request->table_lock_mode)
+                            : LockModeName(request->lock_mode),
+        transaction->id());
     queue.requests.erase(request);
   }
   transaction->RemoveGrantedLock(lock_id);
@@ -294,6 +344,11 @@ Status LockManager::UnlockAll(Transaction *transaction) {
           request->upgrading = false;
           ++request;
         } else {
+          EmitEventUnlocked(
+              "RELEASE", queue_it->first,
+              request->table_mode ? TableModeName(request->table_lock_mode)
+                                  : LockModeName(request->lock_mode),
+              txn_id);
           request = queue.requests.erase(request);
         }
       } else {
@@ -310,6 +365,50 @@ Status LockManager::UnlockAll(Transaction *transaction) {
   transactions_.erase(txn_id);
   transaction->ClearGrantedLocks();
   return Status::Ok();
+}
+
+void LockManager::BeginEventCapture() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  capture_events_ = true;
+  capture_started_at_ = std::chrono::steady_clock::now();
+  captured_events_.clear();
+}
+
+std::vector<LockEvent> LockManager::EndEventCapture() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  capture_events_ = false;
+  return std::move(captured_events_);
+}
+
+void LockManager::SetEventSession(std::size_t session_index) noexcept {
+  current_event_session = session_index;
+}
+
+void LockManager::ClearEventSession() noexcept {
+  current_event_session = 0;
+}
+
+void LockManager::EmitEventUnlocked(std::string action, const LockId &lock_id,
+                                    std::string mode, txn_id_t txn_id) {
+  if (!capture_events_) return;
+  const double offset_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - capture_started_at_)
+          .count();
+  captured_events_.push_back(LockEvent{
+      offset_ms,
+      current_event_session,
+      txn_id,
+      std::move(action),
+      ResourceName(lock_id.type),
+      std::move(mode),
+      lock_id.table_id,
+      lock_id.page_id,
+      lock_id.index_id,
+      lock_id.encoded_key,
+      "",
+      "",
+  });
 }
 
 std::optional<txn_id_t> LockManager::FindDeadlockVictimUnlocked() const {

@@ -5,6 +5,7 @@
 #include "oursql/transaction/transaction.h"
 
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -13,6 +14,21 @@
 #include <vector>
 
 namespace oursql {
+
+struct LockEvent {
+  double offset_ms{0.0};
+  std::size_t session_index{0};
+  txn_id_t txn_id{kInvalidTxnId};
+  std::string action;
+  std::string resource;
+  std::string mode;
+  table_id_t table_id{0};
+  page_id_t page_id{INVALID_PAGE_ID};
+  index_id_t index_id{0};
+  std::string encoded_key;
+  std::string table_name;
+  std::string index_name;
+};
 
 class LockManager {
  public:
@@ -46,6 +62,13 @@ class LockManager {
   [[nodiscard]] std::vector<LockId> GetGrantedLocks(txn_id_t txn_id) const;
   // Caller: diagnostics/tests. Count currently waiting or upgrading requests.
   [[nodiscard]] std::size_t GetWaitingRequestCount() const;
+
+  // Caller: concurrent SQL diagnostics. Capture lock lifecycle events until
+  // EndEventCapture(). Events are relative to the capture start.
+  void BeginEventCapture();
+  [[nodiscard]] std::vector<LockEvent> EndEventCapture();
+  static void SetEventSession(std::size_t session_index) noexcept;
+  static void ClearEventSession() noexcept;
 
  private:
   struct LockRequest {
@@ -87,10 +110,15 @@ class LockManager {
                                       const LockRequest &other) const noexcept;
   [[nodiscard]] bool IsWaiting(const LockRequest &request) const noexcept;
   [[nodiscard]] std::optional<txn_id_t> FindDeadlockVictimUnlocked() const;
+  void EmitEventUnlocked(std::string action, const LockId &lock_id,
+                         std::string mode, txn_id_t txn_id);
 
   mutable std::mutex mutex_;
   std::unordered_map<LockId, LockRequestQueue, LockIdHash> queues_;
   std::unordered_map<txn_id_t, Transaction *> transactions_;
+  bool capture_events_{false};
+  std::chrono::steady_clock::time_point capture_started_at_;
+  std::vector<LockEvent> captured_events_;
 };
 
 }  // namespace oursql

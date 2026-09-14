@@ -10,6 +10,11 @@
 #include <variant>
 #include <vector>
 
+// 编译层 AST 数据模型。
+//
+// Statement 使用 std::variant 形成封闭语句集合；表达式使用只读共享指针组成
+// CompileExpr 树。AST 只保存用户写下的语法结构和位置，不保存 Catalog 或
+// 页面对象，也不执行任何数据库操作。
 namespace oursql {
 
 // 源码位置：offset 与 token 起始偏移一致，行列从 1 开始。
@@ -21,7 +26,11 @@ struct Position {
   std::size_t column{0};
 };
 
-enum class PredicateKind { Equal, IsNull, IsNotNull };
+enum class PredicateKind {
+  Equal,     // column = literal
+  IsNull,    // column IS NULL
+  IsNotNull  // column IS NOT NULL
+};
 
 // 数据库层 Filter 支持“列 = 常量”和“列 IS [NOT] NULL”。
 // Parser 在表达式满足这些形态时额外生成 Predicate，使执行路径无需解析 SQL。
@@ -45,8 +54,8 @@ struct Predicate {
 
 // 编译层表达式树：用于解析、语义类型推导、常量折叠和诊断打印。简单等值
 // 条件会额外抽取为 Predicate；复杂条件保留在 FilterPlan/UPDATE 中，并由
-// 执行层表达式求值器逐行消费。子查询节点虽然能完成语义检查，但当前没有
-// 执行算子，会在生成可执行计划前明确返回 NotImplemented。
+// 执行层表达式求值器逐行消费。WHERE 中的 EXISTS/IN 子查询已有执行上下文；
+// SELECT 投影中的子查询仍由 Planner 明确拒绝，避免生成无法执行的计划。
 enum class CompileLiteralKind { Int, String, Bool, Null };
 
 struct CompileExpr;
@@ -104,7 +113,11 @@ struct CompileInExpr {
   bool negated{false};
 };
 
-enum class CompileSubqueryKind { Scalar, Exists, In };
+enum class CompileSubqueryKind {
+  Scalar,  // (SELECT ...) 标量子查询
+  Exists,  // EXISTS (SELECT ...)
+  In       // [NOT] IN (SELECT ...)
+};
 
 // 编译层子查询表达式。query 指向嵌套 SELECT AST，不保存 SQL 文本；
 // Scalar 表示标量子查询，Exists 表示 EXISTS，In 表示 IN (SELECT ...)。
@@ -139,7 +152,13 @@ struct CompileExpr {
 };
 
 enum class OrderDirection { Asc, Desc };
-enum class JoinType { Inner, Left, Right, Full };
+
+enum class JoinType {
+  Inner,  // 只保留匹配行
+  Left,   // 保留左行，右侧未匹配列补 NULL
+  Right,  // 保留右行，左侧未匹配列补 NULL
+  Full    // 两侧未匹配行都保留
+};
 
 // ORDER BY 的单个键。列名同样已在 Lexer 阶段规范化为小写。
 struct OrderKey {
@@ -198,7 +217,7 @@ struct SelectStatement {
   std::string table_alias;
   std::vector<JoinClause> joins;
   std::vector<std::string> projection;
-  // 与 projection 等长，保存列引用或聚合函数等 SELECT 项表达式。
+  // 与 projection 等长，保存列引用、常量、算术表达式或聚合函数等 SELECT 项。
   std::vector<CompileExprPtr> projection_expressions;
   // 与 projection 等长；空字符串表示该列没有 AS 别名。
   std::vector<std::string> projection_aliases;
@@ -267,7 +286,11 @@ struct UpdateStatement {
   Position location;
 };
 
-enum class AlterTableAction { RenameTable, RenameColumn, AddColumn };
+enum class AlterTableAction {
+  RenameTable,   // ALTER TABLE ... RENAME TO ...
+  RenameColumn,  // ALTER TABLE ... RENAME COLUMN ... TO ...
+  AddColumn      // ALTER TABLE ... ADD COLUMN ...
+};
 
 // 事务控制语句分开建模，确保所有 variant 访问点显式处理每种动作。
 struct BeginStatement {

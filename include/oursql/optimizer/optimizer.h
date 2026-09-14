@@ -9,6 +9,11 @@
 #include <string>
 #include <vector>
 
+// 计划级规则优化器。
+//
+// Optimizer 只接收结构化 Plan，通过固定点调度执行 R1 内层 Project 裁剪和
+// R2 等值 INT 谓词索引选择。它不解析 SQL、不访问 Catalog 页面，也不执行
+// 数据读写；最终必须保留 Executor 可以消费的计划形态。
 namespace oursql {
 
 struct OptimizationStats {

@@ -9,11 +9,22 @@
 #include <variant>
 #include <vector>
 
+// 编译层逻辑计划数据模型。
+//
+// Plan 是 Planner 语义检查后的结构化结果。SELECT 的计划节点使用
+// shared_ptr<const PlanNode> 连接，执行阶段只能读取；DDL/DML 计划则保存
+// 已规范化的表名、Schema、行值和约束信息。Plan 不保存页面、Guard 或执行器
+// 对象，具体数据访问由 ExecutionEngine 完成。
 namespace oursql {
 
 // 逻辑计划输出的编译层类型。数据库执行层只存 INT/VARCHAR；BOOL 只可能来自
 // SELECT 表达式或子查询内部，用于编译期类型推导。
-enum class PlanValueType { Int, Varchar, Bool, Null };
+enum class PlanValueType {
+  Int,      // 编译层 INT 表达式
+  Varchar,  // 编译层 VARCHAR 表达式
+  Bool,     // 谓词、比较或逻辑表达式
+  Null      // 常量 NULL 或仅由 NULL 推导出的结果
+};
 
 // DDL 计划：执行器根据 Schema 创建物理表和 Catalog 元数据。
 struct CreateTablePlan {
@@ -107,7 +118,8 @@ struct PlanNode {
 // distinct 和 limit 是根计划修饰符，由执行器在投影或聚合完成后应用：
 // DISTINCT 按输出行去重，LIMIT 按行数截断。
 // projection_aliases 与 root Project 的 columns 等长；table_alias 保存 AS 表别名。
-// projection_expressions 和 having 保存聚合相关的编译层表达式。
+// projection_expressions 与 root Project 的 columns 一一对应，可保存列引用、
+// 常量或一般表达式；having 保存聚合后的分组过滤表达式。
 // output_types 与 Project 输出列等长，供外层子查询做类型推导；执行器不依赖它。
 struct SelectPlan {
   std::string table_name;

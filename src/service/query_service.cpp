@@ -281,12 +281,14 @@ Result<std::vector<ConcurrentSqlResult>> QueryService::ExecuteConcurrentSql(
     sessions.push_back(session.value());
   }
 
+  engine_->BeginLockEventCapture();
   StartGate start_gate(sql_statements.size());
   std::vector<std::thread> workers;
   workers.reserve(sql_statements.size());
   for (std::size_t i = 0; i < sql_statements.size(); ++i) {
     workers.emplace_back([&, i] {
       start_gate.Wait();
+      engine_->SetLockEventSession(i + 1);
       const auto started_at = std::chrono::steady_clock::now();
       auto execution = [&]() {
         if (sql_statements[i].empty()) {
@@ -309,9 +311,16 @@ Result<std::vector<ConcurrentSqlResult>> QueryService::ExecuteConcurrentSql(
         outcomes[i].status = execution.status();
       }
       (void)engine_->CloseSession(sessions[i]);
+      engine_->ClearLockEventSession();
     });
   }
   for (auto &worker : workers) worker.join();
+  auto lock_events = engine_->EndLockEventCapture();
+  for (auto &event : lock_events) {
+    if (event.session_index > 0 && event.session_index <= outcomes.size()) {
+      outcomes[event.session_index - 1].lock_events.push_back(std::move(event));
+    }
+  }
   return Result<std::vector<ConcurrentSqlResult>>(std::move(outcomes));
 }
 

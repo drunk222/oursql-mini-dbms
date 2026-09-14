@@ -1075,6 +1075,74 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
+.lock-timeline {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.lock-timeline-title {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.lock-event-list {
+  display: grid;
+  gap: 5px;
+}
+
+.lock-event {
+  display: grid;
+  grid-template-columns: 58px 52px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.lock-event-time {
+  color: var(--text-muted);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.lock-event-action {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #e2e8f0;
+  color: #475569;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.lock-event[data-action="wait"] .lock-event-action {
+  background: #fef0c7;
+  color: #854d0e;
+}
+
+.lock-event[data-action="granted"] .lock-event-action {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.lock-event[data-action="release"] .lock-event-action {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.lock-event-resource {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .concurrent-session-results .result-block-header {
   margin-bottom: 6px;
 }

@@ -4,6 +4,7 @@
 #include "oursql/transaction/transaction.h"
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -40,9 +41,13 @@ class BPlusTree {
   [[nodiscard]] Status Remove(index_key_t key, RID rid);
   [[nodiscard]] Status Remove(index_key_t key, RID rid, Transaction *transaction);
   [[nodiscard]] Result<std::vector<RID>> GetValue(index_key_t key) const;
+  [[nodiscard]] Result<std::vector<RID>> GetValue(index_key_t key,
+                                                  Transaction *transaction) const;
   // 闭区间扫描 [lower, upper]，结果按 Key、RID 排序。
   [[nodiscard]] Result<std::vector<std::pair<index_key_t, RID>>> RangeScan(
       index_key_t lower, index_key_t upper) const;
+  [[nodiscard]] Result<std::vector<std::pair<index_key_t, RID>>> RangeScan(
+      index_key_t lower, index_key_t upper, Transaction *transaction) const;
 
   // 调用者：DROP INDEX；作用：释放元数据页及全部内部页、叶子页；成功后树为空。
   [[nodiscard]] Status Destroy();
@@ -54,7 +59,11 @@ class BPlusTree {
   };
 
   [[nodiscard]] Result<page_id_t> FindLeaf(index_key_t key,
-                                           std::vector<page_id_t> *path) const;
+                                           std::vector<page_id_t> *path,
+                                           Transaction *transaction = nullptr,
+                                           // 写路径发现候选后释放祖先 latch，再取得
+                                           // Page X 并重新验证，因此可关闭物理读耦合。
+                                           bool latch_coupling = true) const;
   [[nodiscard]] Result<SplitResult> InsertIntoLeaf(page_id_t leaf_page_id,
                                                    index_key_t key, RID rid);
   [[nodiscard]] Result<std::optional<SplitResult>> InsertIntoInternal(
@@ -71,7 +80,8 @@ class BPlusTree {
 
   BufferPoolManager *buffer_pool_{nullptr};
   Transaction *transaction_{nullptr};
-  page_id_t root_page_id_{INVALID_PAGE_ID};
+  // 根编号是进程内的发布点；页面内容仍由事务锁/PageGuard保护。
+  std::atomic<page_id_t> root_page_id_{INVALID_PAGE_ID};
   page_id_t header_page_id_{INVALID_PAGE_ID};
   std::uint32_t leaf_max_size_{BPlusTreeLeafPage::kPhysicalMaxSize};
   std::uint32_t internal_max_size_{BPlusTreeInternalPage::kPhysicalMaxSize};

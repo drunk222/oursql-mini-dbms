@@ -27,6 +27,7 @@ std::string ContentTypeFor(const std::filesystem::path &path) {
   const std::string extension = path.extension().string();
   if (extension == ".css") return "text/css; charset=utf-8";
   if (extension == ".js") return "application/javascript; charset=utf-8";
+  if (extension == ".sql") return "text/plain; charset=utf-8";
   if (extension == ".svg") return "image/svg+xml";
   if (extension == ".png") return "image/png";
   if (extension == ".jpg" || extension == ".jpeg") return "image/jpeg";

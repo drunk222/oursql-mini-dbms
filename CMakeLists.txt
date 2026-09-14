@@ -129,6 +129,12 @@ target_link_libraries(oursql_concurrent_transaction_tests PRIVATE oursql_core)
 add_executable(oursql_web_tests tests/web_api_tests.cpp)
 target_link_libraries(oursql_web_tests PRIVATE oursql_web_lib)
 
+add_executable(oursql_frontend_sql_tests tests/frontend_sql_script_tests.cpp)
+target_compile_definitions(oursql_frontend_sql_tests PRIVATE
+  OURSQL_FRONTEND_SQL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/web/assets/frontend_all_runnable.sql"
+)
+target_link_libraries(oursql_frontend_sql_tests PRIVATE oursql_core)
+
 add_executable(oursql_benchmark benchmarks/storage_benchmark.cpp)
 target_link_libraries(oursql_benchmark PRIVATE oursql_core)
 
@@ -149,3 +155,4 @@ add_test(NAME oursql_b_plus_tree_tests COMMAND oursql_b_plus_tree_tests)
 add_test(NAME oursql_transaction_tests COMMAND oursql_transaction_tests)
 add_test(NAME oursql_concurrent_transaction_tests COMMAND oursql_concurrent_transaction_tests)
 add_test(NAME oursql_web_tests COMMAND oursql_web_tests)
+add_test(NAME oursql_frontend_sql_tests COMMAND oursql_frontend_sql_tests)

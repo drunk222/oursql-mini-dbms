@@ -10,15 +10,51 @@
 namespace oursql {
 namespace {
 
-bool IsTransactionStatement(const Statement &statement) {
+enum class TransactionStatement { None, Begin, Finish };
+
+TransactionStatement GetTransactionStatement(const Statement &statement) {
   return std::visit(
       [](const auto &value) {
         using Type = std::decay_t<decltype(value)>;
-        return std::is_same_v<Type, BeginStatement> ||
-               std::is_same_v<Type, CommitStatement> ||
-               std::is_same_v<Type, RollbackStatement>;
+        if constexpr (std::is_same_v<Type, BeginStatement>) {
+          return TransactionStatement::Begin;
+        } else if constexpr (std::is_same_v<Type, CommitStatement> ||
+                             std::is_same_v<Type, RollbackStatement>) {
+          return TransactionStatement::Finish;
+        } else {
+          return TransactionStatement::None;
+        }
       },
       statement);
+}
+
+Status ValidateTransactionBatch(const std::vector<Statement> &statements) {
+  bool active = false;
+  for (const auto &statement : statements) {
+    switch (GetTransactionStatement(statement)) {
+      case TransactionStatement::None:
+        break;
+      case TransactionStatement::Begin:
+        if (active) {
+          return Status::InvalidArgument(
+              "a Web request cannot start nested transactions");
+        }
+        active = true;
+        break;
+      case TransactionStatement::Finish:
+        if (!active) {
+          return Status::NotFound(
+              "COMMIT or ROLLBACK has no matching BEGIN in this request");
+        }
+        active = false;
+        break;
+    }
+  }
+  if (active) {
+    return Status::NotImplemented(
+        "cross-request transactions are not supported by the minimal Web demo");
+  }
+  return Status::Ok();
 }
 
 constexpr std::size_t kMaxSqlBytes = 256U * 1024U;
@@ -57,11 +93,9 @@ Result<std::vector<ExecutionResult>> QueryService::ExecuteSql(std::string_view s
   if (!statements.ok()) {
     return Result<std::vector<ExecutionResult>>(statements.status());
   }
-  for (const auto &statement : statements.value()) {
-    if (IsTransactionStatement(statement)) {
-      return Result<std::vector<ExecutionResult>>(Status::NotImplemented(
-          "The minimal Web demo does not support cross-request transactions"));
-    }
+  const auto transaction_status = ValidateTransactionBatch(statements.value());
+  if (!transaction_status.ok()) {
+    return Result<std::vector<ExecutionResult>>(transaction_status);
   }
   return engine_->ExecuteSqlBatch(sql);
 }

@@ -399,6 +399,20 @@ async function flushDatabase() {
   }
 }
 
+async function loadSampleSql() {
+  if (state.busy) return;
+  try {
+    const response = await fetch("/assets/frontend_all_runnable.sql");
+    if (!response.ok) throw new Error(`载入失败 (${response.status})`);
+    elements.sqlEditor.value = await response.text();
+    updateLineNumbers();
+    elements.queryMeta.textContent = "已载入全部可运行 SQL";
+    setMessage("");
+  } catch (error) {
+    setMessage(error.message, "error");
+  }
+}
+
 async function refreshWorkspace() {
   if (state.busy) return;
   setBusy(true);
@@ -435,6 +449,7 @@ function bindElements() {
   elements.sqlEditor = document.getElementById("sqlEditor");
   elements.runButton = document.getElementById("runButton");
   elements.clearButton = document.getElementById("clearButton");
+  elements.loadSampleButton = document.getElementById("loadSampleButton");
   elements.resultSummary = document.getElementById("resultSummary");
   elements.messageArea = document.getElementById("messageArea");
   elements.resultsArea = document.getElementById("resultsArea");
@@ -450,6 +465,7 @@ function bindEvents() {
   });
   elements.refreshButton.addEventListener("click", refreshWorkspace);
   elements.flushButton.addEventListener("click", flushDatabase);
+  elements.loadSampleButton.addEventListener("click", loadSampleSql);
   elements.navigatorFilter.addEventListener("input", renderNavigatorTree);
   elements.sqlEditor.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {

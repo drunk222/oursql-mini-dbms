@@ -1,7 +1,9 @@
 #include "oursql/index/index_manager.h"
 
 #include "oursql/storage/heap_table.h"
+#include "oursql/transaction/lock_manager.h"
 
+#include <cstdint>
 #include <string>
 
 namespace oursql {
@@ -11,6 +13,21 @@ namespace {
 Status MarkTransactionFailed(Transaction *transaction, Status status) {
   if (transaction != nullptr) transaction->MarkFailed();
   return status;
+}
+
+std::uint32_t StableResourceId(std::string_view name) noexcept {
+  std::uint32_t hash = 2166136261U;
+  for (const unsigned char byte : name) {
+    hash ^= byte;
+    hash *= 16777619U;
+  }
+  return hash == 0 ? 1U : hash;
+}
+
+index_id_t StableIndexId(std::string_view name) noexcept {
+  auto hash = StableResourceId(name);
+  hash ^= 0x9e3779b9U;
+  return hash == 0 ? 1U : hash;
 }
 
 }  // namespace
@@ -32,14 +49,28 @@ Result<std::size_t> IndexManager::IndexedColumn(const IndexMetadata &metadata) c
   if (catalog_ == nullptr) {
     return Result<std::size_t>(Status::InvalidArgument("IndexManager缺少Catalog"));
   }
-  auto table = catalog_->GetTableMetadata(metadata.table_name);
+  auto table = catalog_->GetTableMetadataCopy(metadata.table_name);
   if (!table.ok()) return Result<std::size_t>(table.status());
-  auto column = table.value()->schema.FindColumnIndex(metadata.column_name);
+  auto column = table.value().schema.FindColumnIndex(metadata.column_name);
   if (!column.ok()) return Result<std::size_t>(column.status());
-  if (table.value()->schema.At(column.value()).type != DataType::Int) {
+  if (table.value().schema.At(column.value()).type != DataType::Int) {
     return Result<std::size_t>(Status::TypeMismatch("当前B+树索引仅支持INT列"));
   }
   return Result<std::size_t>(column.value());
+}
+
+Status IndexManager::LockUniqueKey(const IndexMetadata &metadata,
+                                   index_key_t key,
+                                   Transaction *transaction) const {
+  if (!metadata.is_unique || transaction == nullptr) return Status::Ok();
+  if (lock_manager_ == nullptr) {
+    // SQL 编排层可能已经取得相同锁；没有显式 LockManager 依赖时保持兼容。
+    // 独立并发调用者应传入 LockManager，使检查与插入之间没有竞争窗口。
+    return Status::Ok();
+  }
+  return lock_manager_->LockIndexKey(
+      transaction, StableIndexId(metadata.name), "i:" + std::to_string(key),
+      LockMode::X, StableResourceId(metadata.table_name));
 }
 
 Status IndexManager::PersistRootIfChanged(const IndexMetadata &metadata,
@@ -133,13 +164,23 @@ Status IndexManager::InsertEntry(std::string_view index_name, index_key_t key, R
     return MarkTransactionFailed(transaction,
                                  Status::InvalidArgument("IndexManager缺少Catalog"));
   }
-  auto found = catalog_->FindIndex(index_name);
+  auto found = catalog_->FindIndexCopy(index_name);
   if (!found.ok()) return MarkTransactionFailed(transaction, found.status());
-  const auto metadata = *found.value();
+  auto metadata = found.value();
+  auto key_lock = LockUniqueKey(metadata, key, transaction);
+  if (!key_lock.ok()) return MarkTransactionFailed(transaction, key_lock);
+  // 等待唯一 Key 锁期间根可能发生过分裂；锁授予后必须重新读取根元数据。
+  if (metadata.is_unique && transaction != nullptr && lock_manager_ != nullptr) {
+    auto refreshed = catalog_->FindIndexCopy(index_name);
+    if (!refreshed.ok()) return MarkTransactionFailed(transaction, refreshed.status());
+    metadata = refreshed.value();
+  }
   auto tree_result = OpenTree(metadata, transaction);
   if (!tree_result.ok()) return MarkTransactionFailed(transaction, tree_result.status());
   auto &tree = *tree_result.value();
   if (metadata.is_unique) {
+    // IndexKey X 串行化同一逻辑键；这里不再申请索引页 S 锁，避免事务已
+    // 持有该叶页 X 锁时发生 X->S 的伪升级。真正写入仍必须取得 Page X。
     auto existing = tree.GetValue(key);
     if (!existing.ok()) return MarkTransactionFailed(transaction, existing.status());
     if (!existing.value().empty()) {
@@ -164,9 +205,9 @@ Status IndexManager::DeleteEntry(std::string_view index_name, index_key_t key, R
     return MarkTransactionFailed(transaction,
                                  Status::InvalidArgument("IndexManager缺少Catalog"));
   }
-  auto found = catalog_->FindIndex(index_name);
+  auto found = catalog_->FindIndexCopy(index_name);
   if (!found.ok()) return MarkTransactionFailed(transaction, found.status());
-  const auto metadata = *found.value();
+  const auto metadata = found.value();
   auto tree_result = OpenTree(metadata, transaction);
   if (!tree_result.ok()) return MarkTransactionFailed(transaction, tree_result.status());
   auto &tree = *tree_result.value();
@@ -191,9 +232,16 @@ Status IndexManager::UpdateEntry(std::string_view index_name, index_key_t old_ke
     return MarkTransactionFailed(transaction,
                                  Status::InvalidArgument("IndexManager缺少Catalog"));
   }
-  auto found = catalog_->FindIndex(index_name);
+  auto found = catalog_->FindIndexCopy(index_name);
   if (!found.ok()) return MarkTransactionFailed(transaction, found.status());
-  const auto metadata = *found.value();
+  auto metadata = found.value();
+  auto key_lock = LockUniqueKey(metadata, new_key, transaction);
+  if (!key_lock.ok()) return MarkTransactionFailed(transaction, key_lock);
+  if (metadata.is_unique && transaction != nullptr && lock_manager_ != nullptr) {
+    auto refreshed = catalog_->FindIndexCopy(index_name);
+    if (!refreshed.ok()) return MarkTransactionFailed(transaction, refreshed.status());
+    metadata = refreshed.value();
+  }
   auto tree_result = OpenTree(metadata, transaction);
   if (!tree_result.ok()) return MarkTransactionFailed(transaction, tree_result.status());
   auto &tree = *tree_result.value();
@@ -372,25 +420,37 @@ Status IndexManager::OnUpdate(std::string_view table_name, const Row &old_row,
 
 Result<std::vector<RID>> IndexManager::Lookup(std::string_view index_name,
                                               index_key_t key) const {
+  return Lookup(index_name, key, nullptr);
+}
+
+Result<std::vector<RID>> IndexManager::Lookup(std::string_view index_name,
+                                              index_key_t key,
+                                              Transaction *transaction) const {
   if (catalog_ == nullptr) return Result<std::vector<RID>>(Status::InvalidArgument("IndexManager缺少Catalog"));
-  auto found = catalog_->FindIndex(index_name);
+  auto found = catalog_->FindIndexCopy(index_name);
   if (!found.ok()) return Result<std::vector<RID>>(found.status());
-  auto tree = OpenTree(*found.value());
+  auto tree = OpenTree(found.value(), transaction);
   if (!tree.ok()) return Result<std::vector<RID>>(tree.status());
-  return tree.value()->GetValue(key);
+  return tree.value()->GetValue(key, transaction);
 }
 
 Result<std::vector<std::pair<index_key_t, RID>>> IndexManager::RangeScan(
     std::string_view index_name, index_key_t lower, index_key_t upper) const {
+  return RangeScan(index_name, lower, upper, nullptr);
+}
+
+Result<std::vector<std::pair<index_key_t, RID>>> IndexManager::RangeScan(
+    std::string_view index_name, index_key_t lower, index_key_t upper,
+    Transaction *transaction) const {
   if (catalog_ == nullptr) {
     return Result<std::vector<std::pair<index_key_t, RID>>>(
         Status::InvalidArgument("IndexManager缺少Catalog"));
   }
-  auto found = catalog_->FindIndex(index_name);
+  auto found = catalog_->FindIndexCopy(index_name);
   if (!found.ok()) return Result<std::vector<std::pair<index_key_t, RID>>>(found.status());
-  auto tree = OpenTree(*found.value());
+  auto tree = OpenTree(found.value(), transaction);
   if (!tree.ok()) return Result<std::vector<std::pair<index_key_t, RID>>>(tree.status());
-  return tree.value()->RangeScan(lower, upper);
+  return tree.value()->RangeScan(lower, upper, transaction);
 }
 
 }  // namespace oursql

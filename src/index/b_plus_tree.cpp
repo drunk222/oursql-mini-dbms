@@ -131,33 +131,59 @@ Result<std::unique_ptr<BPlusTree>> BPlusTree::OpenPersistent(
   return Result<std::unique_ptr<BPlusTree>>(std::move(tree));
 }
 
-bool BPlusTree::IsEmpty() const noexcept { return root_page_id_ == INVALID_PAGE_ID; }
+bool BPlusTree::IsEmpty() const noexcept {
+  return root_page_id_.load(std::memory_order_acquire) == INVALID_PAGE_ID;
+}
 
-page_id_t BPlusTree::GetRootPageId() const noexcept { return root_page_id_; }
+page_id_t BPlusTree::GetRootPageId() const noexcept {
+  return root_page_id_.load(std::memory_order_acquire);
+}
 
 page_id_t BPlusTree::GetHeaderPageId() const noexcept { return header_page_id_; }
 
 Result<page_id_t> BPlusTree::FindLeaf(index_key_t key,
-                                      std::vector<page_id_t> *path) const {
+                                      std::vector<page_id_t> *path,
+                                      Transaction *transaction,
+                                      bool latch_coupling) const {
   if (buffer_pool_ == nullptr) {
     return Result<page_id_t>(Status::InvalidArgument("B+树缺少BufferPoolManager"));
   }
   if (IsEmpty()) return Result<page_id_t>(Status::NotFound("B+树为空"));
 
-  auto current = root_page_id_;
+  auto current = root_page_id_.load(std::memory_order_acquire);
+  auto current_result = transaction == nullptr
+                            ? buffer_pool_->FetchPage(current)
+                            : buffer_pool_->FetchPage(current, transaction);
+  if (!current_result.ok()) return Result<page_id_t>(current_result.status());
+  auto current_guard = std::move(current_result.value());
   while (current != INVALID_PAGE_ID) {
-    auto guard_result = buffer_pool_->FetchPage(current);
-    if (!guard_result.ok()) return Result<page_id_t>(guard_result.status());
-    auto &guard = guard_result.value();
-
-    BPlusTreeLeafPage leaf(guard.Data());
+    BPlusTreeLeafPage leaf(current_guard.Data());
     if (leaf.Validate().ok()) return Result<page_id_t>(current);
 
-    BPlusTreeInternalPage internal(guard.Data());
+    BPlusTreeInternalPage internal(current_guard.Data());
     auto valid = internal.Validate();
     if (!valid.ok()) return Result<page_id_t>(valid);
     if (path != nullptr) path->push_back(current);
-    current = internal.Lookup(key);
+    const auto child = internal.Lookup(key);
+    if (child == INVALID_PAGE_ID) {
+      return Result<page_id_t>(Status::InternalError("B+树内部页包含无效子指针"));
+    }
+    if (transaction == nullptr && latch_coupling) {
+      // 物理读锁耦合：取得子页 ReadGuard 后才释放父页 ReadGuard。
+      auto child_result = buffer_pool_->FetchPage(child);
+      if (!child_result.ok()) return Result<page_id_t>(child_result.status());
+      current_guard = std::move(child_result.value());
+    } else {
+      // 父页事务 S 锁会保持到事务结束，因此可以先释放短期 latch，再等待
+      // 子页事务锁，避免持有 Frame latch 等待 LockManager。
+      current_guard = ReadPageGuard{};
+      auto child_result = transaction == nullptr
+                              ? buffer_pool_->FetchPage(child)
+                              : buffer_pool_->FetchPage(child, transaction);
+      if (!child_result.ok()) return Result<page_id_t>(child_result.status());
+      current_guard = std::move(child_result.value());
+    }
+    current = child;
   }
   return Result<page_id_t>(Status::InternalError("B+树内部页包含无效子指针"));
 }
@@ -188,7 +214,9 @@ Status BPlusTree::Insert(index_key_t key, RID rid) {
   }
 
   std::vector<page_id_t> path;
-  auto leaf_result = FindLeaf(key, &path);
+  // 写路径先发现候选页，释放祖先短期 latch 后再申请候选 Page X；
+  // InsertIntoLeaf 会在 X 锁授予后重新读取并验证页面内容。
+  auto leaf_result = FindLeaf(key, &path, nullptr, false);
   if (!leaf_result.ok()) return leaf_result.status();
   page_id_t left_page_id = leaf_result.value();
   auto split_result = InsertIntoLeaf(left_page_id, key, rid);
@@ -212,10 +240,11 @@ Status BPlusTree::Insert(index_key_t key, RID rid) {
 
 Status BPlusTree::Insert(index_key_t key, RID rid, Transaction *transaction) {
   if (transaction == transaction_) return Insert(key, rid);
-  BPlusTree scoped(buffer_pool_, root_page_id_, leaf_max_size_, internal_max_size_, transaction);
+  BPlusTree scoped(buffer_pool_, root_page_id_.load(std::memory_order_acquire),
+                   leaf_max_size_, internal_max_size_, transaction);
   scoped.header_page_id_ = header_page_id_;
   auto status = scoped.Insert(key, rid);
-  if (status.ok()) root_page_id_ = scoped.root_page_id_;
+  if (status.ok()) root_page_id_.store(scoped.GetRootPageId(), std::memory_order_release);
   return status;
 }
 
@@ -372,7 +401,8 @@ Status BPlusTree::PersistRootPageId() {
           kHeaderFormatVersion) {
     return Status::InternalError("B+树元数据页损坏，无法更新根页面编号");
   }
-  StoreHeaderValue(guard.Data(), kHeaderRootOffset, root_page_id_);
+  StoreHeaderValue(guard.Data(), kHeaderRootOffset,
+                   root_page_id_.load(std::memory_order_acquire));
   return FinalizeWrite(guard);
 }
 
@@ -396,7 +426,7 @@ Status BPlusTree::Remove(index_key_t key, RID rid) {
   if (buffer_pool_ == nullptr) return Status::InvalidArgument("B+树缺少BufferPoolManager");
   if (IsEmpty()) return Status::NotFound("B+树为空");
 
-  auto leaf_result = FindLeaf(key, nullptr);
+  auto leaf_result = FindLeaf(key, nullptr, nullptr, false);
   if (!leaf_result.ok()) return leaf_result.status();
   page_id_t target = INVALID_PAGE_ID;
   auto current = leaf_result.value();
@@ -436,12 +466,13 @@ Status BPlusTree::Remove(index_key_t key, RID rid) {
     if (!status.ok()) return status;
     size = leaf.GetSize();
     max_size = leaf.GetMaxSize();
-    root_became_empty = target == root_page_id_ && entries.empty();
+    root_became_empty = target == root_page_id_.load(std::memory_order_acquire) &&
+                        entries.empty();
     if (!entries.empty()) new_minimum = entries.front().first;
     status = FinalizeWrite(guard);
     if (!status.ok()) return status;
   }
-  if (target == root_page_id_) {
+  if (target == root_page_id_.load(std::memory_order_acquire)) {
     if (!root_became_empty) return Status::Ok();
     root_page_id_ = INVALID_PAGE_ID;
     auto status = PersistRootPageId();
@@ -699,7 +730,7 @@ Status BPlusTree::RebalanceInternal(page_id_t page_id) {
     parent_id = page.GetParentPageId();
     max_size = page.GetMaxSize();
   }
-  if (page_id == root_page_id_) {
+  if (page_id == root_page_id_.load(std::memory_order_acquire)) {
     if (entries.size() >= 2) return Status::Ok();
     if (entries.empty()) return Status::InternalError("B+树根内部页没有子页面");
     const auto new_root = entries.front().second;
@@ -850,7 +881,8 @@ Status BPlusTree::Destroy() {
   if (buffer_pool_ == nullptr) return Status::InvalidArgument("B+树缺少BufferPoolManager");
   std::vector<page_id_t> pending;
   std::vector<page_id_t> pages;
-  if (root_page_id_ != INVALID_PAGE_ID) pending.push_back(root_page_id_);
+  const auto root = root_page_id_.load(std::memory_order_acquire);
+  if (root != INVALID_PAGE_ID) pending.push_back(root);
   while (!pending.empty()) {
     const auto page_id = pending.back();
     pending.pop_back();
@@ -880,15 +912,21 @@ Status BPlusTree::Destroy() {
 
 Status BPlusTree::Remove(index_key_t key, RID rid, Transaction *transaction) {
   if (transaction == transaction_) return Remove(key, rid);
-  BPlusTree scoped(buffer_pool_, root_page_id_, leaf_max_size_, internal_max_size_, transaction);
+  BPlusTree scoped(buffer_pool_, root_page_id_.load(std::memory_order_acquire),
+                   leaf_max_size_, internal_max_size_, transaction);
   scoped.header_page_id_ = header_page_id_;
   auto status = scoped.Remove(key, rid);
-  if (status.ok()) root_page_id_ = scoped.root_page_id_;
+  if (status.ok()) root_page_id_.store(scoped.GetRootPageId(), std::memory_order_release);
   return status;
 }
 
 Result<std::vector<RID>> BPlusTree::GetValue(index_key_t key) const {
-  auto range = RangeScan(key, key);
+  return GetValue(key, nullptr);
+}
+
+Result<std::vector<RID>> BPlusTree::GetValue(index_key_t key,
+                                             Transaction *transaction) const {
+  auto range = RangeScan(key, key, transaction);
   if (!range.ok()) return Result<std::vector<RID>>(range.status());
   std::vector<RID> values;
   values.reserve(range.value().size());
@@ -898,23 +936,32 @@ Result<std::vector<RID>> BPlusTree::GetValue(index_key_t key) const {
 
 Result<std::vector<std::pair<index_key_t, RID>>> BPlusTree::RangeScan(
     index_key_t lower, index_key_t upper) const {
+  return RangeScan(lower, upper, nullptr);
+}
+
+Result<std::vector<std::pair<index_key_t, RID>>> BPlusTree::RangeScan(
+    index_key_t lower, index_key_t upper, Transaction *transaction) const {
   if (lower > upper) {
     return Result<std::vector<std::pair<index_key_t, RID>>>(
         Status::InvalidArgument("B+树范围查询下界不能大于上界"));
   }
   std::vector<std::pair<index_key_t, RID>> result;
   if (IsEmpty()) return Result<std::vector<std::pair<index_key_t, RID>>>(std::move(result));
-  auto leaf_result = FindLeaf(lower, nullptr);
+  auto leaf_result = FindLeaf(lower, nullptr, transaction);
   if (!leaf_result.ok()) {
     return Result<std::vector<std::pair<index_key_t, RID>>>(leaf_result.status());
   }
   auto current = leaf_result.value();
+  auto first_guard_result = transaction == nullptr
+                                ? buffer_pool_->FetchPage(current)
+                                : buffer_pool_->FetchPage(current, transaction);
+  if (!first_guard_result.ok()) {
+    return Result<std::vector<std::pair<index_key_t, RID>>>(
+        first_guard_result.status());
+  }
+  auto guard = std::move(first_guard_result.value());
   while (current != INVALID_PAGE_ID) {
-    auto guard_result = buffer_pool_->FetchPage(current);
-    if (!guard_result.ok()) {
-      return Result<std::vector<std::pair<index_key_t, RID>>>(guard_result.status());
-    }
-    BPlusTreeLeafPage leaf(guard_result.value().Data());
+    BPlusTreeLeafPage leaf(guard.Data());
     auto valid = leaf.Validate();
     if (!valid.ok()) {
       return Result<std::vector<std::pair<index_key_t, RID>>>(valid);
@@ -927,7 +974,24 @@ Result<std::vector<std::pair<index_key_t, RID>>> BPlusTree::RangeScan(
       }
       result.push_back(entry);
     }
-    current = leaf.GetNextPageId();
+    const auto next = leaf.GetNextPageId();
+    if (next != INVALID_PAGE_ID && transaction == nullptr) {
+      // 叶链同样使用读锁耦合，避免合并期间跟随已经失效的 next 指针。
+      auto next_guard = buffer_pool_->FetchPage(next);
+      if (!next_guard.ok()) {
+        return Result<std::vector<std::pair<index_key_t, RID>>>(next_guard.status());
+      }
+      guard = std::move(next_guard.value());
+    } else if (next != INVALID_PAGE_ID) {
+      // 当前叶页的事务 S 锁仍被持有；释放 latch 后再取得下一页锁。
+      guard = ReadPageGuard{};
+      auto next_guard = buffer_pool_->FetchPage(next, transaction);
+      if (!next_guard.ok()) {
+        return Result<std::vector<std::pair<index_key_t, RID>>>(next_guard.status());
+      }
+      guard = std::move(next_guard.value());
+    }
+    current = next;
   }
   std::sort(result.begin(), result.end(), EntryLess);
   return Result<std::vector<std::pair<index_key_t, RID>>>(std::move(result));

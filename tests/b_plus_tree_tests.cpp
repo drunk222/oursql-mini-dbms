@@ -1,12 +1,17 @@
 #include "oursql/index/b_plus_tree.h"
+#include "oursql/index/index_manager.h"
 #include "oursql/storage/log_manager.h"
+#include "oursql/transaction/lock_manager.h"
 #include "oursql/transaction/transaction_manager.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -287,10 +292,12 @@ bool TestTransactionalStructuralChanges() {
                                                        rollback_begin.value());
     if (!Check(deleting.ok(), "transactional structural delete open")) return false;
     for (std::int64_t key = 1; key <= 40; ++key) {
-      if (!Check(deleting.value()->Remove(
-                     key, oursql::RID{static_cast<oursql::page_id_t>(key), 1})
-                     .ok(),
-                 "transactional structural delete")) return false;
+      auto status = deleting.value()->Remove(
+          key, oursql::RID{static_cast<oursql::page_id_t>(key), 1});
+      if (!Check(status.ok(), "transactional structural delete key " +
+                                  std::to_string(key) + ": " + status.ToString())) {
+        return false;
+      }
     }
     if (!Check(transactions.Rollback().ok(), "transactional structural delete rollback")) {
       return false;
@@ -325,6 +332,27 @@ bool TestTransactionalStructuralChanges() {
   return true;
 }
 
+class StartGate {
+ public:
+  explicit StartGate(std::size_t participants) : participants_(participants) {}
+  void Wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (++arrived_ == participants_) {
+      open_ = true;
+      changed_.notify_all();
+      return;
+    }
+    changed_.wait(lock, [&] { return open_; });
+  }
+
+ private:
+  std::size_t participants_;
+  std::size_t arrived_{0};
+  bool open_{false};
+  std::mutex mutex_;
+  std::condition_variable changed_;
+};
+
 bool TestTransactionalWriteReleaseFailurePropagates() {
   TempDatabase temp;
   oursql::DiskManager disk;
@@ -358,6 +386,269 @@ bool TestTransactionalWriteReleaseFailurePropagates() {
                "release failure resources close");
 }
 
+bool TestConcurrentLookup() {
+  TempDatabase temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "concurrent lookup database open")) return false;
+  oursql::BufferPoolManager buffer_pool(16, &disk);
+  oursql::BPlusTree tree(&buffer_pool, oursql::INVALID_PAGE_ID, 4, 4);
+  for (std::int64_t key = 1; key <= 200; ++key) {
+    if (!Check(tree.Insert(key, oursql::RID{static_cast<oursql::page_id_t>(key), 1}).ok(),
+               "concurrent lookup fixture insert")) return false;
+  }
+
+  constexpr std::size_t kReaders = 8;
+  StartGate gate(kReaders);
+  std::vector<std::uint8_t> succeeded(kReaders, 1);
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (std::size_t reader = 0; reader < kReaders; ++reader) {
+    readers.emplace_back([&, reader] {
+      gate.Wait();
+      for (std::int64_t key = 1; key <= 200; ++key) {
+        auto found = tree.GetValue(key);
+        if (!found.ok() || found.value().size() != 1 ||
+            found.value()[0] !=
+                oursql::RID{static_cast<oursql::page_id_t>(key), 1}) {
+          succeeded[reader] = 0;
+          return;
+        }
+      }
+    });
+  }
+  for (auto &reader : readers) reader.join();
+  for (const auto ok : succeeded) {
+    if (!Check(ok, "concurrent lookup should preserve every RID")) return false;
+  }
+  return true;
+}
+
+bool TestLookupDuringInsertAndSplit() {
+  TempDatabase temp;
+  oursql::DiskManager disk;
+  if (!Check(disk.Open(temp.path).ok(), "lookup/insert database open")) return false;
+  oursql::BufferPoolManager buffer_pool(32, &disk);
+  oursql::BPlusTree tree(&buffer_pool, oursql::INVALID_PAGE_ID, 4, 4);
+  for (std::int64_t key = 1; key <= 200; ++key) {
+    if (!Check(tree.Insert(key, oursql::RID{static_cast<oursql::page_id_t>(key), 1}).ok(),
+               "lookup/insert fixture insert")) return false;
+  }
+
+  constexpr std::size_t kReaders = 4;
+  StartGate gate(kReaders + 1);
+  std::vector<std::uint8_t> succeeded(kReaders, 1);
+  std::vector<std::thread> readers;
+  for (std::size_t reader = 0; reader < kReaders; ++reader) {
+    readers.emplace_back([&, reader] {
+      gate.Wait();
+      for (std::size_t pass = 0; pass < 10; ++pass) {
+        for (std::int64_t key = 1; key <= 200; ++key) {
+          auto found = tree.GetValue(key);
+          if (!found.ok() || found.value().size() != 1) {
+            succeeded[reader] = 0;
+            return;
+          }
+        }
+      }
+    });
+  }
+  oursql::Status writer_status =
+      oursql::Status::InternalError("lookup/insert writer unfinished");
+  std::thread writer([&] {
+    gate.Wait();
+    for (std::int64_t key = 201; key <= 400; ++key) {
+      writer_status = tree.Insert(
+          key, oursql::RID{static_cast<oursql::page_id_t>(key), 1});
+      if (!writer_status.ok()) return;
+    }
+  });
+  writer.join();
+  for (auto &reader : readers) reader.join();
+  if (!Check(writer_status.ok(), "concurrent inserts and splits should finish")) return false;
+  for (const auto ok : succeeded) {
+    if (!Check(ok, "lookup should stay valid during insert/split")) return false;
+  }
+  auto all = tree.RangeScan(1, 400);
+  return Check(all.ok() && all.value().size() == 400,
+               "lookup/insert tree should retain an ordered complete leaf chain");
+}
+
+bool TestConcurrentUniqueKeyInsert() {
+  using namespace std::chrono_literals;
+  TempDatabase temp;
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  oursql::LockManager locks;
+  if (!Check(disk.Open(temp.path).ok(), "unique-key database open") ||
+      !Check(log.Open(temp.path).ok(), "unique-key WAL open")) return false;
+  oursql::BufferPoolManager buffer_pool(12, &disk);
+  if (!Check(buffer_pool.SetLogManager(&log).ok(), "unique-key WAL binding") ||
+      !Check(buffer_pool.SetLockManager(&locks).ok(), "unique-key lock binding")) {
+    return false;
+  }
+  oursql::Catalog catalog(&buffer_pool, &disk);
+  if (!Check(catalog.Open().ok(), "unique-key catalog open") ||
+      !Check(catalog.CreateTable(
+                 oursql::TableMetadata{"items", oursql::Schema({
+                     oursql::Column{"id", oursql::DataType::Int}})})
+                 .ok(),
+             "unique-key table create")) return false;
+  oursql::IndexManager indexes(&catalog, &buffer_pool, &locks);
+  if (!Check(indexes.CreateIndex("idx_items_id", "items", "id", true).ok(),
+             "unique-key index create")) return false;
+
+  oursql::TransactionManager transactions(&log, &buffer_pool, &disk, &locks);
+  auto first = transactions.Begin();
+  auto second = transactions.Begin();
+  if (!Check(first.ok() && second.ok(), "unique-key transactions begin")) return false;
+  std::vector<oursql::Status> status{
+      oursql::Status::InternalError("first insert unfinished"),
+      oursql::Status::InternalError("second insert unfinished")};
+  std::mutex state_mutex;
+  std::condition_variable changed;
+  std::size_t completed = 0;
+  StartGate gate(2);
+  std::thread first_worker([&] {
+    gate.Wait();
+    status[0] = indexes.InsertEntry("idx_items_id", 7, oursql::RID{11, 1},
+                                    first.value().get());
+    std::lock_guard<std::mutex> lock(state_mutex);
+    ++completed;
+    changed.notify_all();
+  });
+  std::thread second_worker([&] {
+    gate.Wait();
+    status[1] = indexes.InsertEntry("idx_items_id", 7, oursql::RID{12, 1},
+                                    second.value().get());
+    std::lock_guard<std::mutex> lock(state_mutex);
+    ++completed;
+    changed.notify_all();
+  });
+  bool first_completed = false;
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    first_completed = changed.wait_for(lock, 2s, [&] { return completed == 1; });
+  }
+  if (!Check(first_completed,
+             "one unique-key insert should finish while its peer waits")) {
+    (void)transactions.Abort(first.value());
+    (void)transactions.Abort(second.value());
+    first_worker.join();
+    second_worker.join();
+    return false;
+  }
+  const std::size_t winner = status[0].ok() ? 0 : 1;
+  const std::size_t loser = 1 - winner;
+  auto winner_txn = winner == 0 ? first.value() : second.value();
+  auto loser_txn = loser == 0 ? first.value() : second.value();
+  if (!Check(status[winner].ok(), "one unique-key insert should win") ||
+      !Check(transactions.Commit(winner_txn).ok(), "unique-key winner commit")) {
+    (void)transactions.Abort(first.value());
+    (void)transactions.Abort(second.value());
+    first_worker.join();
+    second_worker.join();
+    return false;
+  }
+  bool loser_completed = false;
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    loser_completed = changed.wait_for(lock, 2s, [&] { return completed == 2; });
+  }
+  if (!Check(loser_completed,
+             "unique-key loser should resume after winner commit")) {
+    (void)transactions.Abort(loser_txn);
+    first_worker.join();
+    second_worker.join();
+    return false;
+  }
+  first_worker.join();
+  second_worker.join();
+  if (!Check(!status[loser].ok() &&
+                 status[loser].code() == oursql::ErrorCode::AlreadyExists,
+             "exactly one concurrent unique-key insert should fail") ||
+      !Check(transactions.Abort(loser_txn).ok(), "unique-key loser rollback")) return false;
+  auto found = indexes.Lookup("idx_items_id", 7);
+  return Check(found.ok() && found.value().size() == 1,
+               "unique index should contain one RID after commit/rollback") &&
+         Check(buffer_pool.Close().ok() && log.Close().ok() && disk.Close().ok(),
+               "unique-key resources close");
+}
+
+bool TestConcurrentDifferentLeafInsert() {
+  using namespace std::chrono_literals;
+  TempDatabase temp;
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  oursql::LockManager locks;
+  if (!Check(disk.Open(temp.path).ok(), "different-leaf database open") ||
+      !Check(log.Open(temp.path).ok(), "different-leaf WAL open")) return false;
+  oursql::BufferPoolManager buffer_pool(32, &disk);
+  if (!Check(buffer_pool.SetLogManager(&log).ok(), "different-leaf WAL binding") ||
+      !Check(buffer_pool.SetLockManager(&locks).ok(), "different-leaf lock binding")) {
+    return false;
+  }
+  oursql::BPlusTree tree(&buffer_pool, oursql::INVALID_PAGE_ID, 8, 8);
+  for (std::int64_t key = 2; key <= 400; key += 2) {
+    if (!Check(tree.Insert(key, oursql::RID{static_cast<oursql::page_id_t>(key), 1}).ok(),
+               "different-leaf fixture insert")) return false;
+  }
+  if (!Check(buffer_pool.FlushAllPages().ok(), "different-leaf fixture flush")) return false;
+  oursql::TransactionManager transactions(&log, &buffer_pool, &disk, &locks);
+  auto first = transactions.Begin();
+  auto second = transactions.Begin();
+  if (!Check(first.ok() && second.ok(), "different-leaf transactions begin")) return false;
+
+  std::vector<oursql::Status> status{
+      oursql::Status::InternalError("first leaf insert unfinished"),
+      oursql::Status::InternalError("second leaf insert unfinished")};
+  std::mutex state_mutex;
+  std::condition_variable changed;
+  std::size_t completed = 0;
+  StartGate gate(2);
+  std::thread first_worker([&] {
+    gate.Wait();
+    status[0] = tree.Insert(51, oursql::RID{501, 1}, first.value().get());
+    std::lock_guard<std::mutex> lock(state_mutex);
+    ++completed;
+    changed.notify_all();
+  });
+  std::thread second_worker([&] {
+    gate.Wait();
+    status[1] = tree.Insert(351, oursql::RID{502, 1}, second.value().get());
+    std::lock_guard<std::mutex> lock(state_mutex);
+    ++completed;
+    changed.notify_all();
+  });
+  // 在任何事务提交前等待两个写线程都返回；若树被一把全局写锁包住，
+  // 第二个线程会一直等到提交，此断言便会确定性失败。
+  bool both_completed = false;
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    both_completed = changed.wait_for(lock, 2s, [&] { return completed == 2; });
+  }
+  if (!Check(both_completed,
+             "different leaf inserts should both finish before either commit")) {
+    (void)transactions.ResolveDeadlocksOnce();
+    (void)transactions.Abort(first.value());
+    (void)transactions.Abort(second.value());
+    first_worker.join();
+    second_worker.join();
+    return false;
+  }
+  first_worker.join();
+  second_worker.join();
+  if (!Check(status[0].ok() && status[1].ok(),
+             "different leaf inserts should both succeed") ||
+      !Check(transactions.Commit(first.value()).ok() &&
+                 transactions.Commit(second.value()).ok(),
+             "different leaf inserts commit")) return false;
+  auto first_found = tree.GetValue(51);
+  auto second_found = tree.GetValue(351);
+  return Check(first_found.ok() && first_found.value().size() == 1 &&
+                   second_found.ok() && second_found.value().size() == 1,
+               "different leaf inserts should remain searchable");
+}
+
 }  // namespace
 
 int main() {
@@ -377,5 +668,9 @@ int main() {
   run("transactional structural changes", &TestTransactionalStructuralChanges);
   run("transactional write release failure",
       &TestTransactionalWriteReleaseFailurePropagates);
+  run("concurrent lookup", &TestConcurrentLookup);
+  run("lookup during insert and split", &TestLookupDuringInsertAndSplit);
+  run("concurrent unique key insert", &TestConcurrentUniqueKeyInsert);
+  run("concurrent different leaf insert", &TestConcurrentDifferentLeafInsert);
   return failures == 0 ? 0 : 1;
 }

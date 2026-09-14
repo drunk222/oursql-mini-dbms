@@ -3,6 +3,7 @@
 #include "oursql/storage/storage.h"
 
 #include <limits>
+#include <mutex>
 #include <unordered_set>
 #include <utility>
 
@@ -209,7 +210,54 @@ Result<IndexMetadata> DecodeIndex(const std::vector<std::byte> &bytes) {
 
 }  // namespace
 
+Catalog::Catalog(const Catalog &other) {
+  std::shared_lock<std::shared_mutex> lock(other.mutex_);
+  tables_ = other.tables_;
+  indexes_ = other.indexes_;
+  buffer_pool_ = other.buffer_pool_;
+  disk_manager_ = other.disk_manager_;
+  catalog_head_ = other.catalog_head_;
+  opened_ = other.opened_;
+}
+
+Catalog &Catalog::operator=(const Catalog &other) {
+  if (this == &other) return *this;
+  std::unique_lock<std::shared_mutex> self_lock(mutex_, std::defer_lock);
+  std::shared_lock<std::shared_mutex> other_lock(other.mutex_, std::defer_lock);
+  std::lock(self_lock, other_lock);
+  tables_ = other.tables_;
+  indexes_ = other.indexes_;
+  buffer_pool_ = other.buffer_pool_;
+  disk_manager_ = other.disk_manager_;
+  catalog_head_ = other.catalog_head_;
+  opened_ = other.opened_;
+  return *this;
+}
+
+Catalog::Catalog(Catalog &&other) noexcept {
+  std::unique_lock<std::shared_mutex> lock(other.mutex_);
+  tables_ = std::move(other.tables_);
+  indexes_ = std::move(other.indexes_);
+  buffer_pool_ = other.buffer_pool_;
+  disk_manager_ = other.disk_manager_;
+  catalog_head_ = other.catalog_head_;
+  opened_ = other.opened_;
+}
+
+Catalog &Catalog::operator=(Catalog &&other) noexcept {
+  if (this == &other) return *this;
+  std::scoped_lock lock(mutex_, other.mutex_);
+  tables_ = std::move(other.tables_);
+  indexes_ = std::move(other.indexes_);
+  buffer_pool_ = other.buffer_pool_;
+  disk_manager_ = other.disk_manager_;
+  catalog_head_ = other.catalog_head_;
+  opened_ = other.opened_;
+  return *this;
+}
+
 Status Catalog::Open() {
+  std::unique_lock<std::shared_mutex> catalog_lock(mutex_);
   if (opened_) return Status::Ok();
   if (buffer_pool_ == nullptr || disk_manager_ == nullptr) {
     return Status::InvalidArgument("持久化 Catalog 需要 BufferPoolManager 和 DiskManager");
@@ -312,10 +360,13 @@ Status Catalog::Reload() {
   if (buffer_pool_ == nullptr || disk_manager_ == nullptr) {
     return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
   }
-  tables_.clear();
-  indexes_.clear();
-  catalog_head_ = INVALID_PAGE_ID;
-  opened_ = false;
+  {
+    std::unique_lock<std::shared_mutex> catalog_lock(mutex_);
+    tables_.clear();
+    indexes_.clear();
+    catalog_head_ = INVALID_PAGE_ID;
+    opened_ = false;
+  }
   return Open();
 }
 
@@ -372,8 +423,6 @@ Status Catalog::AppendCatalogRecord(const std::vector<std::byte> &record) {
 Status Catalog::CreateTable(TableInfo table) {
   auto valid = ValidateTable(table);
   if (!valid.ok()) return valid;
-  if (tables_.find(table.name) != tables_.end()) return Status::AlreadyExists("表已存在: " + table.name);
-
   // 先按不影响记录长度的占位 page_id 编码，超大元数据不得触发任何页面申请。
   auto encoded_size_check = EncodeTable(table);
   if (!encoded_size_check.ok()) return encoded_size_check.status();
@@ -381,12 +430,16 @@ Status Catalog::CreateTable(TableInfo table) {
   // 无存储依赖时退化为纯内存 Catalog，便于上层组件和单元测试独立使用。
   const bool persistent = buffer_pool_ != nullptr || disk_manager_ != nullptr;
   if (persistent) {
+    auto open_status = Open();
+    if (!open_status.ok()) return open_status;
+  }
+  std::unique_lock<std::shared_mutex> catalog_lock(mutex_);
+  if (tables_.find(table.name) != tables_.end()) {
+    return Status::AlreadyExists("表已存在: " + table.name);
+  }
+  if (persistent) {
     if (buffer_pool_ == nullptr || disk_manager_ == nullptr) {
       return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
-    }
-    if (!opened_) {
-      auto open_status = Open();
-      if (!open_status.ok()) return open_status;
     }
     // 每张新表先分配自己的首数据页，再把该页号与 schema 一起写进 Catalog。
     auto data_page_result = buffer_pool_->NewPageGuarded();
@@ -423,16 +476,19 @@ Status Catalog::DropTable(std::string_view table_name) {
   if (persistent && (buffer_pool_ == nullptr || disk_manager_ == nullptr)) {
     return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
   }
-  if (persistent && !opened_) {
+  if (persistent) {
     auto status = Open();
     if (!status.ok()) return status;
   }
+  std::unique_lock<std::shared_mutex> catalog_lock(mutex_);
   auto table = tables_.find(std::string(table_name));
   if (table == tables_.end()) {
     return Status::NotFound("Catalog 未找到表: " + std::string(table_name));
   }
-  if (!ListTableIndexes(table_name).empty()) {
-    return Status::InvalidArgument("删除表元数据前必须先删除该表的全部索引");
+  for (const auto &entry : indexes_) {
+    if (entry.second.table_name == table_name) {
+      return Status::InvalidArgument("删除表元数据前必须先删除该表的全部索引");
+    }
   }
   if (persistent) {
     page_id_t record_page_id = INVALID_PAGE_ID;
@@ -491,11 +547,10 @@ Status Catalog::CreateIndex(IndexInfo index) {
     if (buffer_pool_ == nullptr || disk_manager_ == nullptr) {
       return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
     }
-    if (!opened_) {
-      auto open_status = Open();
-      if (!open_status.ok()) return open_status;
-    }
+    auto open_status = Open();
+    if (!open_status.ok()) return open_status;
   }
+  std::unique_lock<std::shared_mutex> catalog_lock(mutex_);
   if (indexes_.find(index.name) != indexes_.end()) {
     return Status::AlreadyExists("索引已存在: " + index.name);
   }
@@ -525,10 +580,11 @@ Status Catalog::UpdateIndexRootPageId(std::string_view index_name,
   if (persistent && (buffer_pool_ == nullptr || disk_manager_ == nullptr)) {
     return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
   }
-  if (persistent && !opened_) {
+  if (persistent) {
     auto open_status = Open();
     if (!open_status.ok()) return open_status;
   }
+  std::unique_lock<std::shared_mutex> catalog_lock(mutex_);
   auto index = indexes_.find(std::string(index_name));
   if (index == indexes_.end()) {
     return Status::NotFound("Catalog 未找到索引: " + std::string(index_name));
@@ -599,10 +655,11 @@ Status Catalog::DropIndex(std::string_view index_name) {
   if (persistent && (buffer_pool_ == nullptr || disk_manager_ == nullptr)) {
     return Status::InvalidArgument("持久化 Catalog 需要完整的存储依赖");
   }
-  if (persistent && !opened_) {
+  if (persistent) {
     auto status = Open();
     if (!status.ok()) return status;
   }
+  std::unique_lock<std::shared_mutex> catalog_lock(mutex_);
   auto index = indexes_.find(std::string(index_name));
   if (index == indexes_.end()) {
     return Status::NotFound("Catalog 未找到索引: " + std::string(index_name));
@@ -656,6 +713,7 @@ Status Catalog::DropIndex(std::string_view index_name) {
 }
 
 Result<const TableInfo *> Catalog::FindTable(std::string_view table_name) const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
   // 返回 map 内对象的只读指针；调用方不得跨越 Catalog 生命周期保存它。
   auto it = tables_.find(std::string(table_name));
   if (it == tables_.end()) {
@@ -665,10 +723,12 @@ Result<const TableInfo *> Catalog::FindTable(std::string_view table_name) const 
 }
 
 bool Catalog::HasTable(std::string_view table_name) const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
   return tables_.find(std::string(table_name)) != tables_.end();
 }
 
 std::vector<TableMetadata> Catalog::ListTables() const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
   std::vector<TableMetadata> result;
   result.reserve(tables_.size());
   for (const auto &entry : tables_) result.push_back(entry.second);
@@ -676,18 +736,38 @@ std::vector<TableMetadata> Catalog::ListTables() const {
 }
 
 Result<const Schema *> Catalog::GetSchema(std::string_view table_name) const {
-  auto table = FindTable(table_name);
-  if (!table.ok()) return Result<const Schema *>(table.status());
-  return Result<const Schema *>(&table.value()->schema);
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
+  auto table = tables_.find(std::string(table_name));
+  if (table == tables_.end()) {
+    return Result<const Schema *>(
+        Status::NotFound("Catalog 未找到表: " + std::string(table_name)));
+  }
+  return Result<const Schema *>(&table->second.schema);
 }
 
 Result<const TableMetadata *> Catalog::GetTableMetadata(std::string_view table_name) const {
-  auto table = FindTable(table_name);
-  if (!table.ok()) return Result<const TableMetadata *>(table.status());
-  return Result<const TableMetadata *>(table.value());
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
+  auto table = tables_.find(std::string(table_name));
+  if (table == tables_.end()) {
+    return Result<const TableMetadata *>(
+        Status::NotFound("Catalog 未找到表: " + std::string(table_name)));
+  }
+  return Result<const TableMetadata *>(&table->second);
+}
+
+Result<TableMetadata> Catalog::GetTableMetadataCopy(
+    std::string_view table_name) const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
+  auto table = tables_.find(std::string(table_name));
+  if (table == tables_.end()) {
+    return Result<TableMetadata>(
+        Status::NotFound("Catalog 未找到表: " + std::string(table_name)));
+  }
+  return Result<TableMetadata>(table->second);
 }
 
 Result<const IndexMetadata *> Catalog::FindIndex(std::string_view index_name) const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
   auto it = indexes_.find(std::string(index_name));
   if (it == indexes_.end()) {
     return Result<const IndexMetadata *>(
@@ -696,7 +776,18 @@ Result<const IndexMetadata *> Catalog::FindIndex(std::string_view index_name) co
   return Result<const IndexMetadata *>(&it->second);
 }
 
+Result<IndexMetadata> Catalog::FindIndexCopy(std::string_view index_name) const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
+  auto it = indexes_.find(std::string(index_name));
+  if (it == indexes_.end()) {
+    return Result<IndexMetadata>(
+        Status::NotFound("Catalog 未找到索引: " + std::string(index_name)));
+  }
+  return Result<IndexMetadata>(it->second);
+}
+
 bool Catalog::HasIndex(std::string_view index_name) const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
   return indexes_.find(std::string(index_name)) != indexes_.end();
 }
 
@@ -705,6 +796,7 @@ Result<const IndexMetadata *> Catalog::GetIndexMetadata(std::string_view index_n
 }
 
 std::vector<IndexMetadata> Catalog::ListIndexes() const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
   std::vector<IndexMetadata> result;
   result.reserve(indexes_.size());
   for (const auto &entry : indexes_) result.push_back(entry.second);
@@ -712,6 +804,7 @@ std::vector<IndexMetadata> Catalog::ListIndexes() const {
 }
 
 std::vector<IndexMetadata> Catalog::ListTableIndexes(std::string_view table_name) const {
+  std::shared_lock<std::shared_mutex> catalog_lock(mutex_);
   std::vector<IndexMetadata> result;
   for (const auto &entry : indexes_) {
     if (entry.second.table_name == table_name) result.push_back(entry.second);

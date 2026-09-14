@@ -6,6 +6,7 @@
 #include "oursql/storage/storage.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,7 +45,7 @@ class InsertExecutor {
   InsertExecutor(Catalog *catalog, BufferPoolManager *buffer_pool) noexcept
       : catalog_(catalog), buffer_pool_(buffer_pool) {}
 
-  // 调用者：ExecutionEngine；作用：按表 Schema 插入一行；返回：影响行数和新 RID。
+  // 调用者：ExecutionEngine；作用：按表 Schema 批量插入规范化行；返回：影响行数和新 RID。
   [[nodiscard]] Result<ExecutionResult> Execute(const InsertPlan &plan,
                                                 Transaction *transaction = nullptr) const;
 
@@ -70,7 +71,9 @@ class FilterExecutor {
  public:
   // 调用者：ExecutionEngine；作用：包装通用 WHERE 表达式；返回：过滤后的逐行源或错误。
   [[nodiscard]] Result<std::unique_ptr<RowSource>> Execute(
-      const FilterPlan &plan, std::unique_ptr<RowSource> child, const Schema &schema) const;
+      const FilterPlan &plan, std::unique_ptr<RowSource> child,
+      const Schema &schema,
+      std::function<Result<ExecutionResult>(const SelectStatement &)> subquery_runner = {}) const;
 };
 
 class ProjectExecutor {
@@ -124,6 +127,19 @@ class UpdateExecutor {
   BufferPoolManager *buffer_pool_{nullptr};
 };
 
+class AlterTableExecutor {
+ public:
+  AlterTableExecutor(Catalog *catalog, BufferPoolManager *buffer_pool) noexcept
+      : catalog_(catalog), buffer_pool_(buffer_pool) {}
+
+  [[nodiscard]] Result<ExecutionResult> Execute(
+      const AlterTablePlan &plan, Transaction *transaction = nullptr) const;
+
+ private:
+  Catalog *catalog_{nullptr};
+  BufferPoolManager *buffer_pool_{nullptr};
+};
+
 class ExecutionEngine {
  public:
   ExecutionEngine(Catalog *catalog, BufferPoolManager *buffer_pool) noexcept
@@ -141,7 +157,8 @@ class ExecutionEngine {
     Schema schema;
   };
 
-  [[nodiscard]] Result<SourcePlan> BuildSource(const SelectPlan &plan) const;
+  [[nodiscard]] Result<SourcePlan> BuildSource(
+      const SelectPlan &plan, const ExecutionContext &context) const;
 
   Catalog *catalog_{nullptr};
   BufferPoolManager *buffer_pool_{nullptr};

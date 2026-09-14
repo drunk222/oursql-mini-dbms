@@ -119,7 +119,7 @@ Status BPlusTreeLeafPage::Insert(index_key_t key, RID rid) {
   entries.insert(position, {key, rid});
   return Assign(entries);
 }
-
+ 
 std::vector<std::pair<index_key_t, RID>> BPlusTreeLeafPage::Entries() const {
   std::vector<std::pair<index_key_t, RID>> entries;
   entries.reserve(GetSize());

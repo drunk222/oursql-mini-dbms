@@ -307,7 +307,7 @@ bool TestOrderGroupAndUpdate() {
                "UPDATE 求值失败时目标行应保持不变");
 }
 
-bool TestExtendedInsertCompileOnly() {
+bool TestExtendedInsertExecution() {
   TempDb temp;
   oursql::DatabaseEngine engine(temp.path, 3);
   if (!Check(engine.GetInitStatus().ok(), "扩展 INSERT 测试数据库打开应成功")) {
@@ -320,28 +320,44 @@ bool TestExtendedInsertCompileOnly() {
 
   auto specified = engine.ExecuteSql(
       "INSERT INTO student (name, id) VALUES('Bob', 2);");
-  if (!Check(!specified.ok() &&
-                 specified.status().code() == oursql::ErrorCode::NotImplemented &&
-                 specified.status().message().find("Execution") !=
-                     std::string::npos,
-             "指定列 INSERT 应完成编译后明确拒绝执行")) {
+  if (!Check(specified.ok() && specified.value().affected_rows == 1,
+             "指定列 INSERT 应按 Schema 顺序写入")) {
     return false;
   }
 
   auto multiple = engine.ExecuteSql(
       "INSERT INTO student VALUES(2, 'Bob'), (3, 'Cara');");
-  if (!Check(!multiple.ok() &&
-                 multiple.status().code() == oursql::ErrorCode::NotImplemented &&
-                 multiple.status().message().find("Execution") !=
-                     std::string::npos,
-             "多行 INSERT 应完成编译后明确拒绝执行")) {
+  if (!Check(multiple.ok() && multiple.value().affected_rows == 2 &&
+                 multiple.value().rids.size() == 2,
+             "多行 INSERT 应在同一语句中全部写入")) {
     return false;
   }
 
   auto rows = engine.ExecuteSql("SELECT * FROM student;");
-  return Check(rows.ok() && rows.value().rows.size() == 1 &&
-                   rows.value().rows[0][1].AsVarchar() == "Alice",
-               "未实现的扩展 INSERT 不得产生部分写入");
+  if (!Check(rows.ok() && rows.value().rows.size() == 4 &&
+                   rows.value().rows[1][0].AsInt() == 2 &&
+                   rows.value().rows[1][1].AsVarchar() == "Bob" &&
+                   rows.value().rows[3][0].AsInt() == 3,
+               "指定列和多行 INSERT 结果应可查询")) return false;
+
+  if (!Check(engine.ExecuteSql(
+                 "CREATE TABLE optional_values(id INT, note VARCHAR DEFAULT 'new');"
+                 "INSERT INTO optional_values(id) VALUES(7);").ok(),
+             "指定列 INSERT 应填充 DEFAULT")) return false;
+  auto defaulted = engine.ExecuteSql("SELECT note FROM optional_values;");
+  if (!Check(defaulted.ok() &&
+                 defaulted.value().rows[0][0].AsVarchar() == "new",
+             "省略列应读到默认值")) return false;
+
+  if (!Check(engine.ExecuteSql(
+                 "CREATE TABLE atomic_rows(id INT, value VARCHAR);"
+                 "CREATE UNIQUE INDEX idx_atomic_id ON atomic_rows(id);").ok(),
+             "批量原子性测试表应创建")) return false;
+  auto rejected = engine.ExecuteSql(
+      "INSERT INTO atomic_rows VALUES(1, 'first'), (1, 'duplicate');");
+  auto empty = engine.ExecuteSql("SELECT * FROM atomic_rows;");
+  return Check(!rejected.ok() && empty.ok() && empty.value().rows.empty(),
+               "多行 INSERT 任一行失败时应回滚整条语句");
 }
 
 bool TestDistinctAndLimitExecution() {
@@ -526,6 +542,97 @@ bool TestComplexWhereAndJoinExecution() {
                    joined.value().rows[1][0].AsVarchar() == "Cara" &&
                    joined.value().rows[1][1].AsInt() == 95,
                "INNER JOIN 应执行等值连接、表别名和输出别名");
+}
+
+bool TestOuterJoinSubqueryAndAlterExecution() {
+  TempDb temp;
+  {
+    oursql::DatabaseEngine engine(temp.path, 5);
+    if (!Check(engine.GetInitStatus().ok(), "扩展执行数据库应打开")) return false;
+    auto setup = engine.ExecuteSql(
+        "CREATE TABLE users(id INT, name VARCHAR(16));"
+        "CREATE TABLE scores(user_id INT, score INT);"
+        "INSERT INTO users VALUES(1, 'Alice'), (2, 'Bob');"
+        "INSERT INTO scores VALUES(1, 80), (3, 95);"
+        "CREATE UNIQUE INDEX idx_users_id ON users(id);");
+    if (!Check(setup.ok(), "外连接/子查询/ALTER 数据应创建")) return false;
+
+    auto left = engine.ExecuteSql(
+        "SELECT u.id, s.score FROM users AS u LEFT JOIN scores AS s "
+        "ON u.id = s.user_id;");
+    if (!Check(left.ok() && left.value().rows.size() == 2 &&
+                   left.value().rows[1][0].AsInt() == 2 &&
+                   left.value().rows[1][1].IsNull(),
+               "LEFT JOIN 应保留左侧未匹配行")) return false;
+
+    auto right = engine.ExecuteSql(
+        "SELECT u.name, s.score FROM users AS u RIGHT JOIN scores AS s "
+        "ON u.id = s.user_id;");
+    if (!Check(right.ok() && right.value().rows.size() == 2 &&
+                   right.value().rows[1][0].IsNull() &&
+                   right.value().rows[1][1].AsInt() == 95,
+               "RIGHT JOIN 应保留右侧未匹配行")) return false;
+
+    auto full = engine.ExecuteSql(
+        "SELECT u.id, s.user_id FROM users AS u FULL JOIN scores AS s "
+        "ON u.id = s.user_id;");
+    if (!Check(full.ok() && full.value().rows.size() == 3,
+               "FULL JOIN 应合并两侧未匹配行")) return false;
+
+    auto in_query = engine.ExecuteSql(
+        "SELECT id FROM users WHERE id IN "
+        "(SELECT user_id FROM scores WHERE score >= 90);");
+    if (!Check(in_query.ok() && in_query.value().rows.empty(),
+               "IN 子查询应执行并过滤外层行")) return false;
+    auto exists = engine.ExecuteSql(
+        "SELECT id FROM users WHERE EXISTS "
+        "(SELECT user_id FROM scores WHERE score = 80);");
+    if (!Check(exists.ok() && exists.value().rows.size() == 2,
+               "EXISTS 子查询应按结果是否为空求值")) return false;
+    auto scalar = engine.ExecuteSql(
+        "SELECT (SELECT score FROM scores WHERE user_id = 1) AS best "
+        "FROM users LIMIT 1;");
+    if (!Check(scalar.ok() && scalar.value().rows.size() == 1 &&
+                   scalar.value().column_names[0] == "best" &&
+                   scalar.value().rows[0][0].AsInt() == 80,
+               "标量子查询应可用于 SELECT 列表")) return false;
+
+    if (!Check(engine.ExecuteSql(
+                   "ALTER TABLE users RENAME COLUMN id TO user_id;").ok() &&
+                   engine.ExecuteSql(
+                   "ALTER TABLE users RENAME COLUMN name TO display_name;").ok(),
+               "ALTER RENAME COLUMN 应执行")) return false;
+    if (!Check(engine.ExecuteSql(
+                   "ALTER TABLE users ADD COLUMN age INT DEFAULT 18;").ok(),
+               "ALTER ADD COLUMN 应执行")) return false;
+    if (!Check(engine.ExecuteSql("ALTER TABLE users RENAME TO accounts;").ok(),
+               "ALTER RENAME TABLE 应执行")) return false;
+    auto altered = engine.ExecuteSql(
+        "SELECT user_id, display_name, age FROM accounts ORDER BY user_id;");
+    if (!Check(altered.ok() && altered.value().rows.size() == 2 &&
+                   altered.value().rows[0][0].AsInt() == 1 &&
+                   altered.value().rows[0][1].AsVarchar() == "Alice" &&
+                   altered.value().rows[0][2].AsInt() == 18,
+               "ALTER 应保留原行并填充新列默认值")) return false;
+    auto indexed = engine.ExecuteSql("SELECT * FROM accounts WHERE user_id = 2;");
+    if (!Check(indexed.ok() && indexed.value().rows.size() == 1,
+               "ALTER 后重建的索引应可查询")) return false;
+    if (!Check(engine.Close().ok(), "扩展执行数据库应关闭")) return false;
+  }
+
+  oursql::DatabaseEngine reopened(temp.path, 4);
+  auto inserted_after_restart = reopened.ExecuteSql(
+      "INSERT INTO accounts(user_id, display_name) VALUES(3, 'Cara');");
+  auto persisted = reopened.ExecuteSql(
+      "SELECT user_id, display_name, age FROM accounts ORDER BY user_id;");
+  return Check(reopened.GetInitStatus().ok() && inserted_after_restart.ok() &&
+                   persisted.ok() && persisted.value().rows.size() == 3 &&
+                   persisted.value().rows[1][1].AsVarchar() == "Bob" &&
+                   persisted.value().rows[1][2].AsInt() == 18 &&
+                   persisted.value().rows[2][1].AsVarchar() == "Cara" &&
+                   persisted.value().rows[2][2].AsInt() == 18 &&
+                   reopened.Close().ok(),
+               "ALTER 后的表结构、默认值、数据和索引应持久化");
 }
 
 bool TestIndexMaintenanceAndExplain() {
@@ -1105,8 +1212,8 @@ int main() {
   } else {
     return 1;
   }
-  if (TestExtendedInsertCompileOnly()) {
-    std::cout << "[PASS] Extended INSERT compile-only\n";
+  if (TestExtendedInsertExecution()) {
+    std::cout << "[PASS] Extended INSERT execution\n";
   } else {
     return 1;
   }
@@ -1127,6 +1234,11 @@ int main() {
   }
   if (TestComplexWhereAndJoinExecution()) {
     std::cout << "[PASS] Complex WHERE and JOIN execution\n";
+  } else {
+    return 1;
+  }
+  if (TestOuterJoinSubqueryAndAlterExecution()) {
+    std::cout << "[PASS] Outer JOIN, subquery and ALTER execution\n";
   } else {
     return 1;
   }

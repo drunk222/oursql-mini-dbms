@@ -897,10 +897,10 @@ bool TestSubqueryCompileOnly() {
     return false;
   }
   auto scalar_plan = planner.Build(scalar_query.value()[0], catalog);
-  if (!Check(!scalar_plan.ok() &&
-                 scalar_plan.status().code() ==
-                     oursql::ErrorCode::NotImplemented,
-             "SELECT 列表标量子查询应明确报告执行未接入")) {
+  if (!Check(scalar_plan.ok() &&
+                 std::holds_alternative<oursql::SelectPlan>(
+                     scalar_plan.value()),
+             "SELECT 列表标量子查询应生成可执行计划")) {
     return false;
   }
 

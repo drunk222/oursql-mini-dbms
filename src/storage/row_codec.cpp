@@ -68,6 +68,15 @@ Result<std::vector<std::byte>> RowCodec::Encode(const Schema &schema, const Row 
   // 每列带类型和长度，Decode 因而可以检测 schema/记录不一致或损坏。
   for (std::size_t i = 0; i < row.size(); ++i) {
     const auto &column = schema.At(i);
+    if (row[i].IsNull()) {
+      if (!column.nullable) {
+        return Result<std::vector<std::byte>>(Status::InvalidArgument(
+            "Row 列不允许 NULL: " + column.name));
+      }
+      record.push_back(std::byte{0});
+      AppendU32(&record, 0);
+      continue;
+    }
     if (row[i].type() != column.type) {
       return Result<std::vector<std::byte>>(Status::TypeMismatch(
           "Row 第 " + std::to_string(i + 1) + " 项与列 " + column.name + " 类型不匹配"));
@@ -117,6 +126,14 @@ Result<Row> RowCodec::Decode(const Schema &schema, const std::vector<std::byte> 
     const auto length = ReadU32(record, offset + 1);
     offset += kFieldHeaderSize;
     const auto &column = schema.At(i);
+    if (type_tag == 0U) {
+      if (length != 0 || !column.nullable) {
+        return Result<Row>(Status::InvalidArgument(
+            "Row NULL 字段非法: " + column.name));
+      }
+      row.emplace_back(Value{});
+      continue;
+    }
     if (type_tag != TypeTag(column.type)) {
       return Result<Row>(Status::TypeMismatch("Row 第 " + std::to_string(i + 1) + " 项类型标记不匹配"));
     }

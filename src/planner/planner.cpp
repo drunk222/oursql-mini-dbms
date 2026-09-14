@@ -814,42 +814,6 @@ Status CheckGroupedExpr(const CompileExprPtr &expr,
       expr->data);
 }
 
-// 判断表达式树中是否出现子查询。子查询已由 CheckCompileExpr 完成独立
-// 语义校验；当前执行算子不能消费该节点，因此 Plan 生成前必须显式拒绝。
-bool ContainsSubquery(const CompileExprPtr &expr) {
-  if (expr == nullptr) return false;
-  return std::visit(
-      [&](const auto &value) -> bool {
-        using Type = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<Type, CompileSubqueryExpr>) {
-          return true;
-        } else if constexpr (std::is_same_v<Type, CompileColumnExpr> ||
-                             std::is_same_v<Type, CompileLiteralExpr>) {
-          return false;
-        } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
-          return ContainsSubquery(value.operand);
-        } else if constexpr (std::is_same_v<Type, CompileIsNullExpr>) {
-          return ContainsSubquery(value.operand);
-        } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
-          return ContainsSubquery(value.left) ||
-                 ContainsSubquery(value.right);
-        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
-          return ContainsSubquery(value.operand) ||
-                 ContainsSubquery(value.lower) ||
-                 ContainsSubquery(value.upper);
-        } else if constexpr (std::is_same_v<Type, CompileInExpr>) {
-          if (ContainsSubquery(value.operand)) return true;
-          for (const auto &option : value.options) {
-            if (ContainsSubquery(option)) return true;
-          }
-          return false;
-        } else {
-          return ContainsSubquery(value.argument);
-        }
-      },
-      expr->data);
-}
-
 // FROM/JOIN 中绑定的一个表。offset 是该表首列在连接输出行中的下标。
 struct BoundTable {
   const TableInfo *table{nullptr};
@@ -1168,10 +1132,6 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                 expression, table.value()->schema,
                 "SELECT " + value.projection[i], true, &catalog);
             if (!expression_type.ok()) return fail_at(expression_type.status());
-            if (ContainsSubquery(expression)) {
-              return fail_at(Status::NotImplemented(
-                  "SELECT 列表中的子查询仅编译层支持，未接入数据库执行"));
-            }
             output_types.push_back(ToPlanValueType(expression_type.value()));
             if (ContainsAggregate(expression)) {
               has_aggregates = true;
@@ -1299,8 +1259,7 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           }
           return Result<Plan>(DeletePlan{value.table_name, value.where});
         } else if constexpr (std::is_same_v<Type, DropTableStatement>) {
-          // DROP 只验证目标表存在并生成计划，不在 Planner 中修改 Catalog；
-          // 当前 Executor 尚未实现删除表，因此执行时会显式返回 NotImplemented。
+          // DROP 只验证目标表存在并生成计划，不在 Planner 中修改 Catalog。
           auto table = RequireTable(catalog, value.table_name);
           if (!table.ok()) return fail_at(table.status());
           return Result<Plan>(DropTablePlan{value.table_name});
@@ -1446,8 +1405,7 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                 CheckPredicate(*value.where, table.value()->schema);
             if (!predicate_status.ok()) return fail_at(predicate_status);
           }
-          // 生成结构化 UpdatePlan；执行层会明确返回 NotImplemented，
-          // 因此计划本身只承担编译层表达与诊断职责。
+          // 生成结构化 UpdatePlan，执行层直接消费赋值表达式。
           return Result<Plan>(
               UpdatePlan{value.table_name, value.assignments, value.where});
         }

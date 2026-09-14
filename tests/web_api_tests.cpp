@@ -188,6 +188,19 @@ bool TestWebApi() {
   }
 
   {
+    const nlohmann::json transaction_body = {
+        {"sql", "BEGIN; INSERT INTO student VALUES(3, 'Cara'); ROLLBACK;"}};
+    auto response =
+        client.Post("/api/query", transaction_body.dump(), "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true &&
+                   payload["data"]["results"].size() == 3,
+               "A complete transaction batch should be allowed") &&
+         ok;
+  }
+
+  {
     auto response = client.Post("/api/query", "{", "application/json");
     nlohmann::json payload;
     const bool parsed = ParseJson(response, &payload);

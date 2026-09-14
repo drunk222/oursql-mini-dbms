@@ -66,6 +66,37 @@ POST /api/concurrency/demo
 
 `GET /api/tables` 返回每张表的名称和列定义，供 API 调用方使用。
 
+## 全量 SQL 测试脚本
+
+工作台的“载入测试 SQL”按钮会读取：
+
+```text
+web/assets/frontend_all_runnable.sql
+```
+
+也可以在浏览器直接访问：
+
+```text
+http://127.0.0.1:8080/assets/frontend_all_runnable.sql
+```
+
+该脚本只包含已经接入执行层的 SQL，覆盖：
+
+- `CREATE TABLE`
+- 单行全列 `INSERT`
+- `CREATE INDEX` 和 `CREATE UNIQUE INDEX`
+- `EXPLAIN SELECT`
+- 投影、列别名、表别名和 `DISTINCT`
+- `WHERE` 比较、`AND`、`OR`、`NOT`、`BETWEEN`、`IN`、`LIKE`、`IS NULL`
+- `ORDER BY` 和 `LIMIT`
+- `GROUP BY`、`COUNT`、`SUM`、`AVG`、`MAX`、`MIN`、`HAVING`
+- `INNER JOIN`
+- `UPDATE` 和 `DELETE`
+- `BEGIN`、`COMMIT`、`ROLLBACK`
+- `DROP INDEX` 和 `DROP TABLE`
+
+当前仍返回 `NotImplemented` 的指定列 INSERT、多行 INSERT、`ALTER TABLE`、外连接和子查询没有放入该脚本。
+
 ## 数据库导航
 
 工作台侧栏使用树形数据库导航：

@@ -498,6 +498,118 @@ bool TestTransactionManagerDeadlockResolution() {
   return waiters_ready && victim_closed && survivor_committed && victim_data_undone && wal_closed;
 }
 
+bool TestAutomaticDeadlockDetector() {
+  TempFiles files;
+  oursql::DiskManager disk;
+  oursql::LogManager log;
+  if (!Check(disk.Open(files.database).ok(), "automatic deadlock database open") ||
+      !Check(log.Open(files.database).ok(), "automatic deadlock WAL open")) {
+    return false;
+  }
+  oursql::BufferPoolManager pool(2, &disk);
+  oursql::LockManager locks;
+  if (!Check(pool.SetLogManager(&log).ok(), "automatic deadlock WAL binding") ||
+      !Check(pool.SetLockManager(&locks).ok(), "automatic deadlock lock binding")) {
+    return false;
+  }
+  oursql::TransactionManager manager(&log, &pool, &disk, &locks);
+  if (!Check(manager.StartDeadlockDetector().ok(), "automatic deadlock detector start")) {
+    return false;
+  }
+  if (!Check(manager.StartDeadlockDetector().ok(),
+             "repeated automatic deadlock detector start")) {
+    (void)manager.StopDeadlockDetector();
+    return false;
+  }
+  auto first = manager.Begin();
+  auto second = manager.Begin();
+  if (!Check(first.ok() && second.ok() && first.value()->id() < second.value()->id(),
+             "automatic deadlock transaction ids")) {
+    (void)manager.StopDeadlockDetector();
+    return false;
+  }
+  if (!Check(locks.LockPage(first.value().get(), 31, oursql::LockMode::X).ok(),
+             "automatic deadlock T1 first lock") ||
+      !Check(locks.LockPage(second.value().get(), 32, oursql::LockMode::X).ok(),
+             "automatic deadlock T2 first lock")) {
+    (void)locks.UnlockAll(first.value().get());
+    (void)locks.UnlockAll(second.value().get());
+    (void)manager.Abort(first.value());
+    (void)manager.Abort(second.value());
+    (void)manager.StopDeadlockDetector();
+    return false;
+  }
+
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  bool first_finished = false;
+  bool second_finished = false;
+  oursql::Status first_status = oursql::Status::InternalError("automatic T1 not finished");
+  oursql::Status second_status = oursql::Status::InternalError("automatic T2 not finished");
+  std::thread first_waiter([&] {
+    first_status = locks.LockPage(first.value().get(), 32, oursql::LockMode::X);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      first_finished = true;
+    }
+    state_changed.notify_all();
+  });
+  std::thread second_waiter([&] {
+    second_status = locks.LockPage(second.value().get(), 31, oursql::LockMode::X);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      second_finished = true;
+    }
+    state_changed.notify_all();
+  });
+
+  bool both_finished = false;
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    both_finished = state_changed.wait_for(lock, 2s, [&] {
+      return first_finished && second_finished;
+    });
+  }
+  if (!both_finished) {
+    // Cleanup only releases lock waiters on a test failure; the test never
+    // invokes ResolveDeadlocksOnce manually.
+    (void)locks.UnlockAll(first.value().get());
+    (void)locks.UnlockAll(second.value().get());
+  }
+  first_waiter.join();
+  second_waiter.join();
+
+  const bool victim_aborted =
+      Check(both_finished, "automatic deadlock detector resolves within two seconds") &&
+      Check(second.value()->state() == oursql::TransactionState::Aborted,
+            "automatic detector aborts the larger txn_id victim") &&
+      Check(first_status.ok(), "surviving transaction continues after automatic abort") &&
+      Check(second_status.code() == oursql::ErrorCode::InvalidArgument,
+            "automatic detector cancels victim lock request") &&
+      Check(manager.GetTransaction(second.value()->id()) == nullptr,
+            "automatic victim leaves active transaction map") &&
+      Check(locks.GetWaitingRequestCount() == 0,
+            "automatic detector leaves no waiting lock request");
+  const bool survivor_committed = Check(manager.Commit(first.value()).ok(),
+                                        "automatic detector survivor commit");
+  const bool stopped = Check(manager.StopDeadlockDetector().ok(),
+                             "automatic detector stop") &&
+                       Check(manager.StopDeadlockDetector().ok(),
+                             "repeated automatic detector stop");
+  const bool closed = Check(pool.Close().ok(), "automatic deadlock pool close") &&
+                      Check(log.Close().ok(), "automatic deadlock WAL close") &&
+                      Check(disk.Close().ok(), "automatic deadlock database close");
+  return victim_aborted && survivor_committed && stopped && closed;
+}
+
+bool TestDatabaseEngineRepeatedClose() {
+  TempFiles files;
+  oursql::DatabaseEngine engine(files.database, 2);
+  if (!Check(engine.GetInitStatus().ok(), "repeated close engine open")) return false;
+  return Check(engine.Close().ok(), "first DatabaseEngine Close") &&
+         Check(engine.Close().ok(), "repeated DatabaseEngine Close");
+}
+
 bool TestBufferPoolPageLockIntegration() {
   TempFiles files;
   oursql::DiskManager disk;
@@ -1075,6 +1187,29 @@ bool TestExactIndexUpdateLocks() {
       parallel_changed.notify_all();
     }
   });
+  const auto cleanup_parallel_updates = [&] {
+    // Wait for one worker to release its session mutex before submitting
+    // cleanup SQL. That rollback can then release locks needed by the other
+    // worker before it is joined.
+    {
+      std::unique_lock<std::mutex> lock(parallel_mutex);
+      parallel_changed.wait_for(lock, 2s,
+                                [&] { return parallel_completed != 0; });
+    }
+    bool first_done = false;
+    bool second_done = false;
+    {
+      std::lock_guard<std::mutex> lock(parallel_mutex);
+      first_done = parallel_done[0];
+      second_done = parallel_done[1];
+    }
+    if (first_done) (void)engine.ExecuteSql(first.value(), "ROLLBACK;");
+    if (second_done) (void)engine.ExecuteSql(second.value(), "ROLLBACK;");
+    if (first_update.joinable()) first_update.join();
+    if (second_update.joinable()) second_update.join();
+    (void)engine.ExecuteSql(first.value(), "ROLLBACK;");
+    (void)engine.ExecuteSql(second.value(), "ROLLBACK;");
+  };
   const auto has_key_and_page_locks = [](const std::shared_ptr<oursql::Transaction> &transaction) {
     bool has_key = false;
     bool has_page = false;
@@ -1093,6 +1228,7 @@ bool TestExactIndexUpdateLocks() {
   if (!Check(has_key_and_page_locks(first.value()->current_transaction) &&
                  has_key_and_page_locks(second.value()->current_transaction),
              "different-page updates should concurrently hold key and page locks")) {
+    cleanup_parallel_updates();
     return false;
   }
   {
@@ -1100,6 +1236,7 @@ bool TestExactIndexUpdateLocks() {
     if (!Check(parallel_changed.wait_for(
                    lock, 1s, [&] { return parallel_completed != 0; }),
                "one exact-index update should finish without a table X lock")) {
+      cleanup_parallel_updates();
       return false;
     }
   }
@@ -1111,10 +1248,12 @@ bool TestExactIndexUpdateLocks() {
   if (first_completed_first) {
     if (!Check(engine.ExecuteSql(first.value(), "COMMIT;").ok(),
                "first parallel exact-index update commit")) {
+      cleanup_parallel_updates();
       return false;
     }
   } else if (!Check(engine.ExecuteSql(second.value(), "COMMIT;").ok(),
                     "second parallel exact-index update commit")) {
+    cleanup_parallel_updates();
     return false;
   }
   {
@@ -1122,16 +1261,19 @@ bool TestExactIndexUpdateLocks() {
     if (!Check(parallel_changed.wait_for(
                    lock, 1s, [&] { return parallel_completed == 2; }),
                "both exact-index updates should finish after first commit")) {
+      cleanup_parallel_updates();
       return false;
     }
   }
   if (first_completed_first) {
     if (!Check(engine.ExecuteSql(second.value(), "COMMIT;").ok(),
                "second parallel exact-index update commit")) {
+      cleanup_parallel_updates();
       return false;
     }
   } else if (!Check(engine.ExecuteSql(first.value(), "COMMIT;").ok(),
                     "first parallel exact-index update commit")) {
+    cleanup_parallel_updates();
     return false;
   }
   first_update.join();
@@ -1312,6 +1454,8 @@ int main() {
   if (!TestLockCompatibilityAndFairness()) ++failures;
   if (!TestLockUpgradeAndDeadlockVictim()) ++failures;
   if (!TestTransactionManagerDeadlockResolution()) ++failures;
+  if (!TestAutomaticDeadlockDetector()) ++failures;
+  if (!TestDatabaseEngineRepeatedClose()) ++failures;
   if (!TestBufferPoolPageLockIntegration()) ++failures;
   if (!TestInterleavedWalChains()) ++failures;
   if (!TestConcurrentWalFlush()) ++failures;

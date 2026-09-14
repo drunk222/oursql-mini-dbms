@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <limits>
 #include <queue>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
 
 namespace oursql {
 
@@ -27,6 +29,47 @@ const char *TransactionStateName(TransactionState state) noexcept {
 }
 
 }  // namespace
+
+TransactionManager::~TransactionManager() { (void)StopDeadlockDetector(); }
+
+Status TransactionManager::StartDeadlockDetector() {
+  std::lock_guard<std::mutex> lifecycle_lock(detector_lifecycle_mutex_);
+  if (detector_thread_.joinable()) return Status::Ok();
+  {
+    std::lock_guard<std::mutex> wait_lock(detector_wait_mutex_);
+    detector_stop_requested_ = false;
+  }
+  try {
+    detector_thread_ = std::thread(&TransactionManager::DeadlockDetectorLoop, this);
+  } catch (const std::system_error &error) {
+    return Status::IOError("cannot start deadlock detector: " + std::string(error.what()));
+  }
+  return Status::Ok();
+}
+
+Status TransactionManager::StopDeadlockDetector() {
+  std::lock_guard<std::mutex> lifecycle_lock(detector_lifecycle_mutex_);
+  if (!detector_thread_.joinable()) return Status::Ok();
+  {
+    std::lock_guard<std::mutex> wait_lock(detector_wait_mutex_);
+    detector_stop_requested_ = true;
+  }
+  detector_cv_.notify_all();
+  detector_thread_.join();
+  return Status::Ok();
+}
+
+void TransactionManager::DeadlockDetectorLoop() noexcept {
+  while (true) {
+    std::unique_lock<std::mutex> wait_lock(detector_wait_mutex_);
+    const bool stop_requested = detector_cv_.wait_for(
+        wait_lock, std::chrono::milliseconds(100),
+        [this] { return detector_stop_requested_; });
+    wait_lock.unlock();
+    if (stop_requested) return;
+    (void)ResolveDeadlocksOnce();
+  }
+}
 
 Result<lsn_t> TransactionManager::AppendFor(Transaction *transaction, LogRecord record) {
   if (transaction == nullptr || log_manager_ == nullptr) {

@@ -338,6 +338,8 @@ DatabaseEngine::DatabaseEngine(std::filesystem::path file_path, std::size_t pool
   init_status_ = buffer_pool_.SetLockManager(&lock_manager_);
   if (!init_status_.ok()) return;
   init_status_ = catalog_.Open();
+  if (!init_status_.ok()) return;
+  init_status_ = transaction_manager_.StartDeadlockDetector();
 }
 
 DatabaseEngine::~DatabaseEngine() {
@@ -378,6 +380,8 @@ Status DatabaseEngine::FinishSessionTransaction(
 }
 
 Status DatabaseEngine::Close() {
+  const auto detector_status = transaction_manager_.StopDeadlockDetector();
+  if (!detector_status.ok()) return Contextualize("DatabaseEngine", detector_status);
   if (closed_) return Status::Ok();
   if (!init_status_.ok()) {
     {

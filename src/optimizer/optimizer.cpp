@@ -135,7 +135,8 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(
                                     index.column_name,
                                     filter->predicate.value});
                   auto new_filter = std::make_shared<PlanNode>(
-                      FilterPlan{index_scan, filter->predicate});
+                      FilterPlan{index_scan, filter->predicate,
+                                 filter->expression});
                   select->root = std::make_shared<PlanNode>(
                       ProjectPlan{new_filter, project->columns,
                                   project->select_all,

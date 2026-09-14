@@ -68,7 +68,7 @@ class SeqScanExecutor {
 
 class FilterExecutor {
  public:
-  // 调用者：ExecutionEngine；作用：包装等值过滤条件；返回：过滤后的逐行源或错误。
+  // 调用者：ExecutionEngine；作用：包装通用 WHERE 表达式；返回：过滤后的逐行源或错误。
   [[nodiscard]] Result<std::unique_ptr<RowSource>> Execute(
       const FilterPlan &plan, std::unique_ptr<RowSource> child, const Schema &schema) const;
 };
@@ -138,6 +138,7 @@ class ExecutionEngine {
   struct SourcePlan {
     std::unique_ptr<RowSource> source;
     std::vector<std::string> column_names;
+    Schema schema;
   };
 
   [[nodiscard]] Result<SourcePlan> BuildSource(const SelectPlan &plan) const;

@@ -849,10 +849,8 @@ bool TestSubqueryCompileOnly() {
     return false;
   }
   auto in_plan = planner.Build(in_query.value()[0], catalog);
-  if (!Check(!in_plan.ok() &&
-                 in_plan.status().code() ==
-                     oursql::ErrorCode::NotImplemented,
-             "IN 子查询应通过语义检查后明确报告执行未接入")) {
+  if (!Check(in_plan.ok(),
+             "IN 子查询应保留完整过滤表达式进入执行计划")) {
     return false;
   }
 
@@ -874,10 +872,8 @@ bool TestSubqueryCompileOnly() {
     return false;
   }
   auto exists_plan = planner.Build(exists_query.value()[0], catalog);
-  if (!Check(!exists_plan.ok() &&
-                 exists_plan.status().code() ==
-                     oursql::ErrorCode::NotImplemented,
-             "EXISTS 子查询应明确报告执行未接入")) {
+  if (!Check(exists_plan.ok(),
+             "EXISTS 子查询应保留完整过滤表达式进入执行计划")) {
     return false;
   }
 
@@ -1538,9 +1534,8 @@ bool TestBetweenInLikeParsing() {
     auto parsed = parser.Parse(sql);
     if (!Check(parsed.ok(), "合法 BETWEEN/IN/LIKE 应可解析")) return false;
     auto plan = planner.Build(parsed.value()[0], catalog);
-    if (!Check(!plan.ok() &&
-                   plan.status().code() == oursql::ErrorCode::NotImplemented,
-               "合法 BETWEEN/IN/LIKE 应完成语义检查后报告未实现")) {
+    if (!Check(plan.ok(),
+               "合法 BETWEEN/IN/LIKE 应生成可执行过滤计划")) {
       return false;
     }
   }

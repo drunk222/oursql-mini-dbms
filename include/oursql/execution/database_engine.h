@@ -81,6 +81,9 @@ class DatabaseEngine {
   [[nodiscard]] std::size_t GetPoolSize() const noexcept;
   // 调用者：CLI 或批处理客户端；作用：编译并逐条执行多条 SQL；返回：每条语句的结果序列。
   [[nodiscard]] Result<std::vector<ExecutionResult>> ExecuteSqlBatch(std::string_view sql);
+  // 调用者：编译链路展示；作用：对单条 AST 完成语义检查并生成逻辑 Plan；
+  // 返回：Plan 或语义/规划错误。该调用不执行 SQL，也不修改 Catalog 或存储。
+  [[nodiscard]] Result<Plan> BuildPlan(const Statement &statement) const;
   // 调用者：命令行或客户端；作用：编译并执行多条 SQL；返回：最后一条结果或执行错误。
   [[nodiscard]] Result<ExecutionResult> ExecuteSql(std::string_view sql);
   // 调用者：并发客户端；作用：创建一个独立 Session；返回：会话句柄或引擎错误。

@@ -17,9 +17,10 @@ bool IsJoinSource(const PlanNode &node) {
 }
 
 // 冻结计划形态：SELECT 的根算子必须是 ProjectPlan；其下只允许出现
-// OrderBy?、GroupBy?、Filter?、SeqScan 或 Join 子树。GroupBy/OrderBy 是
-// 编译层扩展算子，Filter 只允许直接包住 SeqScan/IndexScan。执行器依赖根
-// Project 取得投影列，因此所有规则都必须保留这一外层合同。
+// OrderBy?、GroupBy?、Filter?、SeqScan/IndexScan 或合法 Join 子树。
+// GroupBy/OrderBy 负责数据组织，Filter 直接包住扫描叶子；Join 叶子必须是
+// 可由执行器构造的二元连接树。执行器依赖根 Project 取得投影列，因此所有
+// 规则都必须保留这一外层合同。
 bool IsFrozenSelectShape(const PlanNode &node) {
   const auto *project = std::get_if<ProjectPlan>(&node.operation);
   if (project == nullptr || project->child == nullptr) return false;
@@ -97,6 +98,8 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(
     bool changed = false;
 
     // R1：连续 Project 的内层投影若覆盖外层所需列，可去掉内层 Project。
+    // 规则只删除中间投影，不删除根 Project；外层 SELECT * 时只有内层也
+    // 保留整行，才能证明删除后不会丢失输出列。
     if (const auto *outer =
             std::get_if<ProjectPlan>(&select->root->operation)) {
       if (outer->child != nullptr) {
@@ -114,7 +117,12 @@ Result<OptimizationResult> Optimizer::OptimizeWithStats(
     }
 
     // R2：等值 INT 谓词存在匹配索引时，把 SeqScan 替换为 IndexScan。
-    // Filter 节点仍保留，执行时会对索引返回的行再次求值，保证正确性。
+    // 触发前提包括：
+    // 1. 根仍是 Project，且其下是 Filter；
+    // 2. Filter 的 Predicate 是“列 = INT 常量”；
+    // 3. 索引属于同一张表且索引列与谓词列一致。
+    // Filter 节点仍保留，执行时会复核索引返回的候选行，避免把索引本身
+    // 当成最终语义来源；当前规则不做选择率估算，也不比较 SeqScan 成本。
     if (const auto *project =
             std::get_if<ProjectPlan>(&select->root->operation)) {
       if (project->child != nullptr) {

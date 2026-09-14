@@ -78,6 +78,8 @@ nlohmann::json ExecutionResultToJson(const ExecutionResult &result) {
       {"rows", std::move(rows)},
       {"rids", std::move(rids)},
       {"affected_rows", result.affected_rows},
+      {"line", result.source_line},
+      {"duration_ms", result.execution_time_ms},
   };
 }
 
@@ -128,6 +130,35 @@ nlohmann::json FrameSnapshotToJson(const FrameSnapshot &snapshot) {
     result["page_id"] = nullptr;
   }
   return result;
+}
+
+nlohmann::json SqlTraceToJson(const SqlTrace &trace) {
+  auto steps = nlohmann::json::array();
+  for (const auto &step : trace.steps) {
+    steps.push_back({
+        {"name", step.name},
+        {"ok", step.ok},
+        {"summary", step.summary},
+        {"entries", step.entries},
+    });
+  }
+  return nlohmann::json{{"steps", std::move(steps)}};
+}
+
+nlohmann::json ConcurrentSqlResultToJson(const ConcurrentSqlResult &result) {
+  auto results = nlohmann::json::array();
+  for (const auto &item : result.results) {
+    results.push_back(ExecutionResultToJson(item));
+  }
+  nlohmann::json payload{
+      {"ok", result.status.ok()},
+      {"duration_ms", result.duration_ms},
+      {"results", std::move(results)},
+  };
+  if (!result.status.ok()) {
+    payload["error"] = ErrorPayload(result.status)["error"];
+  }
+  return payload;
 }
 
 }  // namespace oursql

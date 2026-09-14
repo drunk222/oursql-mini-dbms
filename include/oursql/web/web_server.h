@@ -32,10 +32,13 @@ class WebServer {
  private:
   void RegisterRoutes();
   void HandleQuery(const httplib::Request &request, httplib::Response &response);
+  void HandleTrace(const httplib::Request &request, httplib::Response &response);
   void HandleTables(const httplib::Request &request, httplib::Response &response);
   void HandleSchema(const httplib::Request &request, httplib::Response &response);
   void HandleStats(const httplib::Request &request, httplib::Response &response);
   void HandleFlush(const httplib::Request &request, httplib::Response &response);
+  void HandleConcurrencyRun(const httplib::Request &request,
+                            httplib::Response &response);
   void HandleConcurrencyDemo(const httplib::Request &request,
                              httplib::Response &response);
 

@@ -4,6 +4,7 @@
 #include "oursql/storage/heap_table.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <set>
@@ -728,6 +729,12 @@ Status DatabaseEngine::AcquireStatementLocks(
 
 Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
     const std::shared_ptr<SessionContext> &session, std::string_view sql) {
+  const auto batch_started_at = std::chrono::steady_clock::now();
+  const auto elapsed_ms = [&]() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - batch_started_at)
+        .count();
+  };
   auto statements = parser_.Parse(sql);
   if (!statements.ok()) {
     MarkFailedIfActive(session->current_transaction);
@@ -830,9 +837,11 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
       session->current_transaction = begin.value();
       session->table_lock_modes.clear();
       session->schema_lock_mode.reset();
-      results.push_back(MakeTransactionMessage(
+      auto message = MakeTransactionMessage(
           "Transaction started (txn_id=" +
-          std::to_string(begin.value()->id()) + ")"));
+          std::to_string(begin.value()->id()) + ")");
+      message.execution_time_ms = elapsed_ms();
+      results.push_back(std::move(message));
       continue;
     }
 
@@ -854,7 +863,9 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
       session->current_transaction.reset();
       session->table_lock_modes.clear();
       session->schema_lock_mode.reset();
-      results.push_back(MakeTransactionMessage("Transaction committed"));
+      auto message = MakeTransactionMessage("Transaction committed");
+      message.execution_time_ms = elapsed_ms();
+      results.push_back(std::move(message));
       continue;
     }
 
@@ -877,7 +888,9 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
       session->current_transaction.reset();
       session->table_lock_modes.clear();
       session->schema_lock_mode.reset();
-      results.push_back(MakeTransactionMessage("Transaction rolled back"));
+      auto message = MakeTransactionMessage("Transaction rolled back");
+      message.execution_time_ms = elapsed_ms();
+      results.push_back(std::move(message));
       continue;
     }
 
@@ -954,7 +967,9 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
       session->table_lock_modes.clear();
       session->schema_lock_mode.reset();
     }
-    results.push_back(std::move(result.value()));
+    auto completed = std::move(result.value());
+    completed.execution_time_ms = elapsed_ms();
+    results.push_back(std::move(completed));
   }
   return Result<std::vector<ExecutionResult>>(std::move(results));
 }
@@ -979,6 +994,16 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatch(
         Status::InvalidArgument("session is closed"));
   }
   return ExecuteSqlBatchLocked(session, sql);
+}
+
+Result<Plan> DatabaseEngine::BuildPlan(const Statement &statement) const {
+  if (!init_status_.ok()) {
+    return Result<Plan>(Contextualize("DatabaseEngine", init_status_));
+  }
+  if (closed_) {
+    return Result<Plan>(Status::InvalidArgument("DatabaseEngine 已关闭"));
+  }
+  return planner_.Build(statement, catalog_);
 }
 
 Result<ExecutionResult> DatabaseEngine::ExecuteSql(

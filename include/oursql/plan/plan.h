@@ -21,8 +21,10 @@ struct CreateTablePlan {
   Schema schema;
 };
 
-// DML 插入计划：columns 为空时按表定义顺序写入所有列；否则按指定列顺序写入。
-// rows 中的每个值已经在编译阶段完成数量、类型和长度检查。
+// DML 插入计划：columns 为空时按表定义顺序对应全列；columns 非空时按指定
+// 列顺序对应。rows 中的值已经在编译阶段完成数量、类型、NULL、长度和默认值
+// 规范化。当前执行器只接受“一行、无显式列列表”的形态，其余计划会显式
+// 返回 NotImplemented，避免多行写入被静默截断。
 struct InsertPlan {
   std::string table_name;
   std::vector<std::string> columns;
@@ -34,7 +36,8 @@ struct SeqScanPlan {
   std::string table_name;
 };
 
-// 等值索引点查。key 的下标来自索引列，执行器仍需用 Filter 复核条件。
+// 等值索引点查计划。当前 Optimizer 只在 INT 列等值谓词存在匹配索引时生成；
+// 执行器仍保留外层 Filter，用同一条件复核索引返回的 RID，不能只相信索引。
 struct IndexScanPlan {
   std::string table_name;
   std::string index_name;
@@ -76,7 +79,8 @@ struct ProjectPlan {
   std::vector<std::size_t> input_indexes;
 };
 
-// 分组节点；普通 GROUP BY 去重，聚合查询由 SelectPlan 表达式消费分组。
+// 分组节点。GROUP BY 的列会形成分组键；带聚合函数时由聚合执行路径按组
+// 计算，HAVING 在聚合完成后过滤分组。
 struct GroupByPlan {
   std::shared_ptr<const PlanNode> child;
   std::vector<std::string> columns;
@@ -100,7 +104,8 @@ struct PlanNode {
 };
 
 // SELECT 的根节点固定为 Project，其下按 Planner 产生的算子链读取数据。
-// distinct 和 limit 是由 Executor 在投影/聚合之后应用的根计划修饰符。
+// distinct 和 limit 是根计划修饰符，由执行器在投影或聚合完成后应用：
+// DISTINCT 按输出行去重，LIMIT 按行数截断。
 // projection_aliases 与 root Project 的 columns 等长；table_alias 保存 AS 表别名。
 // projection_expressions 和 having 保存聚合相关的编译层表达式。
 // output_types 与 Project 输出列等长，供外层子查询做类型推导；执行器不依赖它。
@@ -117,19 +122,22 @@ struct SelectPlan {
   std::vector<PlanValueType> output_types;
 };
 
-// 删除计划。where 为空表示删除整表；复杂 WHERE 在执行前会被 Planner 拒绝。
+// 删除计划。where 为空表示删除整表；当前 DeleteExecutor 只执行可提取为
+// 简单 Predicate 的 WHERE，复杂表达式会在 Planner 阶段明确拒绝。
 struct DeletePlan {
   std::string table_name;
   std::optional<Predicate> where;
 };
 
-// DROP TABLE 计划。
+// DROP TABLE 计划。执行器按“删除索引、释放数据页链、删除 Catalog 表记录”
+// 的顺序完成删除；Planner 只负责确认目标表存在。
 struct DropTablePlan {
   std::string table_name;
 };
 
 // ALTER TABLE 计划。RenameTable/RenameColumn 使用 new_name；AddColumn 使用
-// column 和可选 default_value。执行阶段负责原子更新 Catalog 与已有数据。
+// column 和可选 default_value。编译阶段已完成语义检查，但执行器尚未接入
+// Catalog/已有数据的原子改写，因此当前会明确返回 NotImplemented。
 struct AlterTablePlan {
   std::string table_name;
   AlterTableAction action{AlterTableAction::RenameTable};
@@ -162,7 +170,9 @@ struct ExplainPlan {
   SelectPlan select;
 };
 
-// 更新计划。
+// 更新计划。assignments 保存 SET 列和右值表达式，where 保存可执行的简单
+// Predicate。UpdateExecutor 会更新 Heap 并同步维护现有索引；复杂 WHERE
+// 目前仍在 Planner 阶段被拒绝。
 struct UpdatePlan {
   std::string table_name;
   std::vector<UpdateAssignment> assignments;

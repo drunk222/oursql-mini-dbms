@@ -87,6 +87,10 @@
           <textarea id="sqlEditor" class="sql-editor" spellcheck="false" wrap="off"
                     placeholder="CREATE TABLE student(id INT, name VARCHAR);"></textarea>
         </div>
+        <div id="editorResizer" class="editor-resizer" role="separator"
+             aria-orientation="horizontal" aria-label="调整 SQL 编辑器高度"
+             aria-valuemin="160" aria-valuemax="720" aria-valuenow="268"
+             tabindex="0" title="拖动调整 SQL 编辑器高度，双击恢复默认"></div>
         <div class="editor-actions">
           <button id="runButton" class="button button-primary" type="button">
             <i data-lucide="play" aria-hidden="true"></i>
@@ -100,8 +104,45 @@
             <i data-lucide="file-code-2" aria-hidden="true"></i>
             <span>载入测试 SQL</span>
           </button>
+          <button id="traceButton" class="button button-secondary trace-toggle" type="button"
+                  aria-pressed="false" title="切换编译链路展示">
+            <i data-lucide="route" aria-hidden="true"></i>
+            <span>链路展示</span>
+          </button>
           <span class="shortcut-hint">Ctrl + Enter</span>
         </div>
+      </section>
+
+      <section id="tableDetailSection" class="table-detail-section"
+               aria-label="表详情" hidden>
+        <div class="table-detail-header">
+          <div>
+            <p class="eyebrow">表</p>
+            <h2 id="tableDetailTitle"></h2>
+          </div>
+          <div class="table-detail-actions">
+            <button id="refreshTableButton" class="icon-button" type="button"
+                    aria-label="刷新表数据" title="刷新表数据">
+              <i data-lucide="refresh-cw" aria-hidden="true"></i>
+            </button>
+            <button id="closeTableButton" class="icon-button" type="button"
+                    aria-label="关闭表详情" title="关闭表详情">
+              <i data-lucide="x" aria-hidden="true"></i>
+            </button>
+          </div>
+        </div>
+
+        <div class="table-tabs" role="tablist" aria-label="表详情视图">
+          <button id="tableDataTab" class="table-tab" type="button" role="tab"
+                  aria-selected="true" aria-controls="tableDataPanel">数据</button>
+          <button id="tableUmlTab" class="table-tab" type="button" role="tab"
+                  aria-selected="false" aria-controls="tableUmlPanel">UML 图</button>
+        </div>
+
+        <div id="tableDataPanel" class="table-detail-panel" role="tabpanel"
+             aria-labelledby="tableDataTab"></div>
+        <div id="tableUmlPanel" class="table-detail-panel" role="tabpanel"
+             aria-labelledby="tableUmlTab" hidden></div>
       </section>
 
       <section class="result-section" aria-label="查询结果">

@@ -47,6 +47,7 @@ SELECT * FROM student;
 
 - 建表成功。
 - 两次插入均显示执行成功。
+- 每条结果左侧显示对应 SQL 语句的输入行号。
 - 第一次查询显示 Alice 和 Bob。
 - 指定列查询显示 Bob。
 - 删除显示执行成功。
@@ -57,6 +58,7 @@ SELECT * FROM student;
 ```text
 GET  /api/health
 POST /api/query
+POST /api/trace
 GET  /api/tables
 GET  /api/schema?table=student
 GET  /api/stats
@@ -64,7 +66,10 @@ POST /api/flush
 POST /api/concurrency/demo
 ```
 
-`GET /api/tables` 返回每张表的名称和列定义，供 API 调用方使用。
+`GET /api/tables` 返回每张表的名称和列定义，供 API 调用方使用。`POST /api/trace`
+只执行编译链路，按 Token、AST、语义检查和 Plan 返回结果，不会执行 SQL 或修改数据库。
+
+在工作台启用“链路展示”后，“运行”按钮会调用该接口，并把四个阶段依次显示在结果区。
 
 ## 全量 SQL 测试脚本
 
@@ -109,7 +114,7 @@ OurSQL 连接
         -> 列名和类型
 ```
 
-导航支持表名筛选、展开和折叠、节点选中以及键盘方向键操作。执行 `CREATE TABLE` 或 `DROP TABLE` 后会自动刷新树。
+导航支持表名筛选、展开和折叠、节点选中以及键盘方向键操作。点击表节点可以查看表数据，并切换到字段 UML 图。执行 `CREATE TABLE` 或 `DROP TABLE` 后会自动刷新树。
 
 ## 并发演示页
 
@@ -119,12 +124,8 @@ OurSQL 连接
 http://127.0.0.1:8080/concurrency.html
 ```
 
-该页面会运行四个隔离场景：
-
-1. 两个会话在不同表上并发提交。
-2. 同一索引键和页面上的锁等待。
-3. `DROP TABLE` 等待目标表上的 DML 事务提交。
-4. 循环等待的死锁检测与受害者回滚。
+页面支持选择 2–6 个并排 SQL 编辑区。点击底部的“并发运行”后，各会话使用独立
+Session 同时开始执行，并在每条 SQL 的结果旁显示从脚本开始到该语句完成的累计时间。
 
 演示使用临时数据库，不修改工作台当前数据库。每个场景都会返回事件时间线、耗时和关键指标。
 

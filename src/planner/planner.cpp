@@ -416,10 +416,6 @@ Result<CompileType> CheckCompileExpr(const CompileExprPtr &expr,
         using Type = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<Type, CompileColumnExpr>) {
           // 列引用必须存在于当前表 Schema；Catalog 只读，不在编译阶段登记表。
-          if (!value.table_name.empty()) {
-            return Result<CompileType>(Status::InvalidArgument(
-                context + ": 单表查询中的列名不能带表限定符"));
-          }
           auto column = schema.FindColumn(value.name);
           if (!column.ok()) {
             return Result<CompileType>(
@@ -671,6 +667,62 @@ Result<CompileType> CheckCompileExpr(const CompileExprPtr &expr,
       expr->data);
 }
 
+Status CheckSingleTableQualifiers(const CompileExprPtr &expr,
+                                  std::string_view table_name,
+                                  std::string_view table_alias,
+                                  const std::string &context) {
+  if (expr == nullptr) return Status::Ok();
+  return std::visit(
+      [&](const auto &node) -> Status {
+        using Type = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<Type, CompileColumnExpr>) {
+          if (!node.table_name.empty() && node.table_name != table_name &&
+              node.table_name != table_alias) {
+            return Status::NotFound(context + ": 表名或别名不匹配: " +
+                                    node.table_name);
+          }
+          return Status::Ok();
+        } else if constexpr (std::is_same_v<Type, CompileLiteralExpr>) {
+          return Status::Ok();
+        } else if constexpr (std::is_same_v<Type, CompileSubqueryExpr>) {
+          return CheckSingleTableQualifiers(node.operand, table_name,
+                                            table_alias, context);
+        } else if constexpr (std::is_same_v<Type, CompileUnaryExpr> ||
+                             std::is_same_v<Type, CompileIsNullExpr>) {
+          return CheckSingleTableQualifiers(node.operand, table_name,
+                                            table_alias, context);
+        } else if constexpr (std::is_same_v<Type, CompileAggregateExpr>) {
+          return CheckSingleTableQualifiers(node.argument, table_name,
+                                            table_alias, context);
+        } else if constexpr (std::is_same_v<Type, CompileBinaryExpr>) {
+          auto left = CheckSingleTableQualifiers(node.left, table_name,
+                                                 table_alias, context);
+          return left.ok() ? CheckSingleTableQualifiers(
+                                 node.right, table_name, table_alias, context)
+                           : left;
+        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
+          auto operand = CheckSingleTableQualifiers(node.operand, table_name,
+                                                    table_alias, context);
+          if (!operand.ok()) return operand;
+          auto lower = CheckSingleTableQualifiers(node.lower, table_name,
+                                                  table_alias, context);
+          return lower.ok() ? CheckSingleTableQualifiers(
+                                  node.upper, table_name, table_alias, context)
+                            : lower;
+        } else {
+          auto operand = CheckSingleTableQualifiers(node.operand, table_name,
+                                                    table_alias, context);
+          if (!operand.ok()) return operand;
+          for (const auto &option : node.options) {
+            auto status = CheckSingleTableQualifiers(option, table_name,
+                                                     table_alias, context);
+            if (!status.ok()) return status;
+          }
+          return Status::Ok();
+        }
+      }, expr->data);
+}
+
 // 递归判断表达式是否包含聚合函数。WHERE 和 UPDATE 不接受聚合；SELECT
 // 投影与 HAVING 则使用该结果决定是否需要执行 GROUP BY 分组规则检查。
 bool ContainsAggregate(const CompileExprPtr &expr) {
@@ -917,8 +969,7 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
             }
             if (value.where.has_value() || value.compile_where != nullptr ||
                 !value.group_by.empty() || value.having != nullptr ||
-                !value.order_by.empty() || value.distinct ||
-                value.limit.has_value()) {
+                !value.order_by.empty()) {
               return fail_at(Status::NotImplemented(
                   "JOIN 当前仅支持 SELECT ... JOIN ... ON 等值连接"));
             }
@@ -1051,8 +1102,9 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                 std::make_shared<PlanNode>(ProjectPlan{
                     root, output_names, value.select_all, input_indexes});
             return Result<Plan>(SelectPlan{
-                value.table_name, std::move(project), false, std::nullopt, {},
-                "", value.projection_expressions, nullptr, false,
+                value.table_name, std::move(project), value.distinct,
+                value.limit, value.projection_aliases, value.table_alias,
+                value.projection_expressions, nullptr, false,
                 std::move(output_types)});
           }
 
@@ -1069,6 +1121,10 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           }
           if (value.compile_where != nullptr) {
             // 先完成表达式列和类型检查，再判断执行层是否支持该形态。
+            auto qualifier_status = CheckSingleTableQualifiers(
+                value.compile_where, value.table_name, value.table_alias,
+                "WHERE");
+            if (!qualifier_status.ok()) return fail_at(qualifier_status);
             auto where_type =
                 CheckCompileExpr(value.compile_where, table.value()->schema,
                                  "WHERE", false, &catalog);
@@ -1078,11 +1134,6 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                   "WHERE 条件必须为 BOOL，实际 " +
                   CompileTypeName(where_type.value())));
             }
-          }
-          if (value.compile_where != nullptr && !value.where.has_value()) {
-            // 复杂条件没有通用执行算子时必须显式拒绝，不能静默忽略过滤。
-            return fail_at(Status::NotImplemented(
-                "复杂 WHERE 表达式仅编译层支持，未接入数据库执行"));
           }
           std::unordered_set<std::string> projected;
           std::vector<PlanValueType> output_types;
@@ -1109,6 +1160,10 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
               return fail_at(Status::InvalidArgument(
                   "SELECT 投影缺少表达式: " + value.projection[i]));
             }
+            auto qualifier_status = CheckSingleTableQualifiers(
+                expression, value.table_name, value.table_alias,
+                "SELECT " + value.projection[i]);
+            if (!qualifier_status.ok()) return fail_at(qualifier_status);
             auto expression_type = CheckCompileExpr(
                 expression, table.value()->schema,
                 "SELECT " + value.projection[i], true, &catalog);
@@ -1144,6 +1199,9 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
               return fail_at(Status::InvalidArgument(
                   "HAVING 必须与 GROUP BY 一起使用"));
             }
+            auto qualifier_status = CheckSingleTableQualifiers(
+                value.having, value.table_name, value.table_alias, "HAVING");
+            if (!qualifier_status.ok()) return fail_at(qualifier_status);
             auto having_type = CheckCompileExpr(
                 value.having, table.value()->schema, "HAVING", true,
                 &catalog);
@@ -1173,7 +1231,10 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           // 从叶子向根构造：SeqScan -> Filter? -> GroupBy? -> OrderBy?
           // -> Project。根 Project 永不省略，Executor 依赖它获得输出列。
           std::shared_ptr<const PlanNode> root = std::make_shared<PlanNode>(SeqScanPlan{value.table_name});
-          if (value.where.has_value()) root = std::make_shared<PlanNode>(FilterPlan{root, *value.where});
+          if (value.compile_where != nullptr) {
+            root = std::make_shared<PlanNode>(FilterPlan{
+                root, value.where.value_or(Predicate{}), value.compile_where});
+          }
           if (!value.group_by.empty()) {
             root = std::make_shared<PlanNode>(
                 GroupByPlan{root, value.group_by});
@@ -1190,7 +1251,7 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                   expression
                       ? std::get_if<CompileColumnExpr>(&expression->data)
                       : nullptr;
-              if (column == nullptr || !column->table_name.empty()) {
+              if (column == nullptr) {
                 projection_indexes.clear();
                 break;
               }
@@ -1206,8 +1267,8 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           root = std::make_shared<PlanNode>(
               ProjectPlan{root, value.projection, value.select_all,
                           std::move(projection_indexes)});
-          // DISTINCT、LIMIT 和 AS 别名都属于 SELECT 根计划元数据；当前只完成
-          // 编译层表达，执行器会在看到这些修饰符时明确返回 NotImplemented。
+          // DISTINCT、LIMIT 和 AS 别名都属于 SELECT 根计划元数据，
+          // 由执行器在投影或聚合完成后应用。
           return Result<Plan>(SelectPlan{
               value.table_name, std::move(root), value.distinct, value.limit,
               value.projection_aliases, value.table_alias,

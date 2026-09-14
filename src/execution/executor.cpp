@@ -3,8 +3,10 @@
 #include "oursql/index/index_manager.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <limits>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -45,13 +47,280 @@ class HeapTableSource final : public RowSource {
   HeapTable::ScanCursor cursor_;
 };
 
+struct EvalValue {
+  enum class Kind { Null, Int, String, Bool } kind{Kind::Null};
+  std::int64_t integer{0};
+  std::string text;
+  bool boolean{false};
+
+  static EvalValue FromValue(const Value &value) {
+    if (value.IsNull()) return {};
+    if (value.IsInt()) return EvalValue{Kind::Int, value.AsInt(), {}, false};
+    return EvalValue{Kind::String, 0, value.AsVarchar(), false};
+  }
+  static EvalValue Bool(bool value) {
+    return EvalValue{Kind::Bool, 0, {}, value};
+  }
+  [[nodiscard]] bool IsNull() const noexcept { return kind == Kind::Null; }
+};
+
+bool LikeMatches(std::string_view value, std::string_view pattern) {
+  std::vector<bool> previous(pattern.size() + 1, false);
+  std::vector<bool> current(pattern.size() + 1, false);
+  previous[0] = true;
+  for (std::size_t j = 1; j <= pattern.size(); ++j) {
+    previous[j] = previous[j - 1] && pattern[j - 1] == '%';
+  }
+  for (std::size_t i = 1; i <= value.size(); ++i) {
+    current.assign(pattern.size() + 1, false);
+    for (std::size_t j = 1; j <= pattern.size(); ++j) {
+      if (pattern[j - 1] == '%') {
+        current[j] = current[j - 1] || previous[j];
+      } else if (pattern[j - 1] == '_' || pattern[j - 1] == value[i - 1]) {
+        current[j] = previous[j - 1];
+      }
+    }
+    previous.swap(current);
+  }
+  return previous[pattern.size()];
+}
+
+Result<EvalValue> EvaluateExpression(const CompileExprPtr &expression,
+                                     const Row &row, const Schema &schema,
+                                     const std::vector<const Row *> *group = nullptr);
+
+Result<int> CompareEval(const EvalValue &left, const EvalValue &right) {
+  if (left.kind != right.kind || left.IsNull()) {
+    return Result<int>(Status::TypeMismatch("表达式比较的操作数类型不一致"));
+  }
+  if (left.kind == EvalValue::Kind::Int) {
+    return Result<int>(left.integer < right.integer ? -1
+                       : left.integer > right.integer ? 1 : 0);
+  }
+  if (left.kind == EvalValue::Kind::String) {
+    return Result<int>(left.text < right.text ? -1
+                       : left.text > right.text ? 1 : 0);
+  }
+  if (left.kind == EvalValue::Kind::Bool) {
+    return Result<int>(left.boolean == right.boolean ? 0
+                       : left.boolean ? 1 : -1);
+  }
+  return Result<int>(0);
+}
+
+Result<EvalValue> EvaluateExpression(const CompileExprPtr &expression,
+                                     const Row &row, const Schema &schema,
+                                     const std::vector<const Row *> *group) {
+  if (expression == nullptr) {
+    return Result<EvalValue>(Status::InvalidArgument("执行表达式为空"));
+  }
+  return std::visit(
+      [&](const auto &node) -> Result<EvalValue> {
+        using Type = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<Type, CompileColumnExpr>) {
+          auto index = schema.FindColumnIndex(node.name);
+          if (!index.ok()) return Result<EvalValue>(index.status());
+          if (index.value() >= row.size()) {
+            return Result<EvalValue>(Status::InvalidArgument("表达式输入行列数不足"));
+          }
+          return Result<EvalValue>(EvalValue::FromValue(row[index.value()]));
+        } else if constexpr (std::is_same_v<Type, CompileLiteralExpr>) {
+          if (node.kind == CompileLiteralKind::Int) {
+            return Result<EvalValue>(EvalValue{EvalValue::Kind::Int, node.integer, {}, false});
+          }
+          if (node.kind == CompileLiteralKind::String) {
+            return Result<EvalValue>(EvalValue{EvalValue::Kind::String, 0, node.text, false});
+          }
+          if (node.kind == CompileLiteralKind::Bool) {
+            return Result<EvalValue>(EvalValue::Bool(node.text == "true"));
+          }
+          return Result<EvalValue>(EvalValue{});
+        } else if constexpr (std::is_same_v<Type, CompileUnaryExpr>) {
+          auto operand = EvaluateExpression(node.operand, row, schema, group);
+          if (!operand.ok() || operand.value().IsNull()) return operand;
+          if (node.op == "not" && operand.value().kind == EvalValue::Kind::Bool) {
+            return Result<EvalValue>(EvalValue::Bool(!operand.value().boolean));
+          }
+          if (node.op == "-" && operand.value().kind == EvalValue::Kind::Int) {
+            if (operand.value().integer == std::numeric_limits<std::int64_t>::min()) {
+              return Result<EvalValue>(Status::InvalidArgument("整数运算溢出"));
+            }
+            return Result<EvalValue>(EvalValue{EvalValue::Kind::Int,
+                                                -operand.value().integer, {}, false});
+          }
+          return Result<EvalValue>(Status::TypeMismatch("一元运算类型不匹配"));
+        } else if constexpr (std::is_same_v<Type, CompileIsNullExpr>) {
+          auto operand = EvaluateExpression(node.operand, row, schema, group);
+          if (!operand.ok()) return operand;
+          const bool result = operand.value().IsNull();
+          return Result<EvalValue>(EvalValue::Bool(node.negated ? !result : result));
+        } else if constexpr (std::is_same_v<Type, CompileBetweenExpr>) {
+          auto operand = EvaluateExpression(node.operand, row, schema, group);
+          auto lower = EvaluateExpression(node.lower, row, schema, group);
+          auto upper = EvaluateExpression(node.upper, row, schema, group);
+          if (!operand.ok()) return operand;
+          if (!lower.ok()) return lower;
+          if (!upper.ok()) return upper;
+          if (operand.value().IsNull() || lower.value().IsNull() || upper.value().IsNull()) {
+            return Result<EvalValue>(EvalValue{});
+          }
+          auto low = CompareEval(operand.value(), lower.value());
+          auto high = CompareEval(operand.value(), upper.value());
+          if (!low.ok()) return Result<EvalValue>(low.status());
+          if (!high.ok()) return Result<EvalValue>(high.status());
+          bool result = low.value() >= 0 && high.value() <= 0;
+          return Result<EvalValue>(EvalValue::Bool(node.negated ? !result : result));
+        } else if constexpr (std::is_same_v<Type, CompileInExpr>) {
+          auto operand = EvaluateExpression(node.operand, row, schema, group);
+          if (!operand.ok()) return operand;
+          if (operand.value().IsNull()) return Result<EvalValue>(EvalValue{});
+          bool saw_null = false;
+          for (const auto &option_expr : node.options) {
+            auto option = EvaluateExpression(option_expr, row, schema, group);
+            if (!option.ok()) return option;
+            if (option.value().IsNull()) { saw_null = true; continue; }
+            auto comparison = CompareEval(operand.value(), option.value());
+            if (!comparison.ok()) return Result<EvalValue>(comparison.status());
+            if (comparison.value() == 0) {
+              return Result<EvalValue>(EvalValue::Bool(!node.negated));
+            }
+          }
+          if (saw_null) return Result<EvalValue>(EvalValue{});
+          return Result<EvalValue>(EvalValue::Bool(node.negated));
+        } else if constexpr (std::is_same_v<Type, CompileAggregateExpr>) {
+          if (group == nullptr) {
+            return Result<EvalValue>(Status::InvalidArgument("聚合表达式缺少分组上下文"));
+          }
+          if (node.kind == CompileAggregateKind::Count) {
+            std::int64_t count = 0;
+            if (node.star) count = static_cast<std::int64_t>(group->size());
+            else for (const Row *item : *group) {
+              auto value = EvaluateExpression(node.argument, *item, schema, nullptr);
+              if (!value.ok()) return value;
+              if (!value.value().IsNull()) ++count;
+            }
+            return Result<EvalValue>(EvalValue{EvalValue::Kind::Int, count, {}, false});
+          }
+          bool found = false;
+          EvalValue accumulated;
+          std::int64_t count = 0;
+          for (const Row *item : *group) {
+            auto value = EvaluateExpression(node.argument, *item, schema, nullptr);
+            if (!value.ok()) return value;
+            if (value.value().IsNull()) continue;
+            if (!found) { accumulated = value.value(); found = true; }
+            else if (node.kind == CompileAggregateKind::Sum ||
+                     node.kind == CompileAggregateKind::Avg) {
+              const auto rhs = value.value().integer;
+              const auto lhs = accumulated.integer;
+              if ((rhs > 0 && lhs > std::numeric_limits<std::int64_t>::max() - rhs) ||
+                  (rhs < 0 && lhs < std::numeric_limits<std::int64_t>::min() - rhs)) {
+                return Result<EvalValue>(Status::InvalidArgument("聚合整数溢出"));
+              }
+              accumulated.integer += rhs;
+            } else {
+              auto comparison = CompareEval(value.value(), accumulated);
+              if (!comparison.ok()) return Result<EvalValue>(comparison.status());
+              if ((node.kind == CompileAggregateKind::Min && comparison.value() < 0) ||
+                  (node.kind == CompileAggregateKind::Max && comparison.value() > 0)) {
+                accumulated = value.value();
+              }
+            }
+            ++count;
+          }
+          if (!found) return Result<EvalValue>(EvalValue{});
+          if (node.kind == CompileAggregateKind::Avg) accumulated.integer /= count;
+          return Result<EvalValue>(std::move(accumulated));
+        } else if constexpr (std::is_same_v<Type, CompileSubqueryExpr>) {
+          return Result<EvalValue>(Status::NotImplemented("执行表达式中的子查询尚未支持"));
+        } else {
+          auto left = EvaluateExpression(node.left, row, schema, group);
+          if (!left.ok()) return left;
+          if (node.op == "and" && left.value().kind == EvalValue::Kind::Bool &&
+              !left.value().boolean) return Result<EvalValue>(EvalValue::Bool(false));
+          if (node.op == "or" && left.value().kind == EvalValue::Kind::Bool &&
+              left.value().boolean) return Result<EvalValue>(EvalValue::Bool(true));
+          auto right = EvaluateExpression(node.right, row, schema, group);
+          if (!right.ok()) return right;
+          if (node.op == "and" || node.op == "or") {
+            if (node.op == "and" && right.value().kind == EvalValue::Kind::Bool &&
+                !right.value().boolean) return Result<EvalValue>(EvalValue::Bool(false));
+            if (node.op == "or" && right.value().kind == EvalValue::Kind::Bool &&
+                right.value().boolean) return Result<EvalValue>(EvalValue::Bool(true));
+            if (left.value().IsNull() || right.value().IsNull()) {
+              return Result<EvalValue>(EvalValue{});
+            }
+            if (left.value().kind != EvalValue::Kind::Bool || right.value().kind != EvalValue::Kind::Bool) {
+              return Result<EvalValue>(Status::TypeMismatch("逻辑运算需要 BOOL"));
+            }
+            return Result<EvalValue>(EvalValue::Bool(node.op == "and"
+                ? left.value().boolean && right.value().boolean
+                : left.value().boolean || right.value().boolean));
+          }
+          if (left.value().IsNull() || right.value().IsNull()) return Result<EvalValue>(EvalValue{});
+          if (node.op == "like" || node.op == "not like") {
+            bool matches = LikeMatches(left.value().text, right.value().text);
+            return Result<EvalValue>(EvalValue::Bool(node.op == "like" ? matches : !matches));
+          }
+          if (node.op == "+" || node.op == "-" || node.op == "*" || node.op == "/") {
+            const auto lhs = left.value().integer;
+            const auto rhs = right.value().integer;
+            std::int64_t result = 0;
+            bool valid = true;
+            if (node.op == "+") {
+              valid = !((rhs > 0 && lhs > std::numeric_limits<std::int64_t>::max() - rhs) ||
+                        (rhs < 0 && lhs < std::numeric_limits<std::int64_t>::min() - rhs));
+              if (valid) result = lhs + rhs;
+            } else if (node.op == "-") {
+              valid = !((rhs > 0 && lhs < std::numeric_limits<std::int64_t>::min() + rhs) ||
+                        (rhs < 0 && lhs > std::numeric_limits<std::int64_t>::max() + rhs));
+              if (valid) result = lhs - rhs;
+            } else if (node.op == "*") {
+              if (lhs == 0 || rhs == 0) result = 0;
+              else if ((lhs == -1 && rhs == std::numeric_limits<std::int64_t>::min()) ||
+                       (rhs == -1 && lhs == std::numeric_limits<std::int64_t>::min())) valid = false;
+              else {
+                if (lhs > 0 && rhs > 0) valid = lhs <= std::numeric_limits<std::int64_t>::max() / rhs;
+                if (lhs > 0 && rhs < 0) valid = rhs >= std::numeric_limits<std::int64_t>::min() / lhs;
+                if (lhs < 0 && rhs > 0) valid = lhs >= std::numeric_limits<std::int64_t>::min() / rhs;
+                if (lhs < 0 && rhs < 0) valid = lhs >= std::numeric_limits<std::int64_t>::max() / rhs;
+                if (valid) result = lhs * rhs;
+              }
+            } else {
+              valid = rhs != 0 && !(lhs == std::numeric_limits<std::int64_t>::min() && rhs == -1);
+              if (valid) result = lhs / rhs;
+            }
+            if (!valid) return Result<EvalValue>(Status::InvalidArgument(rhs == 0 && node.op == "/" ? "除数不能为零" : "整数运算溢出"));
+            return Result<EvalValue>(EvalValue{EvalValue::Kind::Int, result, {}, false});
+          }
+          auto comparison = CompareEval(left.value(), right.value());
+          if (!comparison.ok()) return Result<EvalValue>(comparison.status());
+          bool result = node.op == "=" ? comparison.value() == 0
+              : (node.op == "!=" || node.op == "<>") ? comparison.value() != 0
+              : node.op == ">" ? comparison.value() > 0
+              : node.op == ">=" ? comparison.value() >= 0
+              : node.op == "<" ? comparison.value() < 0
+              : comparison.value() <= 0;
+          return Result<EvalValue>(EvalValue::Bool(result));
+        }
+      }, expression->data);
+}
+
+Result<Value> ToStorageValue(const EvalValue &value) {
+  if (value.kind == EvalValue::Kind::Null) return Result<Value>(Value{});
+  if (value.kind == EvalValue::Kind::Int) return Result<Value>(Value(value.integer));
+  if (value.kind == EvalValue::Kind::String) return Result<Value>(Value(value.text));
+  return Result<Value>(Status::TypeMismatch("结果集尚不支持 BOOL 物理值"));
+}
+
 class FilterSource final : public RowSource {
  public:
-  FilterSource(std::unique_ptr<RowSource> child, std::size_t column_index, Predicate predicate,
-               Schema schema)
+  FilterSource(std::unique_ptr<RowSource> child, std::size_t column_index,
+               Predicate predicate, CompileExprPtr expression, Schema schema)
       : child_(std::move(child)),
         column_index_(column_index),
         predicate_(std::move(predicate)),
+        expression_(std::move(expression)),
         schema_(std::move(schema)) {}
 
   Result<std::optional<RowEntry>> Next() override {
@@ -65,12 +334,20 @@ class FilterSource final : public RowSource {
         return Result<std::optional<RowEntry>>(
             Status::InvalidArgument("Filter 输入行列数与 Schema 不符"));
       }
-      const auto &value = entry.second[column_index_];
-      if (value.type() != predicate_.value.type()) {
-        return Result<std::optional<RowEntry>>(
-            Status::TypeMismatch("Filter 列和值类型不匹配: " + predicate_.column));
+      bool matches = false;
+      if (expression_ != nullptr) {
+        auto evaluated = EvaluateExpression(expression_, entry.second, schema_);
+        if (!evaluated.ok()) return Result<std::optional<RowEntry>>(evaluated.status());
+        matches = evaluated.value().kind == EvalValue::Kind::Bool &&
+                  evaluated.value().boolean;
+      } else {
+        const auto &value = entry.second[column_index_];
+        if (predicate_.kind == PredicateKind::IsNull) matches = value.IsNull();
+        else if (predicate_.kind == PredicateKind::IsNotNull) matches = !value.IsNull();
+        else matches = !value.IsNull() && value.type() == predicate_.value.type() &&
+                       value == predicate_.value;
       }
-      if (value == predicate_.value) {
+      if (matches) {
         return Result<std::optional<RowEntry>>(
             std::optional<RowEntry>(std::move(entry)));
       }
@@ -81,6 +358,7 @@ class FilterSource final : public RowSource {
   std::unique_ptr<RowSource> child_;
   std::size_t column_index_{0};
   Predicate predicate_;
+  CompileExprPtr expression_;
   Schema schema_;
 };
 
@@ -131,6 +409,95 @@ class MaterializedSource final : public RowSource {
   std::size_t next_{0};
 };
 
+class LimitSource final : public RowSource {
+ public:
+  LimitSource(std::unique_ptr<RowSource> child, std::size_t limit)
+      : child_(std::move(child)), limit_(limit) {}
+  Result<std::optional<RowEntry>> Next() override {
+    if (emitted_ >= limit_) {
+      return Result<std::optional<RowEntry>>(std::optional<RowEntry>{});
+    }
+    auto next = child_->Next();
+    if (next.ok() && next.value().has_value()) ++emitted_;
+    return next;
+  }
+ private:
+  std::unique_ptr<RowSource> child_;
+  std::size_t limit_{0};
+  std::size_t emitted_{0};
+};
+
+class DistinctSource final : public RowSource {
+ public:
+  explicit DistinctSource(std::unique_ptr<RowSource> child)
+      : child_(std::move(child)) {}
+  Result<std::optional<RowEntry>> Next() override {
+    while (true) {
+      auto next = child_->Next();
+      if (!next.ok() || !next.value().has_value()) return next;
+      const Row &candidate = next.value()->second;
+      const bool duplicate = std::any_of(
+          seen_.begin(), seen_.end(), [&](const Row &row) { return row == candidate; });
+      if (!duplicate) {
+        seen_.push_back(candidate);
+        return next;
+      }
+    }
+  }
+ private:
+  std::unique_ptr<RowSource> child_;
+  std::vector<Row> seen_;
+};
+
+Result<std::vector<RowEntry>> Materialize(std::unique_ptr<RowSource> child,
+                                         const char *executor_name);
+
+Result<std::unique_ptr<RowSource>> BuildJoinSource(
+    std::unique_ptr<RowSource> left, std::unique_ptr<RowSource> right,
+    const JoinPlan &plan, std::size_t left_width, std::size_t right_width) {
+  auto left_rows = Materialize(std::move(left), "JoinExecutor");
+  if (!left_rows.ok()) return Result<std::unique_ptr<RowSource>>(left_rows.status());
+  auto right_rows = Materialize(std::move(right), "JoinExecutor");
+  if (!right_rows.ok()) return Result<std::unique_ptr<RowSource>>(right_rows.status());
+  if (!plan.left_column_index.has_value() || !plan.right_column_index.has_value() ||
+      *plan.left_column_index >= left_width || *plan.right_column_index >= right_width) {
+    return Result<std::unique_ptr<RowSource>>(Status::InvalidArgument("JOIN 列下标无效"));
+  }
+  std::vector<RowEntry> output;
+  std::vector<bool> right_matched(right_rows.value().size(), false);
+  for (auto &left_entry : left_rows.value()) {
+    bool matched = false;
+    for (std::size_t r = 0; r < right_rows.value().size(); ++r) {
+      const auto &right_entry = right_rows.value()[r];
+      const Value &lhs = left_entry.second[*plan.left_column_index];
+      const Value &rhs = right_entry.second[*plan.right_column_index];
+      if (lhs.IsNull() || rhs.IsNull() || lhs != rhs) continue;
+      Row joined = left_entry.second;
+      joined.insert(joined.end(), right_entry.second.begin(), right_entry.second.end());
+      output.emplace_back(left_entry.first, std::move(joined));
+      matched = true;
+      right_matched[r] = true;
+    }
+    if (!matched && (plan.join_type == JoinType::Left || plan.join_type == JoinType::Full)) {
+      Row joined = left_entry.second;
+      joined.resize(left_width + right_width, Value{});
+      output.emplace_back(left_entry.first, std::move(joined));
+    }
+  }
+  if (plan.join_type == JoinType::Right || plan.join_type == JoinType::Full) {
+    for (std::size_t r = 0; r < right_rows.value().size(); ++r) {
+      if (right_matched[r]) continue;
+      Row joined(left_width, Value{});
+      joined.insert(joined.end(), right_rows.value()[r].second.begin(),
+                    right_rows.value()[r].second.end());
+      output.emplace_back(right_rows.value()[r].first, std::move(joined));
+    }
+  }
+  std::unique_ptr<RowSource> source =
+      std::make_unique<MaterializedSource>(std::move(output));
+  return Result<std::unique_ptr<RowSource>>(std::move(source));
+}
+
 Result<std::vector<RowEntry>> Materialize(std::unique_ptr<RowSource> child,
                                          const char *executor_name) {
   if (child == nullptr) {
@@ -148,6 +515,9 @@ Result<std::vector<RowEntry>> Materialize(std::unique_ptr<RowSource> child,
 }
 
 int CompareValue(const Value &left, const Value &right) {
+  if (left.IsNull() || right.IsNull()) {
+    return left.IsNull() == right.IsNull() ? 0 : left.IsNull() ? -1 : 1;
+  }
   if (left.IsInt()) {
     return left.AsInt() < right.AsInt() ? -1
            : left.AsInt() > right.AsInt() ? 1
@@ -341,14 +711,19 @@ Result<std::unique_ptr<RowSource>> FilterExecutor::Execute(
   if (child == nullptr) {
     return Result<std::unique_ptr<RowSource>>(Status::InvalidArgument("FilterExecutor 缺少子算子"));
   }
-  auto column = schema.FindColumnIndex(plan.predicate.column);
-  if (!column.ok()) return Result<std::unique_ptr<RowSource>>(column.status());
-  if (schema.At(column.value()).type != plan.predicate.value.type()) {
+  std::size_t column_index = 0;
+  if (plan.expression == nullptr) {
+    auto column = schema.FindColumnIndex(plan.predicate.column);
+    if (!column.ok()) return Result<std::unique_ptr<RowSource>>(column.status());
+    column_index = column.value();
+  }
+  if (plan.expression == nullptr && plan.predicate.kind == PredicateKind::Equal &&
+      schema.At(column_index).type != plan.predicate.value.type()) {
     return Result<std::unique_ptr<RowSource>>(
         Status::TypeMismatch("Filter 列和值类型不匹配: " + plan.predicate.column));
   }
   std::unique_ptr<RowSource> source = std::make_unique<FilterSource>(
-      std::move(child), column.value(), plan.predicate, schema);
+      std::move(child), column_index, plan.predicate, plan.expression, schema);
   return Result<std::unique_ptr<RowSource>>(std::move(source));
 }
 
@@ -359,7 +734,15 @@ Result<std::unique_ptr<RowSource>> ProjectExecutor::Execute(
   }
   std::vector<std::size_t> indexes;
   // 在构建阶段把列名解析成下标，使逐行 Next() 不再重复查找 Schema。
-  if (plan.select_all) {
+  if (!plan.input_indexes.empty()) {
+    indexes = plan.input_indexes;
+    for (const auto index : indexes) {
+      if (index >= schema.size()) {
+        return Result<std::unique_ptr<RowSource>>(
+            Status::InvalidArgument("Project 输入列下标越界"));
+      }
+    }
+  } else if (plan.select_all) {
     indexes.reserve(schema.size());
     for (std::size_t index = 0; index < schema.size(); ++index) indexes.push_back(index);
   } else {
@@ -611,40 +994,8 @@ Result<ExecutionResult> UpdateExecutor::Execute(const UpdatePlan &plan,
 }
 
 Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPlan &plan) const {
-  auto metadata = RequireMetadata(catalog_, plan.table_name);
-  if (!metadata.ok()) {
-    return Result<SourcePlan>(Contextualize("ExecutionEngine", metadata.status()));
-  }
   if (plan.root == nullptr) {
     return Result<SourcePlan>(Status::InvalidArgument("ExecutionEngine SELECT 缺少根算子"));
-  }
-
-  // 把逻辑计划树转换成可按 Next() 拉取数据的 RowSource 管道。
-  // DISTINCT 和 LIMIT 位于 SELECT 根计划修饰位。Parser/Planner 已完成语法和
-  // 语义表达，但当前 RowSource 链尚未提供去重与截断算子，必须显式拒绝。
-  if (plan.distinct || plan.limit.has_value()) {
-    return Result<SourcePlan>(Status::NotImplemented(
-        "DISTINCT/LIMIT 仅编译层支持，未接入数据库执行"));
-  }
-
-  // 聚合和 HAVING 已完成编译层类型/分组检查，但执行层尚无聚合状态和分组
-  // 过滤流程，必须显式拒绝。
-  if (plan.has_aggregates || plan.having != nullptr) {
-    return Result<SourcePlan>(Status::NotImplemented(
-        "聚合函数/HAVING 仅编译层支持，未接入数据库执行"));
-  }
-
-  // AS 别名已进入 SelectPlan，但当前单表执行链没有别名解析和输出重命名
-  // 逻辑，因此显式拒绝，避免忽略别名后产生看似成功的结果。
-  if (!plan.table_alias.empty()) {
-    return Result<SourcePlan>(Status::NotImplemented(
-        "表别名仅编译层支持，未接入数据库执行"));
-  }
-  for (const auto &alias : plan.projection_aliases) {
-    if (!alias.empty()) {
-      return Result<SourcePlan>(Status::NotImplemented(
-          "列别名仅编译层支持，未接入数据库执行"));
-    }
   }
 
   std::function<Result<SourcePlan>(const std::shared_ptr<const PlanNode> &)> build_node;
@@ -658,9 +1009,12 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
             SeqScanExecutor executor(catalog_, buffer_pool_);
             auto source = executor.Execute(operation);
             if (!source.ok()) return Result<SourcePlan>(source.status());
+            auto metadata = RequireMetadata(catalog_, operation.table_name);
+            if (!metadata.ok()) return Result<SourcePlan>(metadata.status());
             std::vector<std::string> names;
             for (const auto &column : metadata.value()->schema.columns()) names.push_back(column.name);
-            return Result<SourcePlan>(SourcePlan{std::move(source.value()), std::move(names)});
+            return Result<SourcePlan>(SourcePlan{std::move(source.value()), std::move(names),
+                                                 metadata.value()->schema});
           } else if constexpr (std::is_same_v<Type, IndexScanPlan>) {
             if (!operation.key.IsInt()) {
               return Result<SourcePlan>(Status::TypeMismatch(
@@ -679,6 +1033,8 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
             auto rids = index_manager.Lookup(operation.index_name,
                                              operation.key.AsInt());
             if (!rids.ok()) return Result<SourcePlan>(rids.status());
+            auto metadata = RequireMetadata(catalog_, operation.table_name);
+            if (!metadata.ok()) return Result<SourcePlan>(metadata.status());
             HeapTable table(buffer_pool_, *metadata.value());
             std::vector<RowEntry> rows;
             rows.reserve(rids.value().size());
@@ -694,61 +1050,200 @@ Result<ExecutionEngine::SourcePlan> ExecutionEngine::BuildSource(const SelectPla
             std::unique_ptr<RowSource> source =
                 std::make_unique<MaterializedSource>(std::move(rows));
             return Result<SourcePlan>(
-                SourcePlan{std::move(source), std::move(names)});
+                SourcePlan{std::move(source), std::move(names), metadata.value()->schema});
           } else if constexpr (std::is_same_v<Type, FilterPlan>) {
             auto child = build_node(operation.child);
             if (!child.ok()) return Result<SourcePlan>(child.status());
             FilterExecutor executor;
             auto source = executor.Execute(operation, std::move(child.value().source),
-                                           metadata.value()->schema);
+                                           child.value().schema);
             if (!source.ok()) return Result<SourcePlan>(source.status());
             return Result<SourcePlan>(SourcePlan{std::move(source.value()),
-                                                 std::move(child.value().column_names)});
+                                                 std::move(child.value().column_names),
+                                                 std::move(child.value().schema)});
           } else if constexpr (std::is_same_v<Type, GroupByPlan>) {
             auto child = build_node(operation.child);
             if (!child.ok()) return Result<SourcePlan>(child.status());
             GroupByExecutor executor;
             auto source = executor.Execute(operation,
                                            std::move(child.value().source),
-                                           metadata.value()->schema);
+                                           child.value().schema);
             if (!source.ok()) return Result<SourcePlan>(source.status());
             return Result<SourcePlan>(SourcePlan{
                 std::move(source.value()),
-                std::move(child.value().column_names)});
+                std::move(child.value().column_names),
+                std::move(child.value().schema)});
           } else if constexpr (std::is_same_v<Type, OrderByPlan>) {
             auto child = build_node(operation.child);
             if (!child.ok()) return Result<SourcePlan>(child.status());
             OrderByExecutor executor;
             auto source = executor.Execute(operation,
                                            std::move(child.value().source),
-                                           metadata.value()->schema);
+                                           child.value().schema);
             if (!source.ok()) return Result<SourcePlan>(source.status());
             return Result<SourcePlan>(SourcePlan{
                 std::move(source.value()),
-                std::move(child.value().column_names)});
+                std::move(child.value().column_names),
+                std::move(child.value().schema)});
           } else if constexpr (std::is_same_v<Type, JoinPlan>) {
-            return Result<SourcePlan>(Status::NotImplemented(
-                "JOIN 当前仅完成编译层计划生成，执行器尚未接入"));
+            auto left = build_node(operation.left);
+            if (!left.ok()) return Result<SourcePlan>(left.status());
+            auto right = build_node(operation.right);
+            if (!right.ok()) return Result<SourcePlan>(right.status());
+            const std::size_t left_width = left.value().schema.size();
+            const std::size_t right_width = right.value().schema.size();
+            auto source = BuildJoinSource(std::move(left.value().source),
+                                          std::move(right.value().source),
+                                          operation, left_width, right_width);
+            if (!source.ok()) return Result<SourcePlan>(source.status());
+            std::vector<Column> columns = left.value().schema.columns();
+            const auto &right_columns = right.value().schema.columns();
+            columns.insert(columns.end(), right_columns.begin(), right_columns.end());
+            auto names = std::move(left.value().column_names);
+            names.insert(names.end(), right.value().column_names.begin(),
+                         right.value().column_names.end());
+            return Result<SourcePlan>(SourcePlan{std::move(source.value()),
+                                                 std::move(names),
+                                                 Schema(std::move(columns))});
           } else {
             auto child = build_node(operation.child);
             if (!child.ok()) return Result<SourcePlan>(child.status());
             ProjectExecutor executor;
             auto source = executor.Execute(operation, std::move(child.value().source),
-                                           metadata.value()->schema);
+                                           child.value().schema);
             if (!source.ok()) return Result<SourcePlan>(source.status());
             std::vector<std::string> names;
             if (operation.select_all) {
-              for (const auto &column : metadata.value()->schema.columns()) names.push_back(column.name);
+              names = child.value().column_names;
             } else {
               names = operation.columns;
             }
-            return Result<SourcePlan>(SourcePlan{std::move(source.value()), std::move(names)});
+            std::vector<Column> columns;
+            const auto &indexes = operation.input_indexes;
+            if (operation.select_all) {
+              columns = child.value().schema.columns();
+            } else for (std::size_t i = 0; i < names.size(); ++i) {
+              std::size_t index = i < indexes.size() ? indexes[i]
+                  : child.value().schema.FindColumnIndex(operation.columns[i]).value();
+              Column column = child.value().schema.At(index);
+              column.name = names[i];
+              columns.push_back(std::move(column));
+            }
+            return Result<SourcePlan>(SourcePlan{std::move(source.value()), std::move(names),
+                                                 Schema(std::move(columns))});
           }
         },
         node->operation);
   };
 
-  return build_node(plan.root);
+  const auto *project = std::get_if<ProjectPlan>(&plan.root->operation);
+  if (project == nullptr) {
+    return Result<SourcePlan>(Status::InvalidArgument("SELECT 根算子必须是 Project"));
+  }
+
+  SourcePlan result;
+  if (plan.has_aggregates || plan.having != nullptr) {
+    const PlanNode *cursor = project->child.get();
+    const OrderByPlan *order = nullptr;
+    const GroupByPlan *group_by = nullptr;
+    if (cursor != nullptr) {
+      order = std::get_if<OrderByPlan>(&cursor->operation);
+      if (order != nullptr) cursor = order->child.get();
+    }
+    if (cursor != nullptr) {
+      group_by = std::get_if<GroupByPlan>(&cursor->operation);
+      if (group_by != nullptr) cursor = group_by->child.get();
+    }
+    if (cursor == nullptr) {
+      return Result<SourcePlan>(Status::InvalidArgument("聚合计划缺少数据源"));
+    }
+    auto input = build_node(std::make_shared<PlanNode>(cursor->operation));
+    if (!input.ok()) return input;
+    auto rows = Materialize(std::move(input.value().source), "AggregateExecutor");
+    if (!rows.ok()) return Result<SourcePlan>(rows.status());
+    std::vector<std::size_t> group_indexes;
+    if (group_by != nullptr) {
+      for (const auto &name : group_by->columns) {
+        auto index = input.value().schema.FindColumnIndex(name);
+        if (!index.ok()) return Result<SourcePlan>(index.status());
+        group_indexes.push_back(index.value());
+      }
+    }
+    std::vector<std::vector<RowEntry>> groups;
+    for (auto &entry : rows.value()) {
+      auto found = std::find_if(groups.begin(), groups.end(), [&](const auto &group) {
+        return !group.empty() && SameGroup(group.front().second, entry.second, group_indexes);
+      });
+      if (found == groups.end()) groups.push_back({std::move(entry)});
+      else found->push_back(std::move(entry));
+    }
+    if (groups.empty() && group_indexes.empty()) groups.emplace_back();
+    if (order != nullptr) {
+      std::vector<std::pair<std::size_t, OrderDirection>> keys;
+      for (const auto &key : order->keys) {
+        auto index = input.value().schema.FindColumnIndex(key.column);
+        if (!index.ok()) return Result<SourcePlan>(index.status());
+        keys.emplace_back(index.value(), key.direction);
+      }
+      std::stable_sort(groups.begin(), groups.end(), [&](const auto &left, const auto &right) {
+        if (left.empty() || right.empty()) return false;
+        for (const auto &[index, direction] : keys) {
+          const int compared = CompareValue(left.front().second[index], right.front().second[index]);
+          if (compared != 0) return direction == OrderDirection::Asc ? compared < 0 : compared > 0;
+        }
+        return false;
+      });
+    }
+    std::vector<RowEntry> output;
+    for (auto &group : groups) {
+      Row empty(input.value().schema.size(), Value{});
+      const Row &representative = group.empty() ? empty : group.front().second;
+      std::vector<const Row *> members;
+      for (const auto &entry : group) members.push_back(&entry.second);
+      if (plan.having != nullptr) {
+        auto condition = EvaluateExpression(plan.having, representative,
+                                            input.value().schema, &members);
+        if (!condition.ok()) return Result<SourcePlan>(condition.status());
+        if (condition.value().kind != EvalValue::Kind::Bool ||
+            !condition.value().boolean) continue;
+      }
+      Row projected;
+      for (const auto &expression : plan.projection_expressions) {
+        auto value = EvaluateExpression(expression, representative,
+                                        input.value().schema, &members);
+        if (!value.ok()) return Result<SourcePlan>(value.status());
+        auto stored = ToStorageValue(value.value());
+        if (!stored.ok()) return Result<SourcePlan>(stored.status());
+        projected.push_back(std::move(stored.value()));
+      }
+      output.emplace_back(group.empty() ? RID{} : group.front().first,
+                          std::move(projected));
+    }
+    std::vector<std::string> names = project->columns;
+    std::vector<Column> columns;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (i < plan.projection_aliases.size() && !plan.projection_aliases[i].empty()) {
+        names[i] = plan.projection_aliases[i];
+      }
+      const DataType type = i < plan.output_types.size() &&
+                                    plan.output_types[i] == PlanValueType::Varchar
+                                ? DataType::Varchar : DataType::Int;
+      columns.emplace_back(names[i], type);
+    }
+    result = SourcePlan{std::make_unique<MaterializedSource>(std::move(output)),
+                        std::move(names), Schema(std::move(columns))};
+  } else {
+    auto built = build_node(plan.root);
+    if (!built.ok()) return built;
+    result = std::move(built.value());
+    for (std::size_t i = 0; i < result.column_names.size() &&
+                            i < plan.projection_aliases.size(); ++i) {
+      if (!plan.projection_aliases[i].empty()) result.column_names[i] = plan.projection_aliases[i];
+    }
+  }
+  if (plan.distinct) result.source = std::make_unique<DistinctSource>(std::move(result.source));
+  if (plan.limit.has_value()) result.source = std::make_unique<LimitSource>(std::move(result.source), *plan.limit);
+  return Result<SourcePlan>(std::move(result));
 }
 
 Result<ExecutionResult> ExecutionEngine::Execute(const Plan &plan) const {

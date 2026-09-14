@@ -123,7 +123,7 @@ struct DeletePlan {
   std::optional<Predicate> where;
 };
 
-// DROP TABLE 计划。当前执行层明确返回 NotImplemented。
+// DROP TABLE 计划。
 struct DropTablePlan {
   std::string table_name;
 };
@@ -162,7 +162,7 @@ struct ExplainPlan {
   SelectPlan select;
 };
 
-// 更新计划。当前只完成编译层表示和语义检查，执行层明确返回 NotImplemented。
+// 更新计划。
 struct UpdatePlan {
   std::string table_name;
   std::vector<UpdateAssignment> assignments;

@@ -15,16 +15,24 @@ namespace {
 // 同时会编码为 Catalog 页面链中的一条记录。用户、权限也可沿用此持久化模式。
 
 constexpr std::uint32_t kCatalogRecordMagic = 0x314C4254U;
+constexpr std::uint32_t kCatalogRecordMagicV2 = 0x324C4254U;
 constexpr std::uint32_t kIndexRecordMagic = 0x31584449U;  // "IDX1"
 
-// Catalog 记录格式（小端序）：magic、首数据页、表名长度、列数、表名，随后是
-// 重复的 [列名长度、类型标签、VARCHAR 上限、列名]；0 表示 VARCHAR 未指定上限。
+// v1 记录只保存列名/类型/长度；v2 追加列约束和 DEFAULT 值。
+// Decode 同时接受 v1，新写入统一使用 v2。
 
 void AppendU32(std::vector<std::byte> *bytes, std::uint32_t value) {
   bytes->push_back(std::byte{static_cast<unsigned char>(value & 0xFFU)});
   bytes->push_back(std::byte{static_cast<unsigned char>((value >> 8U) & 0xFFU)});
   bytes->push_back(std::byte{static_cast<unsigned char>((value >> 16U) & 0xFFU)});
   bytes->push_back(std::byte{static_cast<unsigned char>((value >> 24U) & 0xFFU)});
+}
+
+void AppendU64(std::vector<std::byte> *bytes, std::uint64_t value) {
+  for (std::size_t i = 0; i < sizeof(value); ++i) {
+    bytes->push_back(std::byte{static_cast<unsigned char>(
+        (value >> (i * 8U)) & 0xFFU)});
+  }
 }
 
 bool CanRead(const std::vector<std::byte> &bytes, std::size_t offset, std::size_t length) {
@@ -36,6 +44,15 @@ std::uint32_t ReadU32(const std::vector<std::byte> &bytes, std::size_t offset) {
          (static_cast<std::uint32_t>(bytes[offset + 1]) << 8U) |
          (static_cast<std::uint32_t>(bytes[offset + 2]) << 16U) |
          (static_cast<std::uint32_t>(bytes[offset + 3]) << 24U);
+}
+
+std::uint64_t ReadU64(const std::vector<std::byte> &bytes,
+                      std::size_t offset) {
+  std::uint64_t value = 0;
+  for (std::size_t i = 0; i < sizeof(value); ++i) {
+    value |= static_cast<std::uint64_t>(bytes[offset + i]) << (i * 8U);
+  }
+  return value;
 }
 
 Status ValidateTable(const TableMetadata &table) {
@@ -52,6 +69,26 @@ Status ValidateTable(const TableMetadata &table) {
     if (column.type == DataType::Varchar && column.length.has_value() && *column.length == 0) {
       return Status::InvalidArgument("VARCHAR 长度必须大于 0: " + column.name);
     }
+    if (column.primary_key && (column.nullable || !column.unique)) {
+      return Status::InvalidArgument("PRIMARY KEY 必须是 NOT NULL UNIQUE: " +
+                                     column.name);
+    }
+    if (column.default_value.has_value()) {
+      const auto &value = *column.default_value;
+      if (value.IsNull() && !column.nullable) {
+        return Status::InvalidArgument("NOT NULL 列不能使用 NULL DEFAULT: " +
+                                       column.name);
+      }
+      if (!value.IsNull() && value.type() != column.type) {
+        return Status::TypeMismatch("DEFAULT 类型不匹配: " + column.name);
+      }
+      if (column.type == DataType::Varchar && !value.IsNull() &&
+          column.length.has_value() &&
+          value.AsVarchar().size() > *column.length) {
+        return Status::InvalidArgument("DEFAULT 字符串超过列长度: " +
+                                       column.name);
+      }
+    }
   }
   return Status::Ok();
 }
@@ -63,7 +100,7 @@ Result<std::vector<std::byte>> EncodeTable(const TableMetadata &table) {
   }
   // 明确逐字段编码，不直接序列化 C++ 对象（其中含 string/vector 等进程内指针）。
   std::vector<std::byte> bytes;
-  AppendU32(&bytes, kCatalogRecordMagic);
+  AppendU32(&bytes, kCatalogRecordMagicV2);
   AppendU32(&bytes, table.first_data_page_id);
   AppendU32(&bytes, static_cast<std::uint32_t>(table.name.size()));
   AppendU32(&bytes, static_cast<std::uint32_t>(table.schema.size()));
@@ -78,7 +115,40 @@ Result<std::vector<std::byte>> EncodeTable(const TableMetadata &table) {
     AppendU32(&bytes, static_cast<std::uint32_t>(column.name.size()));
     bytes.push_back(std::byte{static_cast<unsigned char>(column.type == DataType::Int ? 1U : 2U)});
     AppendU32(&bytes, column.length.has_value() ? static_cast<std::uint32_t>(*column.length) : 0U);
+    std::uint8_t flags = column.nullable ? 1U : 0U;
+    if (column.primary_key) flags |= 2U;
+    if (column.unique) flags |= 4U;
+    bytes.push_back(std::byte{flags});
+    std::uint8_t default_tag = 0;
+    std::uint32_t default_length = 0;
+    if (column.default_value.has_value()) {
+      if (column.default_value->IsNull()) {
+        default_tag = 1;
+      } else if (column.default_value->IsInt()) {
+        default_tag = 2;
+        default_length = sizeof(std::int64_t);
+      } else {
+        default_tag = 3;
+        if (column.default_value->AsVarchar().size() >
+            std::numeric_limits<std::uint32_t>::max()) {
+          return Result<std::vector<std::byte>>(Status::InvalidArgument(
+              "Catalog 默认字符串过长: " + column.name));
+        }
+        default_length = static_cast<std::uint32_t>(
+            column.default_value->AsVarchar().size());
+      }
+    }
+    bytes.push_back(std::byte{default_tag});
+    AppendU32(&bytes, default_length);
     for (const auto character : column.name) bytes.push_back(std::byte{static_cast<unsigned char>(character)});
+    if (default_tag == 2) {
+      AppendU64(&bytes, static_cast<std::uint64_t>(
+                            column.default_value->AsInt()));
+    } else if (default_tag == 3) {
+      for (const auto character : column.default_value->AsVarchar()) {
+        bytes.push_back(std::byte{static_cast<unsigned char>(character)});
+      }
+    }
   }
   if (bytes.size() > SlottedPage::kMaxRecordSize) {
     return Result<std::vector<std::byte>>(Status::RecordTooLarge(
@@ -89,9 +159,12 @@ Result<std::vector<std::byte>> EncodeTable(const TableMetadata &table) {
 
 Result<TableMetadata> DecodeTable(const std::vector<std::byte> &bytes) {
   // 磁盘内容不可信：每次读取变长字段前都验证剩余字节范围。
-  if (!CanRead(bytes, 0, 16) || ReadU32(bytes, 0) != kCatalogRecordMagic) {
+  if (!CanRead(bytes, 0, 16) ||
+      (ReadU32(bytes, 0) != kCatalogRecordMagic &&
+       ReadU32(bytes, 0) != kCatalogRecordMagicV2)) {
     return Result<TableMetadata>(Status::InvalidArgument("Catalog 表记录头损坏"));
   }
+  const bool v2 = ReadU32(bytes, 0) == kCatalogRecordMagicV2;
   TableMetadata table;
   table.first_data_page_id = ReadU32(bytes, 4);
   const auto table_name_length = ReadU32(bytes, 8);
@@ -108,25 +181,80 @@ Result<TableMetadata> DecodeTable(const std::vector<std::byte> &bytes) {
   std::vector<Column> columns;
   columns.reserve(column_count);
   for (std::uint32_t i = 0; i < column_count; ++i) {
-    if (!CanRead(bytes, offset, 9)) {
+    const std::size_t field_header_size = v2 ? 15 : 9;
+    if (!CanRead(bytes, offset, field_header_size)) {
       return Result<TableMetadata>(Status::InvalidArgument("Catalog 列定义头越界"));
     }
     const auto name_length = ReadU32(bytes, offset);
     const auto type_tag = static_cast<std::uint8_t>(bytes[offset + 4]);
     const auto varchar_length = ReadU32(bytes, offset + 5);
-    offset += 9;
+    std::uint8_t flags = 1U;
+    std::uint8_t default_tag = 0;
+    std::uint32_t default_length = 0;
+    if (v2) {
+      flags = static_cast<std::uint8_t>(bytes[offset + 9]);
+      default_tag = static_cast<std::uint8_t>(bytes[offset + 10]);
+      default_length = ReadU32(bytes, offset + 11);
+      if ((flags & ~7U) != 0 || default_tag > 3) {
+        return Result<TableMetadata>(Status::InvalidArgument(
+            "Catalog 列约束或默认值标记非法"));
+      }
+    }
+    offset += field_header_size;
     if (!CanRead(bytes, offset, name_length)) {
       return Result<TableMetadata>(Status::InvalidArgument("Catalog 列名越界"));
     }
     std::string name(reinterpret_cast<const char *>(bytes.data() + offset), name_length);
     offset += name_length;
+    std::optional<Value> default_value;
+    if (v2 && default_tag != 0) {
+      if (!CanRead(bytes, offset, default_length)) {
+        return Result<TableMetadata>(
+            Status::InvalidArgument("Catalog 列默认值越界"));
+      }
+      if (default_tag == 1) {
+        if (default_length != 0) {
+          return Result<TableMetadata>(Status::InvalidArgument(
+              "Catalog NULL 默认值长度非法"));
+        }
+        default_value = Value{};
+      } else if (default_tag == 2) {
+        if (default_length != sizeof(std::int64_t)) {
+          return Result<TableMetadata>(Status::InvalidArgument(
+              "Catalog INT 默认值长度非法"));
+        }
+        default_value = Value(
+            static_cast<std::int64_t>(ReadU64(bytes, offset)));
+      } else {
+        default_value = Value(std::string(
+            reinterpret_cast<const char *>(bytes.data() + offset),
+            default_length));
+      }
+      offset += default_length;
+    }
+    const bool nullable = (flags & 1U) != 0;
+    const bool primary_key = (flags & 2U) != 0;
+    const bool unique = (flags & 4U) != 0;
     if (type_tag == 1U) {
       if (varchar_length != 0) return Result<TableMetadata>(Status::InvalidArgument("Catalog INT 列带有长度"));
-      columns.emplace_back(std::move(name), DataType::Int);
+      if (default_value.has_value() && !default_value->IsNull() &&
+          !default_value->IsInt()) {
+        return Result<TableMetadata>(Status::TypeMismatch(
+            "Catalog INT 列默认值类型错误"));
+      }
+      columns.emplace_back(std::move(name), DataType::Int, std::nullopt,
+                           nullable, primary_key, unique, default_value);
     } else if (type_tag == 2U) {
-      columns.emplace_back(std::move(name), DataType::Varchar,
-                           varchar_length == 0 ? std::nullopt
-                                               : std::optional<std::size_t>(varchar_length));
+      if (default_value.has_value() && !default_value->IsNull() &&
+          !default_value->IsVarchar()) {
+        return Result<TableMetadata>(Status::TypeMismatch(
+            "Catalog VARCHAR 列默认值类型错误"));
+      }
+      columns.emplace_back(
+          std::move(name), DataType::Varchar,
+          varchar_length == 0 ? std::nullopt
+                              : std::optional<std::size_t>(varchar_length),
+          nullable, primary_key, unique, default_value);
     } else {
       return Result<TableMetadata>(Status::InvalidArgument("Catalog 列类型标记非法"));
     }
@@ -319,7 +447,7 @@ Status Catalog::Open() {
         return Status::InvalidArgument("Catalog 元数据记录头损坏");
       }
       const auto magic = ReadU32(record.value(), 0);
-      if (magic == kCatalogRecordMagic) {
+      if (magic == kCatalogRecordMagic || magic == kCatalogRecordMagicV2) {
         auto table = DecodeTable(record.value());
         if (!table.ok()) return table.status();
         if (tables_.find(table.value().name) != tables_.end()) {
@@ -511,7 +639,8 @@ Status Catalog::DropTable(std::string_view table_name) {
           return record.status();
         }
         if (!CanRead(record.value(), 0, 4) ||
-            ReadU32(record.value(), 0) != kCatalogRecordMagic) {
+            (ReadU32(record.value(), 0) != kCatalogRecordMagic &&
+             ReadU32(record.value(), 0) != kCatalogRecordMagicV2)) {
           continue;
         }
         auto decoded = DecodeTable(record.value());

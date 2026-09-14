@@ -18,26 +18,38 @@
         <i data-lucide="arrow-left" aria-hidden="true"></i>
         <span>返回工作台</span>
       </a>
-      <button id="runDemoButton" class="button button-primary" type="button">
-        <i data-lucide="play" aria-hidden="true"></i>
-        <span>运行并发演示</span>
-      </button>
     </div>
   </header>
 
   <main class="concurrency-page">
     <section class="demo-header">
       <div>
-        <p class="eyebrow">Multi-session / Lock / Deadlock</p>
-        <h1>并发能力演示</h1>
-      </div>
-      <div id="demoSummary" class="demo-summary">
-        <span class="muted">等待运行</span>
+        <p class="eyebrow">Concurrent SQL</p>
+        <h1>并发 SQL 工作台</h1>
       </div>
     </section>
 
-    <div id="demoMessage" class="message-area" role="status" aria-live="polite"></div>
-    <section id="scenarioList" class="scenario-list" aria-live="polite"></section>
+    <div id="concurrencyMessage" class="message-area" role="status"
+         aria-live="polite"></div>
+    <section id="sessionGrid" class="concurrent-session-grid"
+             aria-label="并发 SQL 编辑器"></section>
+
+    <div class="concurrency-run-bar">
+      <label class="session-count-control" for="sessionCount">
+        <span>并发数</span>
+        <select id="sessionCount">
+          <option value="2" selected>2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+          <option value="6">6</option>
+        </select>
+      </label>
+      <button id="runConcurrentButton" class="button button-primary" type="button">
+        <i data-lucide="play" aria-hidden="true"></i>
+        <span>并发运行</span>
+      </button>
+    </div>
   </main>
 
   <script src="/assets/lucide/lucide.min.js"></script>

@@ -114,9 +114,10 @@ bool TestWebApi() {
 
   const nlohmann::json query_body = {
       {"sql",
-       "CREATE TABLE student(id INT, name VARCHAR);"
-       "INSERT INTO student VALUES(1, 'Alice');"
-       "INSERT INTO student VALUES(2, 'Bob');"
+       "CREATE TABLE student(id INT, name VARCHAR);\n"
+       "INSERT INTO student VALUES(1, 'Alice');\n"
+       "\n"
+       "INSERT INTO student VALUES(2, 'Bob');\n"
        "SELECT * FROM student;"}};
   {
     auto response = client.Post("/api/query", query_body.dump(), "application/json");
@@ -131,6 +132,18 @@ bool TestWebApi() {
                  "Query response should contain one result per SQL statement") &&
            ok;
       if (results.is_array() && results.size() == 4) {
+        double previous_duration = 0.0;
+        for (const auto &result : results) {
+          const double duration = result.value("duration_ms", 0.0);
+          ok = Check(duration >= previous_duration,
+                     "Query result durations should be cumulative") &&
+               ok;
+          previous_duration = duration;
+        }
+        ok = Check(results[0]["line"] == 1 && results[1]["line"] == 2 &&
+                       results[2]["line"] == 4 && results[3]["line"] == 5,
+                   "Query response should map each result to its source line") &&
+             ok;
         const auto &rows = results[3]["rows"];
         ok = Check(rows.size() == 2 && rows[0][0]["type"] == "int" &&
                        rows[0][0]["value"] == "1" &&
@@ -138,6 +151,127 @@ bool TestWebApi() {
                        rows[0][1]["value"] == "Alice",
                    "Query response should preserve typed values") &&
              ok;
+      }
+    }
+  }
+
+  {
+    const nlohmann::json trace_body = {
+        {"sql",
+         "CREATE TABLE trace_should_not_exist(id INT);\n"
+         "SELECT * FROM student;"}};
+    auto response = client.Post("/api/trace", trace_body.dump(), "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true,
+               "POST /api/trace should return a successful trace response") &&
+         ok;
+    if (parsed) {
+      const auto &steps = payload["data"]["steps"];
+      ok = Check(steps.is_array() && steps.size() == 4 &&
+                     steps[0]["name"] == "Token" && steps[1]["name"] == "AST" &&
+                     steps[2]["name"] == "语义检查" && steps[3]["name"] == "Plan",
+                 "Trace response should preserve compilation stage order") &&
+           ok;
+      ok = Check(steps[0]["entries"].size() > 0 && steps[1]["entries"].size() == 2 &&
+                     steps[2]["entries"].size() == 2 &&
+                     steps[3]["entries"].size() == 2,
+                 "Trace response should print every compilation stage") &&
+           ok;
+      ok = Check(steps[2]["ok"] == true && steps[3]["ok"] == true,
+                 "Valid trace SQL should pass semantic checks and planning") &&
+           ok;
+    }
+  }
+
+  {
+    const nlohmann::json concurrent_body = {
+        {"sql",
+         {"SELECT * FROM student WHERE id = 1;",
+          "SELECT * FROM student WHERE id = 2;"}}};
+    auto response =
+        client.Post("/api/concurrency/run", concurrent_body.dump(), "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true,
+               "POST /api/concurrency/run should execute independent sessions") &&
+         ok;
+    if (parsed) {
+      const auto &results = payload["data"]["results"];
+      ok = Check(results.is_array() && results.size() == 2 &&
+                     results[0]["ok"] == true && results[1]["ok"] == true,
+                 "Concurrent SQL should return one successful result per session") &&
+           ok;
+      if (results.is_array() && results.size() == 2) {
+        ok = Check(results[0]["results"][0]["rows"].size() == 1 &&
+                       results[0]["results"][0]["rows"][0][0]["value"] == "1" &&
+                       results[1]["results"][0]["rows"].size() == 1 &&
+                       results[1]["results"][0]["rows"][0][0]["value"] == "2",
+                   "Concurrent SQL should preserve per-session query results") &&
+             ok;
+        ok = Check(results[0]["results"][0].contains("duration_ms") &&
+                       results[1]["results"][0].contains("duration_ms"),
+                   "Each concurrent SQL result should include its own duration") &&
+             ok;
+      }
+    }
+  }
+
+  {
+    const nlohmann::json advanced_body = {
+        {"sql",
+         "CREATE TABLE api_users(id INT, name VARCHAR(16));\n"
+         "CREATE TABLE api_scores(user_id INT, score INT);\n"
+         "INSERT INTO api_users(id, name) VALUES(2, 'Bob'), (1, 'Alice');\n"
+         "INSERT INTO api_scores VALUES(1, 80), (3, 95);\n"
+         "SELECT u.id, s.score FROM api_users AS u LEFT JOIN api_scores AS s "
+         "ON u.id = s.user_id;\n"
+         "SELECT id FROM api_users WHERE EXISTS "
+         "(SELECT user_id FROM api_scores WHERE score = 80);\n"
+         "ALTER TABLE api_users RENAME COLUMN name TO display_name;\n"
+         "SELECT id, display_name FROM api_users;\n"
+         "DROP TABLE api_scores;\n"
+         "DROP TABLE api_users;"}};
+    auto response = client.Post("/api/query", advanced_body.dump(), "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true,
+               "Advanced SQL should execute through the Web API") &&
+         ok;
+    if (parsed) {
+      const auto &results = payload["data"]["results"];
+      ok = Check(results.is_array() && results.size() == 10,
+                 "Advanced Web SQL should return one result per statement") &&
+           ok;
+      if (results.is_array() && results.size() == 10) {
+        ok = Check(results[2]["affected_rows"] == 2 &&
+                       results[3]["affected_rows"] == 2,
+                   "Specified-column and multi-row INSERT should affect all rows") &&
+             ok;
+        const auto &joined = results[4]["rows"];
+        bool saw_match = false;
+        bool saw_unmatched = false;
+        for (const auto &row : joined) {
+          saw_match = saw_match ||
+                      (row[0]["value"] == "1" && row[1]["value"] == "80");
+          saw_unmatched = saw_unmatched ||
+                          (row[0]["value"] == "2" && row[1]["type"] == "null");
+        }
+        ok = Check(joined.size() == 2 && saw_match && saw_unmatched,
+                   "LEFT JOIN should preserve matched and unmatched left rows") &&
+             ok;
+        ok = Check(results[5]["rows"].size() == 2,
+                   "EXISTS subquery should execute through the Web API") &&
+             ok;
+        const auto &altered = results[7]["rows"];
+        bool saw_alice = false;
+        bool saw_bob = false;
+        for (const auto &row : altered) {
+          saw_alice = saw_alice || row[1]["value"] == "Alice";
+          saw_bob = saw_bob || row[1]["value"] == "Bob";
+        }
+        ok = Check(altered.size() == 2 && saw_alice && saw_bob,
+                   "ALTER RENAME COLUMN should preserve existing data") && ok;
       }
     }
   }

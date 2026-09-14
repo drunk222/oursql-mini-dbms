@@ -193,8 +193,8 @@ class ParserImpl {
     return Result<std::string>(std::move(token.value().lexeme));
   }
 
-  // INSERT 值只允许整数或字符串字面量；布尔值、列引用和表达式不属于当前
-  // INSERT 语法。整数使用 from_chars 检查完整消费和 int64 溢出。
+  // INSERT 值只允许整数、单引号字符串或 NULL；布尔值、列引用和表达式不
+  // 属于当前 INSERT 语法。整数使用 from_chars 检查完整消费和 int64 溢出。
   Result<Value> ParseLiteral() {
     if (Match(TokenType::Null)) return Result<Value>(Value());
     if (Match(TokenType::String)) return Result<Value>(Value(Previous().lexeme));
@@ -629,8 +629,9 @@ class ParserImpl {
   };
 
   Result<ParsedWhere> ParseWhere() {
-    // 先保留完整表达式并执行常量折叠，再尝试抽取数据库层可执行的简单等值
-    // Predicate。即使无法抽取，compile_where 仍会留给 Planner 做语义检查。
+    // 先保留完整表达式并执行常量折叠，再尝试抽取数据库层简单 Predicate。
+    // 即使无法抽取，compile_where 仍会保留完整树，供 Planner 做列/类型检查；
+    // SELECT 复杂表达式可直接执行，DELETE/UPDATE 当前仍要求存在简单 Predicate。
     auto expression = ParseCompileExpr();
     if (!expression.ok()) return Result<ParsedWhere>(expression.status());
     auto folded = FoldCompileExpr(expression.value());
@@ -801,8 +802,9 @@ class ParserImpl {
     // 语法：
     //   INSERT INTO name [(column [, ...])]
     //   VALUES (literal [, ...]) [, (...)]...;
-    // Parser 只负责收集目标列和多行字面量，列数、类型和 VARCHAR 长度由
-    // Planner 校验。空目标列和空 VALUES 行都由 Expect 报语法错误。
+    // Parser 只负责收集目标列和多行字面量，列数、类型、NULL、长度和默认值
+    // 由 Planner 规范化。空目标列和空 VALUES 行都由 Expect 报语法错误；
+    // 指定列和多行的可执行性由执行层显式决定，不能在 Parser 中丢弃后续行。
     auto insert = Expect(TokenType::Insert, "INSERT");
     if (!insert.ok()) return Result<Statement>(insert.status());
     auto into = Expect(TokenType::Into, "INTO");
@@ -1022,8 +1024,9 @@ class ParserImpl {
   }
 
   Result<Statement> ParseDelete() {
-    // 当前 DELETE 只支持单表以及可选 WHERE；复杂 WHERE 会通过 compile_where
-    // 进入语义检查，但执行层级尚未接入。
+    // 当前 DELETE 只支持单表以及可选 WHERE。复杂 WHERE 会通过 compile_where
+    // 进入语义检查，但 DeleteExecutor 只消费简单 Predicate，因此无法降级的
+    // 条件会在 Planner 阶段明确返回 NotImplemented。
     auto delete_keyword = Expect(TokenType::Delete, "DELETE");
     if (!delete_keyword.ok()) return Result<Statement>(delete_keyword.status());
     auto from = Expect(TokenType::From, "FROM");
@@ -1047,7 +1050,8 @@ class ParserImpl {
 
   Result<Statement> ParseUpdate() {
     // 语法：UPDATE table SET col = expr [, ...] [WHERE expr]。
-    // 每个赋值都在解析后立即折叠常量，并保留可选的简单 Value。
+    // 每个赋值都在解析后立即折叠常量，并保留可选的简单 Value；执行器可以
+    // 直接使用 Value，也可以对 CompileExpr 做逐行求值。
     auto update = Expect(TokenType::Update, "UPDATE");
     if (!update.ok()) return Result<Statement>(update.status());
     auto table_name = ExpectIdentifier("UPDATE 后的表名");

@@ -1084,7 +1084,8 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                 "SELECT 投影表达式数量与投影列数量不一致"));
           }
           if (value.compile_where != nullptr) {
-            // 先完成表达式列和类型检查，再判断执行层是否支持该形态。
+            // SELECT 的复杂表达式已经接入执行；这里先完成限定符、列和类型
+            // 检查。子查询等尚无执行算子的节点会在后续构建阶段明确拒绝。
             auto qualifier_status = CheckSingleTableQualifiers(
                 value.compile_where, value.table_name, value.table_alias,
                 "WHERE");
@@ -1138,7 +1139,7 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
             }
           }
           for (const auto &column_name : value.group_by) {
-            // GROUP BY 先检查列存在，执行能力由 ExecutionEngine 明确拒绝。
+            // GROUP BY 只允许列名键；执行器按这些列构造分组边界。
             if (!table.value()->schema.FindColumn(column_name).ok()) {
               return fail_at(
                   Status::NotFound("GROUP BY 列不存在: " + column_name));
@@ -1189,7 +1190,9 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
             }
           }
           // 从叶子向根构造：SeqScan -> Filter? -> GroupBy? -> OrderBy?
-          // -> Project。根 Project 永不省略，Executor 依赖它获得输出列。
+          // -> Project。根 Project 永不省略，Executor 依赖它获得输出列；
+          // 随后的 Optimizer 可以在保持该形态的前提下把 SeqScan 改成
+          // IndexScan，或在安全时裁剪冗余内层 Project。
           std::shared_ptr<const PlanNode> root = std::make_shared<PlanNode>(SeqScanPlan{value.table_name});
           if (value.compile_where != nullptr) {
             root = std::make_shared<PlanNode>(FilterPlan{
@@ -1227,8 +1230,8 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           root = std::make_shared<PlanNode>(
               ProjectPlan{root, value.projection, value.select_all,
                           std::move(projection_indexes)});
-          // DISTINCT、LIMIT 和 AS 别名都属于 SELECT 根计划元数据，
-          // 由执行器在投影或聚合完成后应用。
+          // DISTINCT、LIMIT 和 AS 别名属于 SELECT 根计划元数据；DISTINCT
+          // 和 LIMIT 由执行器在投影或聚合完成后应用，别名用于稳定输出列名。
           return Result<Plan>(SelectPlan{
               value.table_name, std::move(root), value.distinct, value.limit,
               value.projection_aliases, value.table_alias,
@@ -1259,7 +1262,8 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           }
           return Result<Plan>(DeletePlan{value.table_name, value.where});
         } else if constexpr (std::is_same_v<Type, DropTableStatement>) {
-          // DROP 只验证目标表存在并生成计划，不在 Planner 中修改 Catalog。
+          // DROP 只验证目标表存在并生成计划，不在 Planner 中修改 Catalog；
+          // 执行器随后按索引 -> 数据页 -> Catalog 记录的顺序完成删除。
           auto table = RequireTable(catalog, value.table_name);
           if (!table.ok()) return fail_at(table.status());
           return Result<Plan>(DropTablePlan{value.table_name});
@@ -1405,7 +1409,8 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
                 CheckPredicate(*value.where, table.value()->schema);
             if (!predicate_status.ok()) return fail_at(predicate_status);
           }
-          // 生成结构化 UpdatePlan，执行层直接消费赋值表达式。
+          // 生成结构化 UpdatePlan。执行器按简单 Predicate 选行，逐行计算
+          // SET 表达式，并同步维护 Heap 和该表上的索引。
           return Result<Plan>(
               UpdatePlan{value.table_name, value.assignments, value.where});
         }

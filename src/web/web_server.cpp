@@ -163,6 +163,10 @@ void WebServer::RegisterRoutes() {
                [this](const httplib::Request &request, httplib::Response &response) {
                  HandleQuery(request, response);
                });
+  server_.Post("/api/trace",
+               [this](const httplib::Request &request, httplib::Response &response) {
+                 HandleTrace(request, response);
+               });
   server_.Get("/api/tables",
               [this](const httplib::Request &request, httplib::Response &response) {
                 HandleTables(request, response);
@@ -182,6 +186,10 @@ void WebServer::RegisterRoutes() {
   server_.Post("/api/concurrency/demo",
                [this](const httplib::Request &request, httplib::Response &response) {
                  HandleConcurrencyDemo(request, response);
+               });
+  server_.Post("/api/concurrency/run",
+               [this](const httplib::Request &request, httplib::Response &response) {
+                 HandleConcurrencyRun(request, response);
                });
 
   server_.set_error_handler([](const httplib::Request &request, httplib::Response &response) {
@@ -209,6 +217,21 @@ void WebServer::HandleQuery(const httplib::Request &request, httplib::Response &
   auto results = nlohmann::json::array();
   for (const auto &item : result.value()) results.push_back(ExecutionResultToJson(item));
   SendJson(response, SuccessPayload({{"results", std::move(results)}}));
+}
+
+void WebServer::HandleTrace(const httplib::Request &request, httplib::Response &response) {
+  auto body = nlohmann::json::parse(request.body, nullptr, false);
+  if (body.is_discarded() || !body.is_object() || !body.contains("sql") ||
+      !body["sql"].is_string()) {
+    SendStatus(response, Status::InvalidArgument("Request body must contain string field 'sql'"));
+    return;
+  }
+  auto result = query_service_->TraceSql(body["sql"].get<std::string>());
+  if (!result.ok()) {
+    SendStatus(response, result.status());
+    return;
+  }
+  SendJson(response, SuccessPayload(SqlTraceToJson(result.value())));
 }
 
 void WebServer::HandleTables(const httplib::Request &, httplib::Response &response) {
@@ -273,6 +296,37 @@ void WebServer::HandleFlush(const httplib::Request &, httplib::Response &respons
     return;
   }
   SendJson(response, SuccessPayload({{"message", "Flushed"}}));
+}
+
+void WebServer::HandleConcurrencyRun(const httplib::Request &request,
+                                     httplib::Response &response) {
+  auto body = nlohmann::json::parse(request.body, nullptr, false);
+  if (body.is_discarded() || !body.is_object() || !body.contains("sql") ||
+      !body["sql"].is_array()) {
+    SendStatus(response,
+               Status::InvalidArgument("Request body must contain array field 'sql'"));
+    return;
+  }
+  std::vector<std::string> statements;
+  statements.reserve(body["sql"].size());
+  for (const auto &item : body["sql"]) {
+    if (!item.is_string()) {
+      SendStatus(response, Status::InvalidArgument("Every concurrent SQL item must be a string"));
+      return;
+    }
+    statements.push_back(item.get<std::string>());
+  }
+
+  auto result = query_service_->ExecuteConcurrentSql(statements);
+  if (!result.ok()) {
+    SendStatus(response, result.status());
+    return;
+  }
+  auto payload = nlohmann::json::array();
+  for (const auto &item : result.value()) {
+    payload.push_back(ConcurrentSqlResultToJson(item));
+  }
+  SendJson(response, SuccessPayload({{"results", std::move(payload)}}));
 }
 
 void WebServer::HandleConcurrencyDemo(const httplib::Request &,

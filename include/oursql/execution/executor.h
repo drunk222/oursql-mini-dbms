@@ -19,6 +19,9 @@ struct ExecutionResult {
   std::vector<Row> rows;
   std::vector<RID> rids;
   std::uint64_t affected_rows{0};
+  std::size_t source_line{1};
+  // 从整批 SQL 开始编译起，累计到该条结果完成的毫秒数。
+  double execution_time_ms{0.0};
 };
 
 class RowSource {

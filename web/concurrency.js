@@ -1,6 +1,8 @@
 "use strict";
 
 const elements = {};
+const sessions = [];
+let busy = false;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -9,17 +11,19 @@ function element(tag, className, text) {
   return node;
 }
 
-function setBusy(busy) {
-  elements.runDemoButton.disabled = busy;
-  document.body.setAttribute("aria-busy", busy ? "true" : "false");
+function setBusy(nextBusy) {
+  busy = nextBusy;
+  elements.runConcurrentButton.disabled = nextBusy;
+  elements.sessionCount.disabled = nextBusy;
+  document.body.setAttribute("aria-busy", nextBusy ? "true" : "false");
 }
 
 function setMessage(text, kind = "") {
-  elements.demoMessage.replaceChildren();
+  elements.concurrencyMessage.replaceChildren();
   if (!text) return;
   const message = element("div", "message", text);
   if (kind) message.dataset.kind = kind;
-  elements.demoMessage.append(message);
+  elements.concurrencyMessage.append(message);
 }
 
 async function request(path, options = {}) {
@@ -36,128 +40,217 @@ async function request(path, options = {}) {
   return payload.data;
 }
 
-function renderSummary(data) {
-  elements.demoSummary.replaceChildren();
-  const scenarios = data.scenarios || [];
-  const passed = scenarios.filter((scenario) => scenario.passed).length;
-  const duration = scenarios.reduce(
-    (total, scenario) => total + Number(scenario.duration_ms || 0),
-    0
-  );
-
-  const passedItem = element("div", "summary-stat");
-  passedItem.append(
-    element("span", "summary-value", `${passed}/${scenarios.length}`),
-    element("span", "summary-label", "场景通过")
-  );
-  const durationItem = element("div", "summary-stat");
-  durationItem.append(
-    element("span", "summary-value", `${duration} ms`),
-    element("span", "summary-label", "总耗时")
-  );
-  elements.demoSummary.append(passedItem, durationItem);
+function syncSqlFromDom() {
+  const editors = elements.sessionGrid.querySelectorAll(".concurrent-sql-editor");
+  editors.forEach((editor, index) => {
+    if (sessions[index]) sessions[index].sql = editor.value;
+  });
 }
 
-function renderMetrics(metrics) {
-  const list = element("dl", "demo-metrics");
-  for (const metric of metrics || []) {
-    list.append(
-      element("dt", "", metric.label),
-      element("dd", "", metric.value)
-    );
+function renderCell(value) {
+  const cell = document.createElement("td");
+  if (value.type === "null") {
+    cell.textContent = "NULL";
+    cell.classList.add("null-cell");
+  } else {
+    cell.textContent = String(value.value ?? "");
   }
-  return list;
+  cell.title = cell.textContent;
+  return cell;
 }
 
-function renderTimeline(events) {
-  const scroll = element("div", "timeline-scroll");
-  const table = element("table", "timeline-table");
-  const head = document.createElement("thead");
+function renderExecutionResult(result) {
+  const duration = `${Number(result.duration_ms || 0).toFixed(1)} ms`;
+  if (!result.columns || result.columns.length === 0) {
+    const line = element("div", "execution-line");
+    const time = element("span", "concurrent-result-time", duration);
+    time.title = "从脚本开始执行到该条语句完成";
+    line.append(
+      element("span", "", "执行成功"),
+      time
+    );
+    return line;
+  }
+
+  const block = element("section", "result-block");
+  const header = element("div", "result-block-header");
+  const time = element("span", "concurrent-result-time", duration);
+  time.title = "从脚本开始执行到该条语句完成";
+  header.append(
+    element("span", "", `${result.columns.length} 列`),
+    element("span", "", `${result.rows?.length || 0} 行`),
+    time
+  );
+  block.append(header);
+
+  const scroll = element("div", "table-scroll");
+  const table = element("table", "data-table");
+  const thead = document.createElement("thead");
   const headRow = document.createElement("tr");
-  for (const label of ["时间", "会话", "动作", "详情", "状态"]) {
-    headRow.append(element("th", "", label));
-  }
-  head.append(headRow);
+  for (const column of result.columns) headRow.append(element("th", "", column));
+  thead.append(headRow);
+  table.append(thead);
 
-  const body = document.createElement("tbody");
-  for (const event of events || []) {
-    const row = document.createElement("tr");
-    row.append(
-      element("td", "timeline-time", `${Number(event.offset_ms || 0).toFixed(1)} ms`),
-      element("td", "", event.session || "-"),
-      element("td", "timeline-action", event.action || "-"),
-      element("td", "", event.detail || "-")
-    );
-    const statusCell = document.createElement("td");
-    const status = element(
-      "span",
-      `event-status event-status--${event.status || "info"}`,
-      event.status || "info"
-    );
-    statusCell.append(status);
-    row.append(statusCell);
-    body.append(row);
+  const tbody = document.createElement("tbody");
+  for (const row of result.rows || []) {
+    const tableRow = document.createElement("tr");
+    for (const value of row) tableRow.append(renderCell(value));
+    tbody.append(tableRow);
   }
-  table.append(head, body);
+  table.append(tbody);
   scroll.append(table);
-  return scroll;
-}
-
-function renderScenario(scenario) {
-  const section = element("section", "scenario");
-  const header = element("div", "scenario-header");
-  const title = element("div");
-  title.append(
-    element("h2", "", scenario.title),
-    element("p", "scenario-purpose", scenario.purpose)
-  );
-  const status = element(
-    "span",
-    `status-pill ${scenario.passed ? "status-pill--success" : "status-pill--error"}`,
-    scenario.passed ? "通过" : "失败"
-  );
-  const duration = element("span", "scenario-duration", `${scenario.duration_ms} ms`);
-  header.append(title, status, duration);
-  section.append(header);
-
-  if (scenario.error) {
-    section.append(element("div", "message", scenario.error));
+  block.append(scroll);
+  if (!result.rows?.length) {
+    block.append(element("div", "empty-state", "查询成功，没有返回数据"));
   }
-  section.append(renderMetrics(scenario.metrics), renderTimeline(scenario.timeline));
-  return section;
+  return block;
 }
 
-async function runDemo() {
+function renderSession(session, index) {
+  const panel = element("article", "concurrent-session");
+  panel.dataset.session = String(index + 1);
+
+  const header = element("div", "concurrent-session-header");
+  const status = element("span", "concurrent-session-status", "等待运行");
+  status.dataset.state = "idle";
+  header.append(
+    element("h2", "", `会话 ${index + 1}`),
+    status
+  );
+
+  const editor = element("textarea", "concurrent-sql-editor");
+  editor.value = session.sql;
+  editor.placeholder = `SQL ${index + 1}`;
+  editor.spellcheck = false;
+  editor.setAttribute("aria-label", `会话 ${index + 1} SQL`);
+
+  const results = element("div", "concurrent-session-results");
+  results.setAttribute("aria-live", "polite");
+
+  panel.append(header, editor, results);
+  session.nodes = { panel, status, results };
+  return panel;
+}
+
+function renderSessions() {
+  syncSqlFromDom();
+  const count = Number(elements.sessionCount.value);
+  while (sessions.length < count) sessions.push({ sql: "", nodes: null });
+  sessions.length = count;
+
+  const fragment = document.createDocumentFragment();
+  sessions.forEach((session, index) => {
+    session.nodes = null;
+    fragment.append(renderSession(session, index));
+  });
+  elements.sessionGrid.replaceChildren(fragment);
+  elements.sessionGrid.style.setProperty("--session-count", String(count));
+  if (window.lucide) window.lucide.createIcons();
+}
+
+function renderOutcome(index, outcome) {
+  const session = sessions[index];
+  if (!session?.nodes) return;
+  const { status, results } = session.nodes;
+  const succeeded = Boolean(outcome.ok);
+  status.textContent = succeeded ? "完成" : "失败";
+  status.dataset.state = succeeded ? "success" : "error";
+  results.replaceChildren();
+
+  if (!succeeded) {
+    const message = element(
+      "div",
+      "message",
+      outcome.error?.message || "执行失败"
+    );
+    message.dataset.kind = "error";
+    const errorRow = element("div", "concurrent-result-error");
+    errorRow.append(
+      message,
+      element(
+        "span",
+        "concurrent-result-time",
+        `${Number(outcome.duration_ms || 0).toFixed(1)} ms`
+      )
+    );
+    results.append(errorRow);
+    return;
+  }
+
+  const executionResults = outcome.results || [];
+  if (!executionResults.length) {
+    const line = element("div", "execution-line");
+    line.append(
+      element("span", "", "执行成功"),
+      element(
+        "span",
+        "concurrent-result-time",
+        `${Number(outcome.duration_ms || 0).toFixed(1)} ms`
+      )
+    );
+    results.append(line);
+    return;
+  }
+  for (const result of executionResults) {
+    results.append(renderExecutionResult(result));
+  }
+}
+
+async function runConcurrent() {
+  if (busy) return;
+  syncSqlFromDom();
   setBusy(true);
-  setMessage("正在运行并发场景");
-  elements.scenarioList.replaceChildren();
+  setMessage("正在并发执行");
+  sessions.forEach((session) => {
+    if (!session.nodes) return;
+    session.nodes.status.textContent = "运行中";
+    session.nodes.status.dataset.state = "running";
+    session.nodes.results.replaceChildren();
+  });
 
   try {
-    const data = await request("/api/concurrency/demo", { method: "POST" });
-    renderSummary(data);
-    for (const scenario of data.scenarios || []) {
-      elements.scenarioList.append(renderScenario(scenario));
+    const data = await request("/api/concurrency/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql: sessions.map((session) => session.sql) }),
+    });
+    const outcomes = data.results || [];
+    for (let index = 0; index < sessions.length; ++index) {
+      renderOutcome(
+        index,
+        outcomes[index] || {
+          ok: false,
+          duration_ms: 0,
+          error: { message: "服务器未返回该会话结果" },
+        }
+      );
     }
+    const failed = outcomes.filter((outcome) => !outcome.ok).length;
     setMessage(
-      data.passed ? "全部并发场景已完成" : "部分并发场景未通过",
-      data.passed ? "success" : "error"
+      failed ? `${failed} 个会话执行失败` : "所有会话执行完成",
+      failed ? "error" : "success"
     );
   } catch (error) {
-    elements.demoSummary.replaceChildren(element("span", "muted", "运行失败"));
     setMessage(error.message, "error");
+    sessions.forEach((session) => {
+      if (!session.nodes) return;
+      session.nodes.status.textContent = "失败";
+      session.nodes.status.dataset.state = "error";
+    });
   } finally {
     setBusy(false);
   }
 }
 
 function init() {
-  elements.runDemoButton = document.getElementById("runDemoButton");
-  elements.demoSummary = document.getElementById("demoSummary");
-  elements.demoMessage = document.getElementById("demoMessage");
-  elements.scenarioList = document.getElementById("scenarioList");
-  elements.runDemoButton.addEventListener("click", runDemo);
+  elements.concurrencyMessage = document.getElementById("concurrencyMessage");
+  elements.sessionGrid = document.getElementById("sessionGrid");
+  elements.sessionCount = document.getElementById("sessionCount");
+  elements.runConcurrentButton = document.getElementById("runConcurrentButton");
+  elements.sessionCount.addEventListener("change", renderSessions);
+  elements.runConcurrentButton.addEventListener("click", runConcurrent);
+  renderSessions();
   if (window.lucide) window.lucide.createIcons();
-  runDemo();
 }
 
 document.addEventListener("DOMContentLoaded", init);

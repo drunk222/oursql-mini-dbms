@@ -253,7 +253,8 @@ Result<std::vector<Token>> Lexer::Tokenize(std::string_view sql) const {
         (character == '-' && offset + 1 < sql.size() &&
          std::isdigit(static_cast<unsigned char>(sql[offset + 1])))) {
       // 负数与数字合并成一个 Integer Token；例如 -12 的 lexeme 为 "-12"。
-      // 当前数据类型只有 INT，不把小数点视为合法数字组成部分。
+      // 项目当前数值类型只有 INT，不把小数点视为合法数字组成部分；遇到
+      // 1.2.3 一类输入会在这里整体收集并报告非法数字格式。
       std::string number;
       if (character == '-') {
         number.push_back(character);

@@ -43,9 +43,10 @@ struct Predicate {
       : kind(predicate_kind), column(std::move(column_name)) {}
 };
 
-// 编译层表达式树：用于解析、语义类型推导、常量折叠和诊断打印。
-// 支持普通二元/一元表达式，以及 BETWEEN、IN 和 LIKE 谓词。
-// 这些节点不会进入 Catalog、BufferPool 或 Executor；是否可执行由 Planner 决定。
+// 编译层表达式树：用于解析、语义类型推导、常量折叠和诊断打印。简单等值
+// 条件会额外抽取为 Predicate；复杂条件保留在 FilterPlan/UPDATE 中，并由
+// 执行层表达式求值器逐行消费。子查询节点虽然能完成语义检查，但当前没有
+// 执行算子，会在生成可执行计划前明确返回 NotImplemented。
 enum class CompileLiteralKind { Int, String, Bool, Null };
 
 struct CompileExpr;
@@ -146,8 +147,9 @@ struct OrderKey {
   OrderDirection direction{OrderDirection::Asc};
 };
 
-// 单个 JOIN 子句的等值连接条件。left_* 表示当前 ON 条件左侧，
-// right_* 表示右侧；两侧在语义分析阶段都允许引用此前的表或本子句新表。
+// 单个 JOIN 子句的等值连接条件。left_* 和 right_* 只保存列名，不保存
+// SQL 字符串；Planner 会解析别名、检查歧义，并保证 ON 两侧分别来自当前
+// 累积输入和新加入的表。
 struct JoinCondition {
   std::string left_table;
   std::string left_column;
@@ -173,8 +175,9 @@ struct CreateTableStatement {
 };
 
 // INSERT 支持可选的显式目标列和一组 VALUES 行。
-// columns 为空表示按表定义顺序写入所有列；rows 至少包含一行，每行只保存
-// 字面量，不支持 SELECT 子查询或表达式。
+// columns 为空表示按表定义顺序对应全列；rows 至少包含一行，每行只保存
+// 字面量，不支持 SELECT 子查询或表达式。Parser 会完整保留这些信息，但
+// 当前执行器只接入单行全列写入，指定列或多行形式会明确拒绝执行。
 struct InsertStatement {
   std::string table_name;
   std::vector<std::string> columns;
@@ -182,9 +185,10 @@ struct InsertStatement {
   Position location;
 };
 
-// SELECT 的 where 与 compile_where 分别服务于简单执行路径和完整语义检查：
+// SELECT 的 where 与 compile_where 分别服务于简单谓词路径和完整表达式执行：
 // - where：表达式可降级为“列 = 常量”时存在；
-// - compile_where：所有 WHERE 都保留完整表达式，供类型推导和诊断使用。
+// - compile_where：所有 WHERE 都保留完整表达式，供类型推导、诊断和执行期
+//   逐行求值；子查询表达式是当前未接入执行的例外。
 // select_all 为 true 时 projection 应为空；二者由 Parser/Planner 保持一致。
 // distinct 表示 SELECT DISTINCT；limit 存在时表示最多输出的行数。
 // table_alias 保存 FROM ... AS alias；projection_aliases 与 projection 等长。
@@ -245,14 +249,16 @@ struct DeleteStatement {
 };
 
 // UPDATE 右值同时保留 CompileExpr 和可选的简单 Value：
-// 复杂表达式用于语义分析，字面量形式可用于未来执行器直接消费。
+// CompileExpr 用于语义推导和执行期表达式求值，字面量形式让简单赋值无需
+// 再次解释完整表达式树。
 struct UpdateAssignment {
   std::string column;
   CompileExprPtr expression;
   std::optional<Value> value;
 };
 
-// UPDATE 语句的完整编译层表示；执行器尚未实现 UpdatePlan。
+// UPDATE 语句的完整编译层表示。Planner 会把它转换为 UpdatePlan，执行器
+// 按简单 WHERE 选行、计算 SET 表达式并同步维护 Heap 与索引。
 struct UpdateStatement {
   std::string table_name;
   std::vector<UpdateAssignment> assignments;

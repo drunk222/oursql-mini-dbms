@@ -2,6 +2,7 @@
 
 #include "oursql/common/status.h"
 #include "oursql/execution/database_engine.h"
+#include "oursql/service/query_service.h"
 
 #include <nlohmann/json.hpp>
 
@@ -22,5 +23,8 @@ namespace oursql {
 [[nodiscard]] nlohmann::json TableMetadataToJson(const TableMetadata &table);
 [[nodiscard]] nlohmann::json StatisticsToJson(const DatabaseStatistics &statistics);
 [[nodiscard]] nlohmann::json FrameSnapshotToJson(const FrameSnapshot &snapshot);
+[[nodiscard]] nlohmann::json SqlTraceToJson(const SqlTrace &trace);
+[[nodiscard]] nlohmann::json ConcurrentSqlResultToJson(
+    const ConcurrentSqlResult &result);
 
 }  // namespace oursql

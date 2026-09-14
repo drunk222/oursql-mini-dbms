@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_package(Threads REQUIRED)
+
 # MSVC 在中文 Windows 上默认用 GBK(代码页 936) 读源码，会导致 UTF-8 源文件中的
 # 中文注释/字符串被误解析。该配置必须放在所有 target 之前。
 if(MSVC)
@@ -49,6 +51,45 @@ if (MINGW)
   target_link_options(oursql PRIVATE -municode)
 endif()
 
+add_library(oursql_vendor INTERFACE)
+target_include_directories(oursql_vendor INTERFACE
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib
+)
+
+add_library(oursql_web_lib
+  src/service/query_service.cpp
+  src/web/concurrency_demo.cpp
+  src/web/json_codec.cpp
+  src/web/web_server.cpp
+)
+target_include_directories(oursql_web_lib
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_definitions(oursql_web_lib
+  PUBLIC
+    OURSQL_DEFAULT_WEB_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/web"
+)
+target_link_libraries(oursql_web_lib
+  PUBLIC
+    oursql_core
+    oursql_vendor
+  PRIVATE
+    Threads::Threads
+)
+if (WIN32)
+  target_link_libraries(oursql_web_lib PRIVATE ws2_32)
+endif()
+
+add_executable(oursql_web src/web/main.cpp)
+target_link_libraries(oursql_web PRIVATE oursql_web_lib)
+add_custom_command(TARGET oursql_web POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CMAKE_CURRENT_SOURCE_DIR}/web"
+          "$<TARGET_FILE_DIR:oursql_web>/web"
+)
+
 add_executable(oursql_tests tests/oursql_tests.cpp)
 target_link_libraries(oursql_tests PRIVATE oursql_core)
 
@@ -85,6 +126,9 @@ target_link_libraries(oursql_transaction_tests PRIVATE oursql_core)
 add_executable(oursql_concurrent_transaction_tests tests/concurrent_transaction_tests.cpp)
 target_link_libraries(oursql_concurrent_transaction_tests PRIVATE oursql_core)
 
+add_executable(oursql_web_tests tests/web_api_tests.cpp)
+target_link_libraries(oursql_web_tests PRIVATE oursql_web_lib)
+
 add_executable(oursql_benchmark benchmarks/storage_benchmark.cpp)
 target_link_libraries(oursql_benchmark PRIVATE oursql_core)
 
@@ -104,3 +148,4 @@ add_test(NAME oursql_edge_case_tests COMMAND oursql_edge_case_tests)
 add_test(NAME oursql_b_plus_tree_tests COMMAND oursql_b_plus_tree_tests)
 add_test(NAME oursql_transaction_tests COMMAND oursql_transaction_tests)
 add_test(NAME oursql_concurrent_transaction_tests COMMAND oursql_concurrent_transaction_tests)
+add_test(NAME oursql_web_tests COMMAND oursql_web_tests)

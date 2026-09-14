@@ -298,6 +298,10 @@ function renderCell(value) {
 }
 
 function renderResult(result) {
+  if (!result.columns || result.columns.length === 0) {
+    return element("div", "execution-line", "执行成功");
+  }
+
   const block = element("section", "result-block");
   const header = element("div", "result-block-header");
   const rowCount = result.rows ? result.rows.length : 0;
@@ -329,8 +333,6 @@ function renderResult(result) {
     if (rowCount === 0) {
       block.append(element("div", "empty-state", "查询成功，没有返回数据"));
     }
-  } else {
-    block.append(element("div", "empty-state", "执行成功"));
   }
 
   return block;

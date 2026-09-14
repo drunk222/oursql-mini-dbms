@@ -503,6 +503,12 @@ h1 {
   min-width: 0;
 }
 
+.execution-line {
+  padding: 3px 2px;
+  color: var(--success);
+  font-weight: 600;
+}
+
 .result-block-header {
   display: flex;
   align-items: center;

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>OurSQL Web</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <i data-lucide="database" aria-hidden="true"></i>
+      <span>OurSQL</span>
+    </div>
+    <div class="topbar-actions">
+      <div id="connectionStatus" class="connection-status" data-state="checking">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="connectionText">连接中</span>
+      </div>
+      <a class="button button-secondary" href="/concurrency.html">
+        <i data-lucide="activity" aria-hidden="true"></i>
+        <span>并发演示</span>
+      </a>
+      <button id="refreshButton" class="button button-secondary" type="button">
+        <i data-lucide="refresh-cw" aria-hidden="true"></i>
+        <span>刷新</span>
+      </button>
+      <button id="flushButton" class="button button-secondary" type="button">
+        <i data-lucide="hard-drive-download" aria-hidden="true"></i>
+        <span>刷盘</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="sidebar">
+      <section class="sidebar-section navigator-section">
+        <div class="section-title">
+          <i data-lucide="folder-tree" aria-hidden="true"></i>
+          <h2>数据库导航</h2>
+        </div>
+        <label class="navigator-filter">
+          <i data-lucide="search" aria-hidden="true"></i>
+          <input id="navigatorFilter" type="search" placeholder="筛选表"
+                 autocomplete="off" aria-label="筛选表">
+        </label>
+        <div id="databaseTree" class="database-tree" role="tree"
+             aria-label="数据库对象"></div>
+      </section>
+
+      <details class="stats-panel" open>
+        <summary>
+          <span class="section-title">
+            <i data-lucide="activity" aria-hidden="true"></i>
+            <span>运行统计</span>
+          </span>
+        </summary>
+        <dl id="statsPanel" class="stats-grid">
+          <dt>Buffer 命中</dt><dd id="statHits">-</dd>
+          <dt>Buffer 未命中</dt><dd id="statMisses">-</dd>
+          <dt>命中率</dt><dd id="statHitRate">-</dd>
+          <dt>淘汰次数</dt><dd id="statEvictions">-</dd>
+          <dt>磁盘读取</dt><dd id="statReads">-</dd>
+          <dt>磁盘写入</dt><dd id="statWrites">-</dd>
+        </dl>
+      </details>
+    </aside>
+    <div id="sidebarResizer" class="sidebar-resizer"
+         role="separator" aria-orientation="vertical"
+         aria-label="调整数据库导航宽度"
+         aria-valuemin="220" aria-valuemax="520" aria-valuenow="270"
+         tabindex="0" title="拖动调整侧栏宽度，双击恢复默认"></div>
+
+    <section class="work-area">
+      <div class="work-header">
+        <div>
+          <p class="eyebrow">SQL 工作台</p>
+          <h1>查询与结果</h1>
+        </div>
+        <div id="queryMeta" class="query-meta">就绪</div>
+      </div>
+
+      <section class="editor-section" aria-label="SQL 编辑器">
+        <div class="editor-shell">
+          <div id="lineNumbers" class="line-numbers" aria-hidden="true">1</div>
+          <textarea id="sqlEditor" class="sql-editor" spellcheck="false" wrap="off"
+                    placeholder="CREATE TABLE student(id INT, name VARCHAR);"></textarea>
+        </div>
+        <div class="editor-actions">
+          <button id="runButton" class="button button-primary" type="button">
+            <i data-lucide="play" aria-hidden="true"></i>
+            <span>运行</span>
+          </button>
+          <button id="clearButton" class="button button-secondary" type="button">
+            <i data-lucide="eraser" aria-hidden="true"></i>
+            <span>清空</span>
+          </button>
+          <button id="loadSampleButton" class="button button-secondary" type="button">
+            <i data-lucide="file-code-2" aria-hidden="true"></i>
+            <span>载入测试 SQL</span>
+          </button>
+          <span class="shortcut-hint">Ctrl + Enter</span>
+        </div>
+      </section>
+
+      <section class="result-section" aria-label="查询结果">
+        <div class="section-heading">
+          <h2>结果</h2>
+          <span id="resultSummary" class="muted">等待查询</span>
+        </div>
+        <div id="messageArea" class="message-area" role="status" aria-live="polite"></div>
+        <div id="resultsArea" class="results-area"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/assets/lucide/lucide.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

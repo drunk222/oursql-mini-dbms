@@ -4,6 +4,7 @@
 #include "oursql/transaction/transaction.h"
 
 #include <map>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,6 +52,10 @@ class Catalog final : public CatalogView {
   // 调用者：数据库打开流程；作用：绑定持久化所需的缓冲池和磁盘管理器；返回：未打开的 Catalog 对象。
   Catalog(BufferPoolManager *buffer_pool, DiskManager *disk_manager) noexcept
       : buffer_pool_(buffer_pool), disk_manager_(disk_manager) {}
+  Catalog(const Catalog &other);
+  Catalog &operator=(const Catalog &other);
+  Catalog(Catalog &&other) noexcept;
+  Catalog &operator=(Catalog &&other) noexcept;
 
   // 调用者：数据库打开流程；作用：加载或创建 Catalog Slotted Page 链；返回：操作状态。
   [[nodiscard]] Status Open();
@@ -88,9 +93,14 @@ class Catalog final : public CatalogView {
 
   // 调用者：HeapTable；作用：获取一张表的持久化元数据；返回：只读表元数据指针或错误。
   [[nodiscard]] Result<const TableMetadata *> GetTableMetadata(std::string_view table_name) const;
+  // 并发执行路径使用副本，避免 Schema 锁释放前后保存 Catalog 内部指针。
+  [[nodiscard]] Result<TableMetadata> GetTableMetadataCopy(
+      std::string_view table_name) const;
 
   // 调用者：执行器或管理代码；作用：按索引名获取元数据；返回：只读索引定义或错误。
   [[nodiscard]] Result<const IndexMetadata *> FindIndex(std::string_view index_name) const;
+  [[nodiscard]] Result<IndexMetadata> FindIndexCopy(
+      std::string_view index_name) const;
 
   // 调用者：测试或管理代码；作用：判断索引是否存在；返回：是否已登记。
   [[nodiscard]] bool HasIndex(std::string_view index_name) const;
@@ -115,6 +125,9 @@ class Catalog final : public CatalogView {
   DiskManager *disk_manager_{nullptr};
   page_id_t catalog_head_{INVALID_PAGE_ID};
   bool opened_{false};
+  // 保护内存目录及 root_page_id 的发布；Schema/Table 事务锁仍由调用层
+  // 负责，不能用这个短期 mutex 替代 DDL/DML 的 Strict 2PL。
+  mutable std::shared_mutex mutex_;
 };
 
 }  // namespace oursql

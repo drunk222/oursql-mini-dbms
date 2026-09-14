@@ -344,7 +344,7 @@ bool TestExtendedInsertCompileOnly() {
                "未实现的扩展 INSERT 不得产生部分写入");
 }
 
-bool TestDistinctAndLimitCompileOnly() {
+bool TestDistinctAndLimitExecution() {
   TempDb temp;
   oursql::DatabaseEngine engine(temp.path, 3);
   if (!Check(engine.GetInitStatus().ok(), "DISTINCT/LIMIT 测试数据库打开应成功")) {
@@ -352,24 +352,23 @@ bool TestDistinctAndLimitCompileOnly() {
   }
   auto setup = engine.ExecuteSql(
       "CREATE TABLE student(id INT, name VARCHAR);"
-      "INSERT INTO student VALUES(1, 'Alice');");
+      "INSERT INTO student VALUES(1, 'Alice');"
+      "INSERT INTO student VALUES(2, 'Alice');"
+      "INSERT INTO student VALUES(3, 'Bob');");
   if (!Check(setup.ok(), "DISTINCT/LIMIT 测试初始化应成功")) return false;
 
   auto distinct = engine.ExecuteSql("SELECT DISTINCT name FROM student;");
-  if (!Check(!distinct.ok() &&
-                 distinct.status().code() == oursql::ErrorCode::NotImplemented &&
-                 distinct.status().message().find("Execution") !=
-                     std::string::npos,
-             "DISTINCT 应完成编译后明确拒绝执行")) {
+  if (!Check(distinct.ok() && distinct.value().rows.size() == 2 &&
+                 distinct.value().rows[0][0].AsVarchar() == "Alice" &&
+                 distinct.value().rows[1][0].AsVarchar() == "Bob",
+             "DISTINCT 应按投影结果去重并保留首次出现顺序")) {
     return false;
   }
 
   auto limit = engine.ExecuteSql("SELECT * FROM student LIMIT 1;");
-  return Check(!limit.ok() &&
-                   limit.status().code() == oursql::ErrorCode::NotImplemented &&
-                   limit.status().message().find("Execution") !=
-                       std::string::npos,
-               "LIMIT 应完成编译后明确拒绝执行");
+  return Check(limit.ok() && limit.value().rows.size() == 1 &&
+                   limit.value().rows[0][0].AsInt() == 1,
+               "LIMIT 应截断输出行");
 }
 
 bool TestDropTableExecutionAndAliases() {
@@ -385,21 +384,16 @@ bool TestDropTableExecutionAndAliases() {
 
   auto column_alias =
       engine.ExecuteSql("SELECT id AS user_id FROM student;");
-  if (!Check(!column_alias.ok() &&
-                 column_alias.status().code() ==
-                     oursql::ErrorCode::NotImplemented &&
-                 column_alias.status().message().find("Execution") !=
-                     std::string::npos,
-             "列别名应完成编译后明确拒绝执行")) {
+  if (!Check(column_alias.ok() && column_alias.value().column_names.size() == 1 &&
+                 column_alias.value().column_names[0] == "user_id",
+             "列别名应用于结果列命名")) {
     return false;
   }
 
   auto table_alias =
-      engine.ExecuteSql("SELECT id FROM student AS s;");
-  if (!Check(!table_alias.ok() &&
-                 table_alias.status().code() ==
-                     oursql::ErrorCode::NotImplemented,
-             "表别名应完成编译后明确拒绝执行")) {
+      engine.ExecuteSql("SELECT s.id FROM student AS s;");
+  if (!Check(table_alias.ok() && table_alias.value().rows.size() == 1,
+             "表别名应使用 Planner 已完成的名称绑定执行")) {
     return false;
   }
 
@@ -448,7 +442,7 @@ bool TestDropTableExecutionAndAliases() {
                "重启后旧表和索引不应恢复，替代表索引应可查询");
 }
 
-bool TestAggregateAndHavingCompileOnly() {
+bool TestAggregateAndHavingExecution() {
   TempDb temp;
   oursql::DatabaseEngine engine(temp.path, 3);
   if (!Check(engine.GetInitStatus().ok(),
@@ -462,30 +456,76 @@ bool TestAggregateAndHavingCompileOnly() {
   if (!Check(setup.ok(), "聚合/HAVING 测试初始化应成功")) return false;
 
   auto aggregate = engine.ExecuteSql("SELECT COUNT(*) FROM student;");
-  if (!Check(!aggregate.ok() &&
-                 aggregate.status().code() ==
-                     oursql::ErrorCode::NotImplemented &&
-                 aggregate.status().message().find("Execution") !=
-                     std::string::npos,
-             "COUNT 应完成编译后明确拒绝执行")) {
+  if (!Check(aggregate.ok() && aggregate.value().rows.size() == 1 &&
+                 aggregate.value().rows[0][0].AsInt() == 2,
+             "COUNT(*) 应返回输入行数")) {
+    return false;
+  }
+
+  auto all_aggregates = engine.ExecuteSql(
+      "SELECT SUM(id), AVG(id), MAX(id), MIN(id) FROM student;");
+  if (!Check(all_aggregates.ok() && all_aggregates.value().rows.size() == 1 &&
+                 all_aggregates.value().rows[0][0].AsInt() == 3 &&
+                 all_aggregates.value().rows[0][1].AsInt() == 1 &&
+                 all_aggregates.value().rows[0][2].AsInt() == 2 &&
+                 all_aggregates.value().rows[0][3].AsInt() == 1,
+             "SUM/AVG/MAX/MIN 应计算正确")) {
     return false;
   }
 
   auto having = engine.ExecuteSql(
       "SELECT name, COUNT(*) FROM student "
       "GROUP BY name HAVING COUNT(*) >= 2;");
-  if (!Check(!having.ok() &&
-                 having.status().code() ==
-                     oursql::ErrorCode::NotImplemented &&
-                 having.status().message().find("Execution") !=
-                     std::string::npos,
-             "聚合 HAVING 应完成编译后明确拒绝执行")) {
+  if (!Check(having.ok() && having.value().rows.size() == 1 &&
+                 having.value().rows[0][0].AsVarchar() == "Alice" &&
+                 having.value().rows[0][1].AsInt() == 2,
+             "聚合 HAVING 应在分组聚合后过滤")) {
     return false;
   }
 
   auto rows = engine.ExecuteSql("SELECT * FROM student;");
   return Check(rows.ok() && rows.value().rows.size() == 2,
-               "未实现的聚合查询不得影响原始数据");
+               "聚合查询不得影响原始数据");
+}
+
+bool TestComplexWhereAndJoinExecution() {
+  TempDb temp;
+  oursql::DatabaseEngine engine(temp.path, 4);
+  if (!Check(engine.GetInitStatus().ok(), "WHERE/JOIN 测试数据库应打开")) return false;
+  auto setup = engine.ExecuteSql(
+      "CREATE TABLE users(id INT, name VARCHAR(16));"
+      "CREATE TABLE scores(user_id INT, score INT);"
+      "INSERT INTO users VALUES(1, 'Alice');"
+      "INSERT INTO users VALUES(2, 'Bob');"
+      "INSERT INTO users VALUES(3, 'Cara');"
+      "INSERT INTO scores VALUES(1, 80);"
+      "INSERT INTO scores VALUES(3, 95);");
+  if (!Check(setup.ok(), "WHERE/JOIN 测试数据应创建")) return false;
+
+  auto filtered = engine.ExecuteSql(
+      "SELECT id FROM users WHERE (id >= 2 AND name LIKE 'C%') "
+      "OR id BETWEEN 1 AND 1 ORDER BY id;");
+  if (!Check(filtered.ok() && filtered.value().rows.size() == 2 &&
+                 filtered.value().rows[0][0].AsInt() == 1 &&
+                 filtered.value().rows[1][0].AsInt() == 3,
+             "WHERE 应执行比较、AND/OR、BETWEEN 和 LIKE")) return false;
+
+  auto in_not = engine.ExecuteSql(
+      "SELECT id FROM users WHERE id IN (1, 3) AND NOT name = 'Alice';");
+  if (!Check(in_not.ok() && in_not.value().rows.size() == 1 &&
+                 in_not.value().rows[0][0].AsInt() == 3,
+             "WHERE 应执行 IN 和 NOT")) return false;
+
+  auto joined = engine.ExecuteSql(
+      "SELECT u.name AS student_name, s.score FROM users AS u "
+      "INNER JOIN scores AS s ON u.id = s.user_id;");
+  return Check(joined.ok() && joined.value().rows.size() == 2 &&
+                   joined.value().column_names[0] == "student_name" &&
+                   joined.value().rows[0][0].AsVarchar() == "Alice" &&
+                   joined.value().rows[0][1].AsInt() == 80 &&
+                   joined.value().rows[1][0].AsVarchar() == "Cara" &&
+                   joined.value().rows[1][1].AsInt() == 95,
+               "INNER JOIN 应执行等值连接、表别名和输出别名");
 }
 
 bool TestIndexMaintenanceAndExplain() {
@@ -1070,18 +1110,23 @@ int main() {
   } else {
     return 1;
   }
-  if (TestDistinctAndLimitCompileOnly()) {
-    std::cout << "[PASS] DISTINCT and LIMIT compile-only\n";
+  if (TestDistinctAndLimitExecution()) {
+    std::cout << "[PASS] DISTINCT and LIMIT execution\n";
   } else {
     return 1;
   }
   if (TestDropTableExecutionAndAliases()) {
-    std::cout << "[PASS] DROP TABLE execution and AS compile-only\n";
+    std::cout << "[PASS] DROP TABLE execution and aliases\n";
   } else {
     return 1;
   }
-  if (TestAggregateAndHavingCompileOnly()) {
-    std::cout << "[PASS] Aggregate and HAVING compile-only\n";
+  if (TestAggregateAndHavingExecution()) {
+    std::cout << "[PASS] Aggregate and HAVING execution\n";
+  } else {
+    return 1;
+  }
+  if (TestComplexWhereAndJoinExecution()) {
+    std::cout << "[PASS] Complex WHERE and JOIN execution\n";
   } else {
     return 1;
   }

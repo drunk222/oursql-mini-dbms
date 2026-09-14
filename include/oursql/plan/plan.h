@@ -44,11 +44,12 @@ struct IndexScanPlan {
 
 struct PlanNode;
 
-// 过滤节点只表达数据库当前可执行的等值 Predicate；复杂 WHERE 不会伪装成
-// 该节点进入执行层。
+// predicate 保留可供索引优化的简单条件；expression 保留完整 WHERE
+// 表达式供执行器逐行求值。
 struct FilterPlan {
   std::shared_ptr<const PlanNode> child;
   Predicate predicate;
+  CompileExprPtr expression;
 };
 
 // 二元 JOIN：左右子树分别产出行，按指定列等值连接。多表 JOIN 使用左深
@@ -75,7 +76,7 @@ struct ProjectPlan {
   std::vector<std::size_t> input_indexes;
 };
 
-// 编译层分组节点。当前 Executor 会明确返回 NotImplemented。
+// 分组节点；普通 GROUP BY 去重，聚合查询由 SelectPlan 表达式消费分组。
 struct GroupByPlan {
   std::shared_ptr<const PlanNode> child;
   std::vector<std::string> columns;
@@ -99,7 +100,7 @@ struct PlanNode {
 };
 
 // SELECT 的根节点固定为 Project，其下按 Planner 产生的算子链读取数据。
-// distinct 和 limit 是编译层支持的根计划修饰符；当前 Executor 会明确拒绝。
+// distinct 和 limit 是由 Executor 在投影/聚合之后应用的根计划修饰符。
 // projection_aliases 与 root Project 的 columns 等长；table_alias 保存 AS 表别名。
 // projection_expressions 和 having 保存聚合相关的编译层表达式。
 // output_types 与 Project 输出列等长，供外层子查询做类型推导；执行器不依赖它。

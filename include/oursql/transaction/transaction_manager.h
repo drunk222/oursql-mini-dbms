@@ -5,8 +5,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -25,6 +27,15 @@ class TransactionManager {
         buffer_pool_(buffer_pool),
         disk_manager_(disk_manager),
         lock_manager_(lock_manager) {}
+  ~TransactionManager();
+
+  TransactionManager(const TransactionManager &) = delete;
+  TransactionManager &operator=(const TransactionManager &) = delete;
+
+  // 调用者：DatabaseEngine；作用：启动每 100ms 检查一次死锁的后台线程；返回：启动状态。
+  [[nodiscard]] Status StartDeadlockDetector();
+  // 调用者：DatabaseEngine/析构函数；作用：唤醒并 join 死锁检测线程；返回：停止状态。
+  [[nodiscard]] Status StopDeadlockDetector();
 
   // Caller: a Session coordinator. Starts one independent transaction.
   [[nodiscard]] Result<std::shared_ptr<Transaction>> Begin();
@@ -64,6 +75,7 @@ class TransactionManager {
   [[nodiscard]] Status ResolveDeadlocksOnce();
 
  private:
+  void DeadlockDetectorLoop() noexcept;
   [[nodiscard]] Result<std::shared_ptr<Transaction>> BeginInternal(bool explicit_transaction);
   [[nodiscard]] Result<lsn_t> AppendFor(Transaction *transaction, LogRecord record);
   [[nodiscard]] Status Undo(Transaction *transaction);
@@ -87,6 +99,14 @@ class TransactionManager {
   std::unordered_set<txn_id_t> starting_transactions_;
   std::unordered_map<txn_id_t, std::size_t> committed_cleanup_index_;
   std::shared_ptr<Transaction> legacy_active_;
+
+  // Protects detector thread creation/join. It is separate from the wait
+  // mutex so Stop can join while the detector is blocked in wait_for.
+  mutable std::mutex detector_lifecycle_mutex_;
+  mutable std::mutex detector_wait_mutex_;
+  std::condition_variable detector_cv_;
+  bool detector_stop_requested_{false};
+  std::thread detector_thread_;
 };
 
 }  // namespace oursql

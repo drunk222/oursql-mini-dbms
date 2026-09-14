@@ -76,6 +76,10 @@ class DatabaseEngine {
   [[nodiscard]] Status ResetStatistics();
   [[nodiscard]] std::vector<FrameSnapshot> GetBufferSnapshots() const;
   [[nodiscard]] std::vector<page_id_t> GetEvictionLog() const;
+  void BeginLockEventCapture();
+  [[nodiscard]] std::vector<LockEvent> EndLockEventCapture();
+  void SetLockEventSession(std::size_t session_index) noexcept;
+  void ClearLockEventSession() noexcept;
   [[nodiscard]] ReplacementPolicy GetReplacementPolicy() const noexcept;
   [[nodiscard]] FlushPolicy GetFlushPolicy() const noexcept;
   [[nodiscard]] std::size_t GetPoolSize() const noexcept;

@@ -213,6 +213,25 @@ bool TestWebApi() {
                        results[1]["results"][0].contains("duration_ms"),
                    "Each concurrent SQL result should include its own duration") &&
              ok;
+        bool first_has_lock_events =
+            results[0].contains("lock_events") &&
+            results[0]["lock_events"].is_array() &&
+            !results[0]["lock_events"].empty();
+        bool second_has_lock_events =
+            results[1].contains("lock_events") &&
+            results[1]["lock_events"].is_array() &&
+            !results[1]["lock_events"].empty();
+        ok = Check(first_has_lock_events && second_has_lock_events,
+                   "Concurrent SQL should report lock acquisition and release events") &&
+             ok;
+        if (first_has_lock_events) {
+          const auto &event = results[0]["lock_events"][0];
+          ok = Check(event.contains("page_id") && event.contains("index_id") &&
+                         event.contains("table_id") &&
+                         event.contains("encoded_key"),
+                     "Lock events should include concrete resource identifiers") &&
+               ok;
+        }
       }
     }
   }

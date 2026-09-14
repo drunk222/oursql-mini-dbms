@@ -252,6 +252,128 @@ bool TestPlanTreeAndPrinting() {
   return Check(project_all.select_all && project_all.columns.empty(), "SELECT * 的 ProjectPlan 应保留全列标记");
 }
 
+bool TestSelectConstantProjection() {
+  oursql::Catalog catalog = MakeCatalog();
+  oursql::Parser parser;
+  oursql::Planner planner;
+
+  auto parsed = parser.Parse(
+      "SELECT 1 AS one, 'hello' AS greeting, NULL AS missing "
+      "FROM users;");
+  if (!Check(parsed.ok(), "SELECT 常量投影应解析成功")) return false;
+  const auto &select =
+      std::get<oursql::SelectStatement>(parsed.value()[0]);
+  if (!Check(select.projection ==
+                 std::vector<std::string>{"1", "'hello'", "NULL"} &&
+                 select.projection_aliases ==
+                     std::vector<std::string>{"one", "greeting", "missing"} &&
+                 select.projection_expressions.size() == 3,
+             "SELECT 常量投影应保存稳定文本和对应表达式")) {
+    return false;
+  }
+  const auto *integer =
+      std::get_if<oursql::CompileLiteralExpr>(
+          &select.projection_expressions[0]->data);
+  const auto *string =
+      std::get_if<oursql::CompileLiteralExpr>(
+          &select.projection_expressions[1]->data);
+  const auto *null_value =
+      std::get_if<oursql::CompileLiteralExpr>(
+          &select.projection_expressions[2]->data);
+  if (!Check(integer != nullptr &&
+                 integer->kind == oursql::CompileLiteralKind::Int &&
+                 integer->integer == 1 &&
+                 string != nullptr &&
+                 string->kind == oursql::CompileLiteralKind::String &&
+                 string->text == "hello" &&
+                 null_value != nullptr &&
+                 null_value->kind == oursql::CompileLiteralKind::Null,
+             "SELECT 常量 AST 应保留具体字面量")) {
+    return false;
+  }
+
+  auto plan = planner.Build(parsed.value()[0], catalog);
+  if (!Check(plan.ok() &&
+                 std::holds_alternative<oursql::SelectPlan>(plan.value()),
+             "SELECT 常量投影应生成 SelectPlan")) {
+    return false;
+  }
+  const auto &select_plan = std::get<oursql::SelectPlan>(plan.value());
+  const auto &project =
+      std::get<oursql::ProjectPlan>(select_plan.root->operation);
+  if (!Check(select_plan.output_types ==
+                 std::vector<oursql::PlanValueType>{
+                     oursql::PlanValueType::Int,
+                     oursql::PlanValueType::Varchar,
+                     oursql::PlanValueType::Null} &&
+                 project.columns ==
+                     std::vector<std::string>{"1", "'hello'", "NULL"} &&
+                 project.input_indexes.empty() &&
+                 select_plan.projection_expressions.size() == 3,
+             "SELECT 常量投影应在 ProjectPlan 中保留表达式并推导类型")) {
+    return false;
+  }
+
+  auto arithmetic = parser.Parse("SELECT 1 + 2 AS total FROM users;");
+  if (!Check(arithmetic.ok(), "SELECT 算术常量投影应解析成功")) return false;
+  const auto &arithmetic_select =
+      std::get<oursql::SelectStatement>(arithmetic.value()[0]);
+  if (!Check(arithmetic_select.projection_expressions.size() == 1 &&
+                 std::holds_alternative<oursql::CompileBinaryExpr>(
+                     arithmetic_select.projection_expressions[0]->data),
+             "SELECT 算术常量应保留表达式树")) {
+    return false;
+  }
+  auto arithmetic_plan = planner.Build(arithmetic.value()[0], catalog);
+  if (!Check(arithmetic_plan.ok(), "SELECT 算术常量投影应规划成功")) {
+    return false;
+  }
+  const auto &arithmetic_select_plan =
+      std::get<oursql::SelectPlan>(arithmetic_plan.value());
+  if (!Check(arithmetic_select_plan.output_types ==
+                 std::vector<oursql::PlanValueType>{
+                     oursql::PlanValueType::Int},
+             "SELECT 算术常量应推导出 INT 类型")) {
+    return false;
+  }
+
+  auto invalid = parser.Parse("SELECT 1 + 'x' FROM users;");
+  if (!Check(invalid.ok(), "SELECT 类型错误表达式应先通过 Parser")) {
+    return false;
+  }
+  auto invalid_plan = planner.Build(invalid.value()[0], catalog);
+  if (!Check(!invalid_plan.ok() &&
+                 invalid_plan.status().code() ==
+                     oursql::ErrorCode::TypeMismatch,
+             "SELECT 常量表达式类型错误应报告 TypeMismatch")) {
+    return false;
+  }
+
+  auto exists = parser.Parse(
+      "SELECT id FROM users "
+      "WHERE EXISTS (SELECT 1 FROM users WHERE id = 1);");
+  if (!Check(exists.ok(), "EXISTS 子查询中的常量投影应解析成功")) {
+    return false;
+  }
+  const auto &exists_select =
+      std::get<oursql::SelectStatement>(exists.value()[0]);
+  const auto *exists_expression =
+      exists_select.compile_where
+          ? std::get_if<oursql::CompileSubqueryExpr>(
+                &exists_select.compile_where->data)
+          : nullptr;
+  if (!Check(exists_expression != nullptr &&
+                 exists_expression->query != nullptr &&
+                 exists_expression->query->projection_expressions.size() == 1 &&
+                 std::holds_alternative<oursql::CompileLiteralExpr>(
+                     exists_expression->query->projection_expressions[0]->data),
+             "EXISTS 子查询应保留 SELECT 1 常量投影")) {
+    return false;
+  }
+  return Check(planner.Build(exists.value()[0], catalog).ok(),
+               "EXISTS 子查询中的常量投影应规划成功");
+}
+
 bool TestInsertColumnListAndMultipleRows() {
   oursql::Catalog catalog = MakeCatalog();
   oursql::Parser parser;
@@ -1746,6 +1868,7 @@ int main() {
   run("Parser errors and positions", &TestParserErrorsHavePositions);
   run("Planner semantic checks", &TestPlannerSemanticChecks);
   run("Plan tree and printing", &TestPlanTreeAndPrinting);
+  run("SELECT constant projection", &TestSelectConstantProjection);
   run("INSERT columns and multiple rows",
       &TestInsertColumnListAndMultipleRows);
   run("DISTINCT and LIMIT compile-only", &TestDistinctAndLimitCompileOnly);

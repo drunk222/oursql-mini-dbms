@@ -5,6 +5,14 @@
 #include <utility>
 #include <variant>
 
+// 表达式优化实现说明：
+//
+// 常量折叠采用后序递归，先处理子表达式，再按运算符和字面量类型生成新常量
+// 节点。所有有符号整数运算都显式检查溢出；除零、INT64_MIN / -1 和含列引用
+// 的表达式保持原样。
+//
+// Predicate 提取只接受“列 = 字面量”和 IS [NOT] NULL，为简单 Filter 与
+// 索引选择提供稳定入口，不改变复杂表达式的语义。
 namespace oursql {
 namespace {
 

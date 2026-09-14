@@ -1006,6 +1006,40 @@ Result<Plan> DatabaseEngine::BuildPlan(const Statement &statement) const {
   return planner_.Build(statement, catalog_);
 }
 
+void DatabaseEngine::BeginLockEventCapture() {
+  lock_manager_.BeginEventCapture();
+}
+
+std::vector<LockEvent> DatabaseEngine::EndLockEventCapture() {
+  auto events = lock_manager_.EndEventCapture();
+  const auto tables = catalog_.ListTables();
+  const auto indexes = catalog_.ListIndexes();
+  for (auto &event : events) {
+    for (const auto &table : tables) {
+      if (TableIdFor(table.name) == event.table_id) {
+        event.table_name = table.name;
+        break;
+      }
+    }
+    for (const auto &index : indexes) {
+      if (IndexIdFor(index.name) == event.index_id) {
+        event.index_name = index.name;
+        if (event.table_name.empty()) event.table_name = index.table_name;
+        break;
+      }
+    }
+  }
+  return events;
+}
+
+void DatabaseEngine::SetLockEventSession(std::size_t session_index) noexcept {
+  LockManager::SetEventSession(session_index);
+}
+
+void DatabaseEngine::ClearLockEventSession() noexcept {
+  LockManager::ClearEventSession();
+}
+
 Result<ExecutionResult> DatabaseEngine::ExecuteSql(
     const std::shared_ptr<SessionContext> &session, std::string_view sql) {
   auto results = ExecuteSqlBatch(session, sql);

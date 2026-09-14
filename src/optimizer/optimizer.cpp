@@ -3,6 +3,11 @@
 #include <utility>
 #include <variant>
 
+// 计划优化器实现说明：
+//
+// 每轮按固定顺序尝试 R1、R2；任一规则改写计划就继续下一轮，直到整轮稳定。
+// 规则必须保留 SELECT 根 Project 和执行器可消费的算子形态。如果输入非法或
+// 规则无法修复，返回 InternalError，而不是把未知计划交给 Executor。
 namespace oursql {
 
 namespace {

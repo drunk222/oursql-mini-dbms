@@ -22,6 +22,7 @@ struct SqlTrace {
 struct ConcurrentSqlResult {
   Status status;
   std::vector<ExecutionResult> results;
+  std::vector<LockEvent> lock_events;
   double duration_ms{0.0};
 };
 

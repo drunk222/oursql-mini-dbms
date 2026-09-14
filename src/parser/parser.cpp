@@ -6,6 +6,15 @@
 #include <type_traits>
 #include <utility>
 
+// Parser 实现说明：
+//
+// 表达式采用分层递归下降，优先级从低到高为：
+//   OR -> AND -> NOT -> 比较 -> 加减 -> 乘除 -> 一元 -> 原子
+// 每条语句必须由对应的 ParseXxx() 消费结束分号，使多条 SQL 能稳定地
+// 从下一条语句的首 Token 继续解析。
+//
+// Parser 只构造 AST。简单等值条件会额外抽取 Predicate；复杂条件保留
+// CompileExpr，供 Planner 做语义检查并供执行层逐行求值。
 namespace oursql {
 
 namespace {
@@ -332,12 +341,11 @@ class ParserImpl {
   }
 
   Result<CompileExprPtr> ParseSelectItem() {
+    // SELECT 项既可以是列引用和聚合，也可以是常量或一般表达式，
+    // 例如 1、'text'、NULL、1 + 2。聚合函数仍先单独识别，避免把
+    // COUNT(*) 等节点误当作普通函数调用。
     if (IsAggregateCall()) return ParseAggregateExpr();
-    if (Peek().type == TokenType::LeftParen ||
-        Peek().type == TokenType::Exists) {
-      return ParseCompileExpr();
-    }
-    return ParseColumnRef("SELECT 后的列名或聚合函数");
+    return ParseCompileExpr();
   }
 
   // 子查询复用完整 SELECT 递归下降逻辑；能否执行由 Planner 决定。调用前
@@ -1141,6 +1149,8 @@ class ParserImpl {
   }
 
   Result<Statement> ParseTransaction() {
+    // BEGIN、COMMIT、ROLLBACK 都只带关键字和分号。Parser 不创建或提交事务，
+    // 只生成带位置的 BeginStatement/CommitStatement/RollbackStatement。
     Token keyword = Peek();
     ++index_;
     auto semicolon = Expect(TokenType::Semicolon, "';'");
@@ -1187,6 +1197,9 @@ class ParserImpl {
   }
 
   Result<Statement> ParseExplain() {
+    // 语法：EXPLAIN SELECT ...;
+    // 被解释的 SELECT 仍完整走 Parser/Planner，但执行阶段只输出计划文本，
+    // 不执行内部查询或访问数据页。
     auto explain = Expect(TokenType::Explain, "EXPLAIN");
     if (!explain.ok()) return Result<Statement>(explain.status());
     if (Peek().type != TokenType::Select) {

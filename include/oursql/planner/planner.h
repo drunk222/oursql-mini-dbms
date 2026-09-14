@@ -3,6 +3,11 @@
 #include "oursql/catalog/catalog.h"
 #include "oursql/plan/plan.h"
 
+// AST 到逻辑 Plan 的语义分析与计划生成入口。
+//
+// Planner 只通过 CatalogReader 读取表、列和索引定义，不登记表、不写数据、
+// 不访问 BufferPool。Build() 完成语义检查后构造 Plan，并在 SELECT 路径上
+// 调用 Optimizer 执行规则式 R1/R2 重写。
 namespace oursql {
 
 class Planner {

@@ -7,6 +7,15 @@
 #include <unordered_set>
 #include <utility>
 
+// Planner 实现说明：
+//
+// 1. 静态辅助函数检查 Schema、Predicate、INSERT 值、表达式类型和分组规则；
+// 2. Build() 使用 std::visit 穷举每种 Statement；
+// 3. SELECT 按扫描叶子 -> Filter -> GroupBy -> OrderBy -> Project 构造；
+// 4. 最后读取目标表索引并调用 Optimizer 执行 R1/R2。
+//
+// Planner 只读 Catalog；所有数据库副作用都留给执行阶段。语义错误保留原
+// 错误码，并附加语句位置，便于 CLI 和上层接口统一诊断。
 namespace oursql {
 
 namespace {
@@ -1085,7 +1094,7 @@ Result<Plan> Planner::Build(const Statement &statement, const CatalogReader &cat
           }
           if (value.compile_where != nullptr) {
             // SELECT 的复杂表达式已经接入执行；这里先完成限定符、列和类型
-            // 检查。子查询等尚无执行算子的节点会在后续构建阶段明确拒绝。
+            // 检查。SELECT 列表中的未支持子查询会在后续构建阶段明确拒绝。
             auto qualifier_status = CheckSingleTableQualifiers(
                 value.compile_where, value.table_name, value.table_alias,
                 "WHERE");

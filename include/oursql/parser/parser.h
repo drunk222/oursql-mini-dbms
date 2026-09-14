@@ -6,6 +6,11 @@
 #include <string_view>
 #include <vector>
 
+// SQL 编译前端的语法阶段。
+//
+// Parser 只把 Token 流转换成强类型 AST，不查询 Catalog、不访问存储、不执行
+// SQL。它负责语法结构、位置记录和 AST 字段收集；表/列/类型、INSERT 行数和
+// 约束合法性由 Planner 负责。
 namespace oursql {
 
 class Parser {

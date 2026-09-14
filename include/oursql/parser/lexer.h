@@ -7,6 +7,14 @@
 #include <string_view>
 #include <vector>
 
+// SQL 编译前端的第一阶段。
+//
+// Lexer 只负责把原始 SQL 切成 Token，不理解语句语义，也不访问 Catalog 或
+// 存储层。Token 同时保存种别码、规范化词素、字节区间和起止行列；非法字符、
+// 非法数字、未闭合字符串和未闭合块注释都会在词法阶段直接返回错误。
+//
+// Parser 依赖输入末尾的 EndOfFile 哨兵判断解析结束，因此 Tokenize() 必须在
+// 合法输入的末尾追加 EOF，不能返回没有结束标记的 Token 序列。
 namespace oursql {
 
 enum class TokenType {

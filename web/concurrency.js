@@ -3,6 +3,26 @@
 const elements = {};
 const sessions = [];
 let busy = false;
+const lockActionLabels = {
+  WAIT: "等待锁",
+  GRANTED: "获得锁",
+  RELEASE: "释放锁",
+};
+function lockResourceText(event) {
+  const mode = event.mode ? ` ${event.mode}` : "";
+  if (event.resource === "schema") return `模式锁${mode}`;
+  if (event.resource === "table") {
+    const name = event.table_name || `#${event.table_id}`;
+    return `表 ${name}${mode}`;
+  }
+  if (event.resource === "page") return `数据页 #${event.page_id}${mode}`;
+  if (event.resource === "index_key") {
+    const name = event.index_name || `#${event.index_id}`;
+    const key = event.encoded_key ? ` · key ${event.encoded_key}` : "";
+    return `索引 ${name}${key}${mode}`;
+  }
+  return `${event.resource || "锁"}${mode}`;
+}
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -132,6 +152,39 @@ function renderSession(session, index) {
   return panel;
 }
 
+function renderLockTimeline(events) {
+  if (!events?.length) return null;
+  const section = element("section", "lock-timeline");
+  section.append(element("div", "lock-timeline-title", "锁事件"));
+  const list = element("div", "lock-event-list");
+  const ordered = [...events].sort(
+    (left, right) => Number(left.offset_ms || 0) - Number(right.offset_ms || 0)
+  );
+  for (const event of ordered) {
+    const row = element("div", "lock-event");
+    row.dataset.action = String(event.action || "").toLowerCase();
+    const resourceText = lockResourceText(event);
+    const detail = element(
+      "span",
+      "lock-event-resource",
+      `${resourceText} · txn ${event.txn_id}`
+    );
+    detail.title = resourceText;
+    row.append(
+      element("span", "lock-event-time", `${Number(event.offset_ms || 0).toFixed(1)} ms`),
+      element(
+        "span",
+        "lock-event-action",
+        lockActionLabels[event.action] || event.action || "锁事件"
+      ),
+      detail
+    );
+    list.append(row);
+  }
+  section.append(list);
+  return section;
+}
+
 function renderSessions() {
   syncSqlFromDom();
   const count = Number(elements.sessionCount.value);
@@ -194,6 +247,8 @@ function renderOutcome(index, outcome) {
   for (const result of executionResults) {
     results.append(renderExecutionResult(result));
   }
+  const lockTimeline = renderLockTimeline(outcome.lock_events);
+  if (lockTimeline) results.append(lockTimeline);
 }
 
 async function runConcurrent() {

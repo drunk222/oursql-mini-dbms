@@ -150,10 +150,29 @@ nlohmann::json ConcurrentSqlResultToJson(const ConcurrentSqlResult &result) {
   for (const auto &item : result.results) {
     results.push_back(ExecutionResultToJson(item));
   }
+  auto lock_events = nlohmann::json::array();
+  for (const auto &event : result.lock_events) {
+    lock_events.push_back({
+        {"offset_ms", event.offset_ms},
+        {"txn_id", event.txn_id},
+        {"action", event.action},
+        {"resource", event.resource},
+        {"mode", event.mode},
+        {"table_id", event.table_id},
+        {"page_id", event.page_id == INVALID_PAGE_ID
+                        ? nlohmann::json(nullptr)
+                        : nlohmann::json(event.page_id)},
+        {"index_id", event.index_id},
+        {"encoded_key", event.encoded_key},
+        {"table_name", event.table_name},
+        {"index_name", event.index_name},
+    });
+  }
   nlohmann::json payload{
       {"ok", result.status.ok()},
       {"duration_ms", result.duration_ms},
       {"results", std::move(results)},
+      {"lock_events", std::move(lock_events)},
   };
   if (!result.status.ok()) {
     payload["error"] = ErrorPayload(result.status)["error"];

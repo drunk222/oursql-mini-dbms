@@ -4,6 +4,11 @@
 
 #include <optional>
 
+// 表达式级优化与 Predicate 规范化接口。
+//
+// 这些函数只处理 CompileExpr，不访问 Catalog、BufferPool 或 Executor。
+// FoldCompileExpr 返回新的只读表达式树；ExtractPredicateFromCompileExpr 把
+// 可安全执行的简单条件转换成数据库层 Predicate。
 namespace oursql {
 
 // 编译层表达式常量折叠：

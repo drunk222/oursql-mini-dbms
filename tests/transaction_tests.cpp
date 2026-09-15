@@ -1,3 +1,10 @@
+// 进程异常退出后的WAL与崩溃恢复
+// 子进程_Exit()跳过正常Close，证明系统在异常崩溃后仍能根据WAL区分Winner和Loser，
+// 对已提交事务Redo、对未提交事务Undo。
+
+// 第一，未提交事务崩溃后，Recovery通过before image Undo；
+// 第二，已提交事务但数据页未落盘时，通过after image Redo；
+// 第三，WAL利用长度和CRC识别损坏尾部，中间损坏拒绝恢复，并通过CLR支持恢复过程中再次中断后继续执行。
 #include "oursql/execution/database_engine.h"
 #include "oursql/index/b_plus_tree.h"
 #include "oursql/recovery/recovery_manager.h"

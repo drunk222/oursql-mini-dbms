@@ -30,10 +30,12 @@ class Page {
  public:
   static constexpr std::size_t kSize = 4096;
 
+  // 调用者：DiskManager/BufferPool；作用：取得可写的 4096 字节页面内存；返回：页面字节首地址。
   [[nodiscard]] std::byte *Data() noexcept {
     return data_.data();
   }
 
+  // 调用者：只读存储逻辑；作用：取得页面字节的只读视图；返回：页面字节首地址。
   [[nodiscard]] const std::byte *Data() const noexcept {
     return data_.data();
   }
@@ -44,8 +46,11 @@ class Page {
 
 class DiskManager {
  public:
+  // 调用者：上层数据库；作用：创建尚未打开文件的管理器；返回：空对象。
   DiskManager() = default;
+  // 调用者：数据库引擎；作用：创建并尝试打开指定数据库文件；返回：对象，错误保存在实现状态中。
   explicit DiskManager(std::filesystem::path file_path);
+  // 调用者：对象生命周期结束；作用：关闭数据库文件；返回：无。
   ~DiskManager();
 
   DiskManager(const DiskManager &) = delete;
@@ -92,19 +97,32 @@ class DiskManager {
 
   static constexpr std::uint32_t kFormatVersion = 1;
 
+  // 以下辅助函数要求调用者已经持有 mutex_，避免内部重复加锁或死锁。
+  // 调用者：Open/析构；作用：关闭当前文件并重置内存元数据；返回：关闭状态。
   Status CloseUnlocked();
+  // 调用者：Open；作用：创建文件并写入初始 Superblock；返回：打开状态。
   Status OpenNewFileUnlocked(const std::filesystem::path &file_path);
+  // 调用者：Open；作用：读取并校验已有文件的 Superblock/free list；返回：打开状态。
   Status OpenExistingFileUnlocked(const std::filesystem::path &file_path);
+  // 调用者：元数据修改；作用：把 page_count/free_list/catalog_head 写回 Page 0；返回：写入状态。
   Status PersistSuperblockUnlocked();
+  // 调用者：公开读页或 free-list；作用：执行已加锁的物理读；返回：完整 Page 或错误。
   Result<Page> ReadPhysicalPageUnlocked(page_id_t page_id);
+  // 调用者：公开写页或元数据；作用：执行已加锁的物理写；返回：写入状态。
   Status WritePhysicalPageUnlocked(page_id_t page_id, const Page &page);
+  // 调用者：AllocatePage；作用：把文件扩展到指定页面数；返回：扩展状态。
   Status EnsureFileSizeUnlocked(std::uint64_t page_count);
+  // 调用者：AllocatePage；作用：摘下 free list 头页并更新链表；返回：复用的 page_id。
   Result<page_id_t> PopFreePageUnlocked();
+  // 调用者：DeallocatePage；作用：把页面头插入 free list 并持久化入口；返回：释放状态。
   Status PushFreePageUnlocked(page_id_t page_id);
+  // 调用者：打开已有文件；作用：校验页数、空闲链和目录头范围；返回：校验状态。
   Status ValidateMetadataUnlocked();
 
   std::filesystem::path file_path_;
   std::fstream file_;
+  // DiskManager 的文件流、超级块元数据和 I/O 统计共用这把锁。
+  // 任何公开操作都先拿锁，因此同一个 DiskManager 可被多个线程安全调用。
   mutable std::mutex mutex_;
   bool is_open_{false};
   page_id_t page_count_{1};
@@ -154,23 +172,33 @@ class Replacer {
   [[nodiscard]] virtual Result<frame_id_t> Victim() = 0;
   // 调用者：缓冲池或测试；作用：查询候选 frame 数量；返回：数量。
   [[nodiscard]] virtual std::size_t Size() const = 0;
+  // 调用者：BufferPool/测试；作用：查询 frame 当前是否在可淘汰集合；返回：判断结果。
   [[nodiscard]] virtual bool IsEvictable(frame_id_t frame_id) const = 0;
 };
 
 // 调用者：缓冲池或替换策略测试；作用：按进入候选集合顺序淘汰 frame；返回：确定性替换器。
 class FIFOReplacer final : public Replacer {
  public:
+  // 调用者：BufferPoolManager；作用：创建固定容量的 FIFO 候选管理器；返回：替换器对象。
   explicit FIFOReplacer(std::size_t capacity);
+  // 调用者：BufferPool；作用：让 frame 暂时不可淘汰；返回：操作状态。
   [[nodiscard]] Status Pin(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：让未 pin frame 进入 FIFO 候选队列；返回：操作状态。
   [[nodiscard]] Status Unpin(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：记录 frame 进入候选集合的时刻；返回：操作状态。
   [[nodiscard]] Status RecordAccess(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：清除 frame 的 FIFO 历史；返回：操作状态。
   [[nodiscard]] Status Remove(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：取出最早进入候选集合的 frame；返回：frame 编号或错误。
   [[nodiscard]] Result<frame_id_t> Victim() override;
+  // 调用者：BufferPool/测试；作用：查询当前候选数量；返回：数量。
   [[nodiscard]] std::size_t Size() const override;
+  // 调用者：BufferPool/测试；作用：判断指定 frame 是否可淘汰；返回：判断结果。
   [[nodiscard]] bool IsEvictable(frame_id_t frame_id) const override;
 
  private:
   std::size_t capacity_{0};
+  // 只保护替换器自己的候选集合和顺序记录，不保护 Frame 的页面字节。
   mutable std::mutex mutex_;
   std::list<frame_id_t> order_;
   std::unordered_set<frame_id_t> candidates_;
@@ -181,17 +209,26 @@ class FIFOReplacer final : public Replacer {
 // 调用者：缓冲池或替换策略测试；作用：按最近成为候选的时间淘汰 frame；返回：确定性替换器。
 class LRUReplacer final : public Replacer {
  public:
+  // 调用者：BufferPoolManager；作用：创建固定容量的 LRU 候选管理器；返回：替换器对象。
   explicit LRUReplacer(std::size_t capacity);
+  // 调用者：BufferPool；作用：让 frame 暂时不可淘汰；返回：操作状态。
   [[nodiscard]] Status Pin(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：让未 pin frame 进入 LRU 候选集合；返回：操作状态。
   [[nodiscard]] Status Unpin(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：刷新 frame 的最近访问时间；返回：操作状态。
   [[nodiscard]] Status RecordAccess(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：清除 frame 的 LRU 历史；返回：操作状态。
   [[nodiscard]] Status Remove(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：取出最久未被访问的 frame；返回：frame 编号或错误。
   [[nodiscard]] Result<frame_id_t> Victim() override;
+  // 调用者：BufferPool/测试；作用：查询当前候选数量；返回：数量。
   [[nodiscard]] std::size_t Size() const override;
+  // 调用者：BufferPool/测试；作用：判断指定 frame 是否可淘汰；返回：判断结果。
   [[nodiscard]] bool IsEvictable(frame_id_t frame_id) const override;
 
  private:
   std::size_t capacity_{0};
+  // 只保护 LRU 的候选集合、最近访问时间和访问时钟。
   mutable std::mutex mutex_;
   std::list<frame_id_t> order_;
   std::unordered_set<frame_id_t> candidates_;
@@ -201,17 +238,26 @@ class LRUReplacer final : public Replacer {
 
 class ClockReplacer final : public Replacer {
  public:
+  // 调用者：BufferPoolManager；作用：创建固定容量的 Clock 候选管理器；返回：替换器对象。
   explicit ClockReplacer(std::size_t capacity);
+  // 调用者：BufferPool；作用：让 frame 暂时不可淘汰；返回：操作状态。
   [[nodiscard]] Status Pin(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：让未 pin frame 成为 Clock 候选；返回：操作状态。
   [[nodiscard]] Status Unpin(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：设置 frame 的引用位；返回：操作状态。
   [[nodiscard]] Status RecordAccess(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：移除 frame 的 Clock 状态；返回：操作状态。
   [[nodiscard]] Status Remove(frame_id_t frame_id) override;
+  // 调用者：BufferPool；作用：按二次机会规则选择 frame；返回：frame 编号或错误。
   [[nodiscard]] Result<frame_id_t> Victim() override;
+  // 调用者：BufferPool/测试；作用：查询当前可淘汰 frame 数量；返回：数量。
   [[nodiscard]] std::size_t Size() const override;
+  // 调用者：BufferPool/测试；作用：判断指定 frame 是否可淘汰；返回：判断结果。
   [[nodiscard]] bool IsEvictable(frame_id_t frame_id) const override;
 
  private:
   std::size_t capacity_{0};
+  // 只保护 Clock 的活动位、引用位、时钟指针和候选数量。
   mutable std::mutex mutex_;
   std::vector<bool> active_;
   std::vector<bool> evictable_;
@@ -224,11 +270,15 @@ class BufferPoolManager;
 
 class ReadPageGuard {
  public:
+  // 调用者：Result/上层移动构造；作用：创建空 guard；返回：不持有页面的 guard。
   ReadPageGuard() = default;
+  // 调用者：作用域结束；作用：释放共享锁并归还 pin；返回：无。
   ~ReadPageGuard();
   ReadPageGuard(const ReadPageGuard &) = delete;
   ReadPageGuard &operator=(const ReadPageGuard &) = delete;
+  // 调用者：上层转移页面所有权；作用：转移锁和 pin 管理权；返回：新的 guard。
   ReadPageGuard(ReadPageGuard &&other) noexcept;
+  // 调用者：上层替换 guard；作用：先释放当前页面再接管 other；返回：自身引用。
   ReadPageGuard &operator=(ReadPageGuard &&other) noexcept;
 
   // 调用者：读查询；作用：访问 guard 持有页面的只读字节；返回：页面数据指针，生命周期受 guard 保护。
@@ -240,23 +290,30 @@ class ReadPageGuard {
 
  private:
   friend class BufferPoolManager;
+  // 调用者：BufferPool；作用：用已锁定的 frame 构造读 guard；返回：持有共享 latch 的 guard。
   ReadPageGuard(BufferPoolManager *buffer_pool, frame_id_t frame_id, page_id_t page_id,
                 std::shared_mutex *latch);
+  // 调用者：析构/移动赋值；作用：解锁并归还一次 pin；返回：无。
   void Reset() noexcept;
 
   BufferPoolManager *buffer_pool_{nullptr};
   frame_id_t frame_id_{0};
   page_id_t page_id_{INVALID_PAGE_ID};
+  // guard 持有共享锁；析构或 Reset 时先解锁，再归还 BufferPool 的 pin。
   std::shared_lock<std::shared_mutex> latch_;
 };
 
 class WritePageGuard {
  public:
+  // 调用者：Result/上层移动构造；作用：创建空 guard；返回：不持有页面的 guard。
   WritePageGuard() = default;
+  // 调用者：作用域结束；作用：标记必要的脏状态、释放独占锁并归还 pin；返回：无。
   ~WritePageGuard();
   WritePageGuard(const WritePageGuard &) = delete;
   WritePageGuard &operator=(const WritePageGuard &) = delete;
+  // 调用者：上层转移页面所有权；作用：转移写锁、脏状态和事务上下文；返回：新的 guard。
   WritePageGuard(WritePageGuard &&other) noexcept;
+  // 调用者：上层替换 guard；作用：释放当前页面后接管 other；返回：自身引用。
   WritePageGuard &operator=(WritePageGuard &&other) noexcept;
 
   // 调用者：写入查询或上层存储；作用：访问 guard 持有页面的可写字节；返回：页面数据指针，生命周期受 guard 保护。
@@ -273,8 +330,10 @@ class WritePageGuard {
 
  private:
   friend class BufferPoolManager;
+  // 调用者：BufferPool；作用：用已锁定的 frame 构造写 guard；返回：持有独占 latch 的 guard。
   WritePageGuard(BufferPoolManager *buffer_pool, frame_id_t frame_id, page_id_t page_id,
                  std::shared_mutex *latch, Transaction *transaction = nullptr);
+  // 调用者：析构/Release/移动赋值；作用：记录修改、解锁并归还 pin；返回：释放状态。
   [[nodiscard]] Status Reset() noexcept;
 
   BufferPoolManager *buffer_pool_{nullptr};
@@ -284,6 +343,7 @@ class WritePageGuard {
   Transaction *transaction_{nullptr};
   std::array<std::byte, Page::kSize> before_image_{};
   bool has_before_image_{false};
+  // guard 持有独占锁；同一时间只能有一个写者访问该 Frame 的页面字节。
   std::unique_lock<std::shared_mutex> latch_;
 };
 
@@ -313,6 +373,7 @@ class SlottedPage {
   // 调用者：扫描或读取流程；作用：读取有效槽中的原始记录；返回：记录字节或错误。
   [[nodiscard]] static Result<std::vector<std::byte>> GetRecord(const ReadPageGuard &page,
                                                                   slot_id_t slot_id);
+  // 调用者：持有写 guard 的修改流程；作用：读取槽记录而不改变页面；返回：记录字节或错误。
   [[nodiscard]] static Result<std::vector<std::byte>> GetRecord(const WritePageGuard &page,
                                                                   slot_id_t slot_id);
   // 调用者：删除流程；作用：将槽标记为 deleted 并释放其逻辑空间；返回：操作状态。
@@ -321,6 +382,7 @@ class SlottedPage {
   [[nodiscard]] static Status Compact(WritePageGuard &page);
   // 调用者：页面元数据读取流程；作用：读取槽数量；返回：数量或格式错误。
   [[nodiscard]] static Result<std::uint32_t> SlotCount(const ReadPageGuard &page);
+  // 调用者：写页面维护流程；作用：读取当前槽数量；返回：数量或格式错误。
   [[nodiscard]] static Result<std::uint32_t> SlotCount(const WritePageGuard &page);
   // 调用者：页面链表读取流程；作用：读取下一页编号；返回：编号或格式错误。
   [[nodiscard]] static Result<page_id_t> NextPageId(const ReadPageGuard &page);
@@ -330,6 +392,7 @@ class SlottedPage {
   [[nodiscard]] static Status SetNextPageId(WritePageGuard &page, page_id_t next_page_id);
 
  private:
+  // 调用者：Validate/所有页面访问；作用：校验磁盘字节布局；返回：合法性状态。
   [[nodiscard]] static Status ValidateBytes(const std::byte *data);
 };
 
@@ -365,6 +428,7 @@ class BufferPoolManager {
 
   // 调用者：读查询；作用：获取页面的共享读 guard；返回：guard 或错误状态。
   [[nodiscard]] Result<ReadPageGuard> FetchPage(page_id_t page_id);
+  // 调用者：事务读路径；作用：获取页面共享 guard 并登记事务访问；返回：guard 或错误。
   [[nodiscard]] Result<ReadPageGuard> FetchPage(page_id_t page_id,
                                                   Transaction *transaction);
   // 调用者：写查询或存储层；作用：获取页面的独占写 guard；返回：guard 或错误状态。
@@ -373,12 +437,17 @@ class BufferPoolManager {
   [[nodiscard]] Result<WritePageGuard> NewPage();
   // 调用者：HeapTable 或页面创建流程；作用：申请并获取新的写 guard 页面；返回：guard 或错误状态。
   [[nodiscard]] Result<WritePageGuard> NewPageGuarded() { return NewPage(); }
+  // 调用者：启动/事务存储层；作用：绑定唯一 WAL 管理器；返回：绑定状态。
   [[nodiscard]] Status SetLogManager(LogManager *log_manager);
+  // 调用者：事务存储层；作用：绑定页锁管理器；返回：绑定状态。
   [[nodiscard]] Status SetLockManager(LockManager *lock_manager);
+  // 调用者：Recovery；作用：把页面镜像恢复到缓存并按要求写盘；返回：恢复状态。
   [[nodiscard]] Status RestorePage(page_id_t page_id, const Page &page,
                                     bool write_disk = true);
+  // 调用者：事务写路径；作用：获取独占 guard 并登记事务访问；返回：guard 或错误。
   [[nodiscard]] Result<WritePageGuard> FetchPageWrite(page_id_t page_id,
                                                        Transaction *transaction);
+  // 调用者：事务页面分配路径；作用：申请新页并记录事务归属；返回：写 guard 或错误。
   [[nodiscard]] Result<WritePageGuard> NewPage(Transaction *transaction);
   // 调用者：不使用 guard 的存储代码；作用：释放一次页面 pin 并更新 dirty；返回：操作状态。
   [[nodiscard]] Status UnpinPage(page_id_t page_id, bool is_dirty);
@@ -388,9 +457,11 @@ class BufferPoolManager {
   [[nodiscard]] Status FlushAllPages();
   // 调用者：删除流程；作用：释放未 pin 页面并从缓冲池移除；返回：操作状态。
   [[nodiscard]] Status DeletePage(page_id_t page_id);
+  // 调用者：事务删除路径；作用：删除页面并追加 PageFree WAL；返回：删除状态。
   [[nodiscard]] Status DeletePage(page_id_t page_id, Transaction *transaction);
   // 调用者：表或索引释放流程；作用：预检查后批量释放页面；返回：成功或错误状态。
   [[nodiscard]] Status DeletePages(const std::vector<page_id_t> &page_ids);
+  // 调用者：事务批量删除路径；作用：批量校验、记录并释放页面；返回：删除状态。
   [[nodiscard]] Status DeletePages(const std::vector<page_id_t> &page_ids,
                                    Transaction *transaction);
   // 调用者：关闭流程；作用：刷新并关闭缓冲池；返回：操作状态。
@@ -411,9 +482,13 @@ class BufferPoolManager {
   [[nodiscard]] std::vector<page_id_t> GetEvictionLog() const;
   // 调用者：测试或监控；作用：清零缓冲池统计；返回：无。
   void ResetStatistics();
+  // 调用者：诊断/测试；作用：复制每个 frame 的页面、pin、dirty 和状态；返回：快照列表。
   [[nodiscard]] std::vector<FrameSnapshot> GetFrameSnapshots() const;
+  // 调用者：CLI/基准；作用：读取当前替换策略；返回：FIFO/LRU/CLOCK。
   [[nodiscard]] ReplacementPolicy GetReplacementPolicy() const noexcept;
+  // 调用者：CLI/基准；作用：读取刷盘策略配置；返回：WriteBack/WriteThrough。
   [[nodiscard]] FlushPolicy GetFlushPolicy() const noexcept;
+  // 调用者：测试/基准；作用：读取 frame 容量；返回：固定缓冲池大小。
   [[nodiscard]] std::size_t GetPoolSize() const noexcept;
 
  private:
@@ -421,7 +496,7 @@ class BufferPoolManager {
   friend class WritePageGuard;
 
   struct Frame {
-    // mutex_ 保护下修改元数据；latch 只保护 page 字节，磁盘 I/O 不持有 mutex_。
+    // mutex_ 保护下修改 BufferPool 元数据；latch 只保护 page 字节，磁盘 I/O 不持有 mutex_。
     Page page;
     page_id_t page_id{INVALID_PAGE_ID};
     std::uint32_t pin_count{0};
@@ -436,21 +511,33 @@ class BufferPoolManager {
     bool from_free_list{false};
   };
 
+  // 以下辅助函数要求调用者已持有 BufferPool mutex_，且不在锁内执行磁盘 I/O。
+  // 调用者：Fetch/NewPage；作用：从 free list 或 replacer 选择一个 frame；返回：选择结果。
   [[nodiscard]] Result<FrameSelection> SelectFrameUnlocked();
+  // 调用者：Fetch/NewPage 失败回滚；作用：把暂时选中的 frame 恢复到可用集合；返回：无。
   void RestoreSelectionUnlocked(const FrameSelection &selection);
+  // 调用者：加载/分配失败；作用：把空 frame 放回 free list；返回：恢复状态。
   [[nodiscard]] Status ReturnFreeFrameUnlocked(frame_id_t frame_id);
+  // 调用者：PageGuard Reset；作用：合并 dirty、更新 pin 并触发必要刷盘/WAL；返回：释放状态。
   [[nodiscard]] Status ReleaseGuard(frame_id_t frame_id, page_id_t page_id, bool is_dirty) noexcept;
+  // 调用者：写 guard Release；作用：记录 before/after 页面镜像并更新事务 LSN；返回：日志状态。
   [[nodiscard]] Status RecordGuardUpdate(frame_id_t frame_id, page_id_t page_id,
-                                         Transaction *transaction, bool dirty,
-                                         const std::array<std::byte, Page::kSize> &before,
-                                         bool *logged) noexcept;
+                                          Transaction *transaction, bool dirty,
+                                          const std::array<std::byte, Page::kSize> &before,
+                                          bool *logged) noexcept;
+  // 调用者：事务删除；作用：追加 PageFree WAL 并登记延迟释放；返回：日志状态。
   [[nodiscard]] Status AppendPageFreeLog(page_id_t page_id, Transaction *transaction);
+  // 调用者：事务页访问；作用：申请页面 S/X 锁；返回：锁状态。
   [[nodiscard]] Status AcquirePageLock(page_id_t page_id, Transaction *transaction,
-                                       LockMode mode);
+                                        LockMode mode);
+  // 调用者：淘汰/Flush；作用：执行 WAL-before-data 检查后写磁盘；返回：写入状态。
   [[nodiscard]] Status FlushFrameToDisk(page_id_t page_id, const Page &page,
-                                        lsn_t page_lsn);
+                                         lsn_t page_lsn);
+  // 调用者：所有公开操作；作用：检查构造和关闭状态；返回：可用状态。
   [[nodiscard]] Status EnsureReadyUnlocked() const;
+  // 调用者：Fetch/Delete；作用：拒绝 Page 0、非法和越界数据页；返回：校验状态。
   [[nodiscard]] Status ValidateDataPageId(page_id_t page_id) const;
+  // 调用者：状态改变后；作用：唤醒等待 frame 状态变化的线程；返回：无。
   void NotifyStateChange() noexcept;
 
   std::size_t pool_size_{0};
@@ -462,6 +549,8 @@ class BufferPoolManager {
   ReplacementPolicy replacement_policy_{ReplacementPolicy::FIFO};
   FlushPolicy flush_policy_{FlushPolicy::WriteBack};
   Status init_status_;
+  // 保护 page_table、Frame 状态、pin/dirty、统计和替换器协调状态。
+  // 这把锁不应跨越磁盘 I/O；慢 I/O 期间只保留必要的 Frame 状态。
   mutable std::mutex mutex_;
   std::condition_variable state_changed_;
   std::vector<Frame> frames_;

@@ -13,6 +13,7 @@ namespace oursql {
 namespace {
 
 struct RecoveryTransaction {
+  // 恢复阶段只需记录每个事务最后一条日志及其终止状态。
   lsn_t last_lsn{kInvalidLsn};
   bool terminal{false};
   LogRecordType terminal_type{LogRecordType::Checkpoint};
@@ -21,6 +22,8 @@ struct RecoveryTransaction {
 
 Status WriteImage(DiskManager *disk_manager, page_id_t page_id,
                   const std::vector<std::byte> &image) {
+  // 调用者：Redo/Undo；作用：通过 DiskManager 写回一张完整页面；返回：写入状态。
+  // 恢复写整页必须仍经过 DiskManager，不能直接操作 .oursql 文件。
   if (disk_manager == nullptr || image.size() != Page::kSize) {
     return Status::InvalidArgument("recovery requires one full page image");
   }
@@ -30,6 +33,8 @@ Status WriteImage(DiskManager *disk_manager, page_id_t page_id,
 }
 
 Status DeallocateIdempotent(DiskManager *disk_manager, page_id_t page_id) {
+  // 调用者：Redo/Undo；作用：幂等释放物理页；返回：AlreadyExists 也视为成功。
+  // 恢复可能重复执行同一释放动作，AlreadyExists 在这里视为幂等成功。
   if (disk_manager == nullptr) {
     return Status::InvalidArgument("recovery requires a DiskManager");
   }
@@ -38,6 +43,8 @@ Status DeallocateIdempotent(DiskManager *disk_manager, page_id_t page_id) {
 }
 
 Status RedoCompensation(DiskManager *disk_manager, const LogRecord &record) {
+  // 调用者：Recover 的 Redo 阶段；作用：重放一条 CLR；返回：重放状态。
+  // CLR 的 Redo 必须可重复：页面镜像重写，分配回收使用幂等释放。
   switch (record.compensation_type) {
     case LogRecordType::PageUpdate:
       return WriteImage(disk_manager, record.page_id, record.after_image);
@@ -57,9 +64,11 @@ Status RecoveryManager::Recover() {
   if (log_manager_ == nullptr || disk_manager_ == nullptr) {
     return Status::InvalidArgument("RecoveryManager requires LogManager and DiskManager");
   }
+  // 第一步：读取并校验 WAL，恢复只使用完整、格式正确的记录。
   auto scan = log_manager_->Scan();
   if (!scan.ok()) return Status::IOError("WAL recovery scan failed: " + scan.status().message());
 
+  // 第二步：按事务分析日志，区分已 Commit 的 winner 和没有终止记录的 loser。
   std::unordered_map<txn_id_t, RecoveryTransaction> transactions;
   std::unordered_map<lsn_t, const LogRecord *> records_by_lsn;
   for (const auto &record : scan.value()) {
@@ -85,6 +94,7 @@ Status RecoveryManager::Recover() {
     }
   }
 
+  // 第三步 Redo：按全局 LSN 顺序重放 winner 的 PageUpdate/PageFree。
   // Redo is global-LSN ordered. A CLR is replayed for both winners and
   // unfinished losers: the latter is what makes recovery resumable when the
   // process stopped after logging a CLR but before writing its page image.
@@ -108,6 +118,7 @@ Status RecoveryManager::Recover() {
     }
   }
 
+  // 第四步 Undo：用最大 LSN 优先堆处理交错的 loser 日志。
   // Undo all losers with one global max-LSN heap. This handles interleaved
   // transaction logs and leaves a resumable CLR chain in the WAL.
   using PendingUndo = std::pair<lsn_t, txn_id_t>;
@@ -121,6 +132,7 @@ Status RecoveryManager::Recover() {
 
   lsn_t recovery_last_lsn = kInvalidLsn;
   while (!pending.empty()) {
+    // 每次取某个 loser 当前最大的 LSN，保证逆向处理顺序。
     const auto [current_lsn, txn_id] = pending.top();
     pending.pop();
     if (next_lsn[txn_id] != current_lsn) continue;
@@ -139,6 +151,7 @@ Status RecoveryManager::Recover() {
     } else if (record.type == LogRecordType::PageUpdate ||
                record.type == LogRecordType::PageAllocate ||
                record.type == LogRecordType::PageFree) {
+      // 先追加 CLR，再执行物理 Undo；这样崩溃后可根据 CLR 继续恢复。
       LogRecord compensation;
       compensation.type = LogRecordType::Compensation;
       compensation.txn_id = txn_id;
@@ -159,6 +172,7 @@ Status RecoveryManager::Recover() {
       transactions.at(txn_id).last_lsn = compensation_lsn.value();
       recovery_last_lsn = std::max(recovery_last_lsn, compensation_lsn.value());
 
+      // PageUpdate 恢复 before image；PageAllocate 撤销分配；PageFree 延迟释放无需反向操作。
       Status undo_status = Status::Ok();
       if (record.type == LogRecordType::PageUpdate) {
         undo_status = WriteImage(disk_manager_, record.page_id, record.before_image);
@@ -176,6 +190,7 @@ Status RecoveryManager::Recover() {
     if (following_lsn != kInvalidLsn) pending.emplace(following_lsn, txn_id);
   }
 
+  // 第五步：所有 loser 的 Undo 完成后才追加 Abort，避免过早宣布恢复结束。
   // Mark a loser terminal only after all of its undo actions are logged and
   // applied. One flush groups all recovery CLRs and Abort records.
   for (const auto txn_id : losers) {
@@ -191,6 +206,7 @@ Status RecoveryManager::Recover() {
     recovery_last_lsn = std::max(recovery_last_lsn, abort_lsn.value());
   }
 
+  // 一次性刷入本次恢复产生的 CLR 和 Abort，保证恢复结果持久化。
   const auto flush_target = std::max(recovery_last_lsn, log_manager_->GetAppendLsn());
   auto flush_status = log_manager_->Flush(flush_target);
   if (!flush_status.ok()) {

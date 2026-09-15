@@ -8,10 +8,12 @@ namespace oursql {
 // 每条记录在页内由 slot 定位，因此稳定地址 RID = (page_id, slot_id)。
 // 行的字节表示交给 RowCodec，页内空间管理交给 SlottedPage，本类只协调跨页操作。
 
+// 调用者：Catalog/Execution；作用：绑定缓存池和表元数据；返回：构造的堆表对象。
 HeapTable::HeapTable(BufferPoolManager *buffer_pool, TableMetadata metadata) noexcept
     : buffer_pool_(buffer_pool), metadata_(std::move(metadata)) {}
 
 Result<std::optional<RowEntry>> HeapTable::ScanCursor::Next() {
+  // 调用者：SeqScanExecutor/HeapTable::Scan；作用：沿数据页链返回下一条有效行；返回：RowEntry 或扫描结束。
   if (buffer_pool_ == nullptr) {
     return Result<std::optional<RowEntry>>(Status::InvalidArgument("HeapTable 扫描游标缺少 BufferPoolManager"));
   }
@@ -98,6 +100,7 @@ Result<std::optional<RowEntry>> HeapTable::ScanCursor::Next() {
 }
 
 Result<HeapTable::ScanCursor> HeapTable::BeginScan() {
+  // 调用者：SeqScanExecutor；作用：创建惰性扫描游标，不立即复制整张表；返回：游标或元数据错误。
   if (buffer_pool_ == nullptr) {
     return Result<ScanCursor>(Status::InvalidArgument("HeapTable 缺少 BufferPoolManager"));
   }
@@ -108,10 +111,12 @@ Result<HeapTable::ScanCursor> HeapTable::BeginScan() {
 }
 
 Result<RID> HeapTable::InsertRow(const Row &row) {
+  // 调用者：非事务 InsertExecutor；作用：转发到无事务参数的插入路径；返回：新 RID。
   return InsertRow(row, nullptr);
 }
 
 Result<RID> HeapTable::InsertRow(const Row &row, Transaction *transaction) {
+  // 调用者：InsertExecutor；作用：编码并把一行插入数据页链；返回：新行 RID 或存储错误。
   if (buffer_pool_ == nullptr) return Result<RID>(Status::InvalidArgument("HeapTable 缺少 BufferPoolManager"));
   if (metadata_.first_data_page_id == INVALID_PAGE_ID || metadata_.first_data_page_id == 0) {
     return Result<RID>(Status::InvalidArgument("HeapTable 缺少首数据页"));
@@ -186,6 +191,7 @@ Result<RID> HeapTable::InsertRow(const Row &row, Transaction *transaction) {
   }
   }
 Status HeapTable::ValidateRidPage(page_id_t page_id) {
+  // 调用者：GetRow/DeleteRow；作用：确认 RID 指向该表的数据页；返回：合法性状态。
   if (page_id == 0 || page_id == INVALID_PAGE_ID) {
     return Status::NotFound("RID 页面编号非法: " + std::to_string(page_id));
   }
@@ -226,6 +232,7 @@ Status HeapTable::ValidateRidPage(page_id_t page_id) {
 }
 
 Result<Row> HeapTable::GetRow(const RID &rid) {
+  // 调用者：查询执行器；作用：通过 RID 读取并解码一行；返回：Row 或无效 RID/损坏错误。
   if (buffer_pool_ == nullptr) return Result<Row>(Status::InvalidArgument("HeapTable 缺少 BufferPoolManager"));
   auto ownership = ValidateRidPage(rid.page_id);
   if (!ownership.ok()) return Result<Row>(ownership);
@@ -239,10 +246,12 @@ Result<Row> HeapTable::GetRow(const RID &rid) {
 }
 
 Status HeapTable::DeleteRow(const RID &rid) {
+  // 调用者：非事务 DeleteExecutor；作用：转发到无事务删除路径；返回：删除状态。
   return DeleteRow(rid, nullptr);
 }
 
 Status HeapTable::DeleteRow(const RID &rid, Transaction *transaction) {
+  // 调用者：DeleteExecutor/事务回滚；作用：标记 RID 对应槽位删除；返回：删除状态。
   if (buffer_pool_ == nullptr) return Status::InvalidArgument("HeapTable 缺少 BufferPoolManager");
   auto ownership = ValidateRidPage(rid.page_id);
   if (!ownership.ok()) return ownership;
@@ -345,6 +354,7 @@ Status HeapTable::DeleteRow(const RID &rid, Transaction *transaction) {
   return buffer_pool_->FinalizePageDeletion(rid.page_id);
 }
 Result<std::vector<RowEntry>> HeapTable::Scan() {
+  // 调用者：兼容接口/测试；作用：消费惰性游标并物化有效行；返回：所有 RowEntry 或错误。
   // 便利接口：消费惰性游标并物化整表；执行 SELECT 时优先直接使用 BeginScan。
   std::vector<RowEntry> rows;
   auto cursor = BeginScan();
@@ -359,6 +369,7 @@ Result<std::vector<RowEntry>> HeapTable::Scan() {
 }
 
 Status HeapTable::Destroy() {
+  // 调用者：表生命周期管理；作用：删除该表数据页链并释放底层页面；返回：销毁状态。
   if (buffer_pool_ == nullptr) {
     return Status::InvalidArgument("HeapTable missing BufferPoolManager");
   }

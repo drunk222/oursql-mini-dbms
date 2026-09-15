@@ -21,10 +21,10 @@ enum class LockResourceType : std::uint8_t {
 };
 
 enum class TableLockMode : std::uint8_t {
-  IS,
-  IX,
+  IS,//准备在下层进行读操作     第一把事务逻辑锁通常是Schema IS
+  IX,//我没有独占整个student表，但我准备在student的某些子资源上加X锁。然后才申请：page的X写锁
   S,
-  SIX,
+  SIX,//整体共享读，同时准备在部分子资源上写
   X,
 };
 

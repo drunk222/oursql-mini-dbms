@@ -917,10 +917,119 @@ bool TestIndexSqlRestartAndConsistency() {
 
   oursql::DatabaseEngine reopened(temp.path, 8);
   if (!Check(reopened.GetInitStatus().ok(), "重建索引后最终重启应成功")) return false;
-  auto explain = reopened.ExecuteSql("EXPLAIN SELECT * FROM student WHERE group_id = 3;");
+  auto explain = reopened.ExecuteSql("EXPLAIN SELECT * FROM student WHERE group_id = 9999;");
   return Check(explain.ok() && explain.value().rows[0][0].AsVarchar().find(
                                    "idx_student_group_rebuilt") != std::string::npos,
                "最终重启应恢复DROP后重建的索引元数据");
+}
+
+bool TestCostBasedSelectionAndIndexedDelete() {
+  TempDb skew;
+  {
+    oursql::DatabaseEngine engine(skew.path, 8);
+    if (!Check(engine.GetInitStatus().ok() &&
+                   engine.ExecuteSql(
+                       "CREATE TABLE people(id INT, gender INT);")
+                       .ok(),
+               "成本选择测试建表应成功")) {
+      return false;
+    }
+    std::string insert = "INSERT INTO people VALUES ";
+    for (int id = 0; id < 100; ++id) {
+      if (id != 0) insert += ',';
+      insert += '(' + std::to_string(id) + ',' +
+                std::to_string(id < 90 ? 1 : 0) + ')';
+    }
+    insert += ';';
+    if (!Check(engine.ExecuteSql(insert).ok() &&
+                   engine.ExecuteSql(
+                       "CREATE INDEX idx_people_gender ON people(gender);")
+                       .ok(),
+               "成本选择测试数据和索引应建立")) {
+      return false;
+    }
+    auto common = engine.ExecuteSql(
+        "EXPLAIN SELECT * FROM people WHERE gender = 1;");
+    auto rare = engine.ExecuteSql(
+        "EXPLAIN SELECT * FROM people WHERE gender = 0;");
+    if (!Check(common.ok() && rare.ok() &&
+                   common.value().rows[0][0].AsVarchar().find(
+                       "SeqScanPlan") != std::string::npos &&
+                   rare.value().rows[0][0].AsVarchar().find(
+                       "IndexScanPlan") != std::string::npos,
+               "90%高频值应选SeqScan，10%低频值应选IndexScan")) {
+      return false;
+    }
+    auto common_rows =
+        engine.ExecuteSql("SELECT * FROM people WHERE gender = 1;");
+    auto rare_rows =
+        engine.ExecuteSql("SELECT * FROM people WHERE gender = 0;");
+    if (!Check(common_rows.ok() && common_rows.value().rows.size() == 90 &&
+                   rare_rows.ok() && rare_rows.value().rows.size() == 10,
+               "两种成本路径必须返回相同语义下的正确结果")) {
+      return false;
+    }
+    auto removed =
+        engine.ExecuteSql("DELETE FROM people WHERE gender = 0;");
+    auto after =
+        engine.ExecuteSql("SELECT * FROM people WHERE gender = 0;");
+    if (!Check(removed.ok() && removed.value().affected_rows == 10 &&
+                   after.ok() && after.value().rows.empty(),
+               "非唯一索引DELETE应按全部候选RID删除并保持索引一致")) {
+      return false;
+    }
+  }
+
+  TempDb delete_probe;
+  {
+    oursql::DatabaseEngine engine(delete_probe.path, 8);
+    if (!Check(engine.GetInitStatus().ok() &&
+                   engine.ExecuteSql(
+                       "CREATE TABLE probe(id INT, payload VARCHAR(256));")
+                       .ok(),
+               "索引DELETE访问量测试建表应成功")) {
+      return false;
+    }
+    const std::string payload(180, 'x');
+    for (int first = 0; first < 800; first += 100) {
+      std::string batch;
+      for (int id = first; id < first + 100; ++id) {
+        batch += "INSERT INTO probe VALUES(" + std::to_string(id) +
+                 ",'" + payload + "');";
+      }
+      if (!Check(engine.ExecuteSqlBatch(batch).ok(),
+                 "索引DELETE访问量测试批量插入应成功")) {
+        return false;
+      }
+    }
+    if (!Check(engine.ExecuteSql(
+                   "CREATE UNIQUE INDEX idx_probe_id ON probe(id);")
+                   .ok() &&
+                   engine.Close().ok(),
+               "索引DELETE访问量测试索引和持久化应成功")) {
+      return false;
+    }
+  }
+  oursql::DatabaseEngine reopened(delete_probe.path, 8);
+  if (!Check(reopened.GetInitStatus().ok() &&
+                 reopened.ResetStatistics().ok(),
+             "索引DELETE访问量测试重启应成功")) {
+    return false;
+  }
+  auto full_scan = reopened.ExecuteSql("SELECT * FROM probe;");
+  const auto full_scan_accesses = reopened.GetStatistics().buffer_accesses;
+  if (!Check(full_scan.ok() && full_scan.value().rows.size() == 800 &&
+                 reopened.ResetStatistics().ok(),
+             "索引DELETE访问量测试全表扫描基线应成功")) {
+    return false;
+  }
+  auto indexed_delete = reopened.ExecuteSql("DELETE FROM probe WHERE id = 0;");
+  const auto indexed_delete_accesses =
+      reopened.GetStatistics().buffer_accesses;
+  return Check(indexed_delete.ok() &&
+                   indexed_delete.value().affected_rows == 1 &&
+                   indexed_delete_accesses * 2 < full_scan_accesses,
+               "索引DELETE访问页次数应显著少于全表扫描");
 }
 
 bool TestFailedTransactionState() {
@@ -1254,6 +1363,11 @@ int main() {
   }
   if (TestIndexSqlRestartAndConsistency()) {
     std::cout << "[PASS] Index SQL restart and consistency\n";
+  } else {
+    return 1;
+  }
+  if (TestCostBasedSelectionAndIndexedDelete()) {
+    std::cout << "[PASS] Cost-based selection and indexed DELETE\n";
   } else {
     return 1;
   }

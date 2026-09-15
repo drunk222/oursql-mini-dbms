@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -112,6 +113,15 @@ class DatabaseEngine {
   [[nodiscard]] bool IsSessionOpen(
       const std::shared_ptr<SessionContext> &session) const;
 
+  struct CachedIndexStatistics {
+    std::uint64_t total_entries{0};
+    std::unordered_map<std::int64_t, std::uint64_t> frequencies;
+  };
+  [[nodiscard]] Result<CachedIndexStatistics> GetIndexStatistics(
+      std::string_view index_name);
+  [[nodiscard]] Plan OptimizeAccessPathByCost(const Plan &plan);
+  void InvalidateAccessPathStatistics();
+
   DiskManager disk_manager_;
   LogManager log_manager_;
   LockManager lock_manager_;
@@ -125,6 +135,9 @@ class DatabaseEngine {
   Status init_status_;
   std::atomic<bool> closed_{false};
   mutable std::mutex sessions_mutex_;
+  mutable std::mutex access_path_statistics_mutex_;
+  std::unordered_map<std::string, CachedIndexStatistics>
+      access_path_statistics_;
   session_id_t next_session_id_{1};
   std::unordered_map<session_id_t, std::shared_ptr<SessionContext>> sessions_;
   std::shared_ptr<SessionContext> default_session_;

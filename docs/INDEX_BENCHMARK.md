@@ -33,3 +33,36 @@ SELECT * FROM student WHERE id = 8765;
 | 热缓存 IndexScan | 1.594 | 113 | 2 | 111 | 1.77% | 111 | 111 | 0 | 1 |
 
 结果会受机器、编译配置和后台负载影响，应以现场重新运行的输出为准。本次 IndexScan 约比 SeqScan 快两个数量级。IndexScan 仍产生较多读取，是因为 `HeapTable::GetRow()` 会沿表页链验证 RID 归属；这属于后续可单独优化的存储安全检查，不影响当前索引与全表扫描的可比性。
+
+## 基于选择率的成本选择
+
+数据库首次考虑一个索引时，会沿 B+ 树叶链惰性统计总索引项数和各键频率，后续查询复用缓存；INSERT、UPDATE、DELETE、ALTER 以及索引或表的 DDL 成功后会使缓存失效。当前教学型成本模型为：
+
+```text
+SeqScanCost   = max(1, total_entries)
+IndexScanCost = ceil(log2(max(2, total_entries))) + 4 * matching_entries
+```
+
+少于 32 个索引项的小表继续使用原有索引规则，避免极小样本的估算噪声影响计划。集成测试使用 100 行数据验证：`gender = 1` 命中 90 行时选择 `SeqScanPlan`，`gender = 0` 命中 10 行时选择 `IndexScanPlan`。两条路径都必须返回正确结果。
+
+## DELETE 索引执行路径
+
+等值 INT 条件存在匹配索引时，DELETE 不再用 SeqScan 定位数据：
+
+```text
+IndexManager::Lookup
+  -> candidate RIDs
+  -> HeapTable::GetRow(RID) 复核
+  -> IndexManager::OnDelete 维护全部索引
+  -> HeapTable::DeleteRow(RID)
+```
+
+没有可用索引时仍保留完整扫描。集成测试还使用 800 行宽记录比较访问次数，要求索引 DELETE 的 Buffer Pool accesses 少于全表扫描的一半，并验证非唯一索引的全部候选 RID 都会被删除。
+
+可单独运行相关验收：
+
+```powershell
+cmake --build build --config Debug --target oursql_optimizer_tests oursql_execution_tests
+.\build\Debug\oursql_optimizer_tests.exe
+.\build\Debug\oursql_execution_tests.exe
+```

@@ -77,6 +77,62 @@ bool ProjectionCovers(const ProjectPlan &inner, const ProjectPlan &outer) {
   return true;
 }
 
+std::shared_ptr<const PlanNode> ApplyIndexCost(
+    const std::shared_ptr<const PlanNode> &node,
+    const IndexScanCostEstimate &estimate, bool use_seq_scan,
+    bool *matched) {
+  if (node == nullptr) return nullptr;
+  return std::visit(
+      [&](const auto &operation) -> std::shared_ptr<const PlanNode> {
+        using Type = std::decay_t<decltype(operation)>;
+        if constexpr (std::is_same_v<Type, IndexScanPlan>) {
+          if (operation.index_name != estimate.index_name ||
+              !operation.key.IsInt() ||
+              operation.key.AsInt() != estimate.key) {
+            return node;
+          }
+          *matched = true;
+          if (use_seq_scan) {
+            return std::make_shared<PlanNode>(
+                SeqScanPlan{operation.table_name});
+          }
+          return node;
+        } else if constexpr (std::is_same_v<Type, FilterPlan>) {
+          auto child = ApplyIndexCost(operation.child, estimate, use_seq_scan,
+                                      matched);
+          return child == operation.child
+                     ? node
+                     : std::make_shared<PlanNode>(FilterPlan{
+                           child, operation.predicate, operation.expression});
+        } else if constexpr (std::is_same_v<Type, ProjectPlan>) {
+          auto child = ApplyIndexCost(operation.child, estimate, use_seq_scan,
+                                      matched);
+          return child == operation.child
+                     ? node
+                     : std::make_shared<PlanNode>(ProjectPlan{
+                           child, operation.columns, operation.select_all,
+                           operation.input_indexes});
+        } else if constexpr (std::is_same_v<Type, GroupByPlan>) {
+          auto child = ApplyIndexCost(operation.child, estimate, use_seq_scan,
+                                      matched);
+          return child == operation.child
+                     ? node
+                     : std::make_shared<PlanNode>(
+                           GroupByPlan{child, operation.columns});
+        } else if constexpr (std::is_same_v<Type, OrderByPlan>) {
+          auto child = ApplyIndexCost(operation.child, estimate, use_seq_scan,
+                                      matched);
+          return child == operation.child
+                     ? node
+                     : std::make_shared<PlanNode>(
+                           OrderByPlan{child, operation.keys});
+        } else {
+          return node;
+        }
+      },
+      node->operation);
+}
+
 }  // namespace
 
 Result<OptimizationResult> Optimizer::OptimizeWithStats(
@@ -197,6 +253,34 @@ Result<Plan> Optimizer::Optimize(
   auto result = OptimizeWithStats(std::move(plan), indexes);
   if (!result.ok()) return Result<Plan>(result.status());
   return Result<Plan>(std::move(result.value().plan));
+}
+
+Result<OptimizationResult> Optimizer::OptimizeWithCost(
+    Plan plan, const IndexScanCostEstimate &estimate) const {
+  constexpr std::uint64_t kMinimumCostedTableEntries = 32;
+  const bool use_seq_scan =
+      estimate.total_entries >= kMinimumCostedTableEntries &&
+      estimate.seq_scan_cost <= estimate.index_scan_cost;
+  bool matched = false;
+  auto apply = [&](SelectPlan *select) {
+    if (select == nullptr || select->root == nullptr) return;
+    select->root = ApplyIndexCost(select->root, estimate, use_seq_scan,
+                                  &matched);
+  };
+  if (auto *select = std::get_if<SelectPlan>(&plan)) {
+    apply(select);
+  } else if (auto *explain = std::get_if<ExplainPlan>(&plan)) {
+    apply(&explain->select);
+  }
+
+  OptimizationStats stats;
+  stats.passes = 1;
+  if (matched) {
+    ++stats.rule_hits[use_seq_scan ? "R3:成本选择SeqScan"
+                                   : "R3:成本保留IndexScan"];
+  }
+  return Result<OptimizationResult>(
+      OptimizationResult{std::move(plan), std::move(stats)});
 }
 
 }  // namespace oursql

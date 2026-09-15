@@ -1,11 +1,14 @@
 #include "oursql/execution/database_engine.h"
 
 #include "oursql/index/index_manager.h"
+#include "oursql/optimizer/optimizer.h"
 #include "oursql/storage/heap_table.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
@@ -90,6 +93,22 @@ bool IsDdlPlan(const Plan &plan) {
                std::is_same_v<Type, DropTablePlan> ||
                std::is_same_v<Type, CreateIndexPlan> ||
                std::is_same_v<Type, DropIndexPlan> ||
+               std::is_same_v<Type, AlterTablePlan>;
+      },
+      plan);
+}
+
+bool InvalidatesAccessPathStatistics(const Plan &plan) {
+  return std::visit(
+      [](const auto &operation) {
+        using Type = std::decay_t<decltype(operation)>;
+        return std::is_same_v<Type, CreateTablePlan> ||
+               std::is_same_v<Type, InsertPlan> ||
+               std::is_same_v<Type, DeletePlan> ||
+               std::is_same_v<Type, DropTablePlan> ||
+               std::is_same_v<Type, CreateIndexPlan> ||
+               std::is_same_v<Type, DropIndexPlan> ||
+               std::is_same_v<Type, UpdatePlan> ||
                std::is_same_v<Type, AlterTablePlan>;
       },
       plan);
@@ -484,6 +503,92 @@ Status DatabaseEngine::ResetStatistics() {
   return Status::Ok();
 }
 
+namespace {
+
+const PlanNode *FindIndexScanInPlan(const Plan &plan) {
+  if (const auto *select = std::get_if<SelectPlan>(&plan)) {
+    return FindIndexScanNode(select->root);
+  }
+  if (const auto *explain = std::get_if<ExplainPlan>(&plan)) {
+    return FindIndexScanNode(explain->select.root);
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+Result<DatabaseEngine::CachedIndexStatistics>
+DatabaseEngine::GetIndexStatistics(std::string_view index_name) {
+  {
+    std::lock_guard<std::mutex> lock(access_path_statistics_mutex_);
+    const auto found = access_path_statistics_.find(std::string(index_name));
+    if (found != access_path_statistics_.end()) {
+      return Result<CachedIndexStatistics>(found->second);
+    }
+  }
+
+  // 统计信息是优化提示而非事务数据。使用 B+ 树有序叶链惰性构建一次精确
+  // 频率表，避免每次规划都扫描 Heap；DML/DDL 成功后会清空该缓存。
+  IndexManager index_manager(&catalog_, &buffer_pool_);
+  auto entries = index_manager.RangeScan(
+      index_name, std::numeric_limits<index_key_t>::min(),
+      std::numeric_limits<index_key_t>::max());
+  if (!entries.ok()) {
+    return Result<CachedIndexStatistics>(entries.status());
+  }
+  CachedIndexStatistics statistics;
+  statistics.total_entries = entries.value().size();
+  for (const auto &[key, rid] : entries.value()) {
+    (void)rid;
+    ++statistics.frequencies[key];
+  }
+  {
+    std::lock_guard<std::mutex> lock(access_path_statistics_mutex_);
+    const auto [found, inserted] = access_path_statistics_.emplace(
+        std::string(index_name), statistics);
+    if (!inserted) return Result<CachedIndexStatistics>(found->second);
+  }
+  return Result<CachedIndexStatistics>(std::move(statistics));
+}
+
+Plan DatabaseEngine::OptimizeAccessPathByCost(const Plan &plan) {
+  const PlanNode *index_node = nullptr;
+  if (const auto *select = std::get_if<SelectPlan>(&plan)) {
+    index_node = FindIndexScanNode(select->root);
+  } else if (const auto *explain = std::get_if<ExplainPlan>(&plan)) {
+    index_node = FindIndexScanNode(explain->select.root);
+  }
+  if (index_node == nullptr) return plan;
+  const auto *index_scan = std::get_if<IndexScanPlan>(&index_node->operation);
+  if (index_scan == nullptr || !index_scan->key.IsInt()) return plan;
+
+  auto statistics = GetIndexStatistics(index_scan->index_name);
+  if (!statistics.ok()) return plan;  // 统计不可用不应阻止正确查询。
+  const auto frequency = statistics.value().frequencies.find(
+      index_scan->key.AsInt());
+  const std::uint64_t matching =
+      frequency == statistics.value().frequencies.end() ? 0
+                                                        : frequency->second;
+  const std::uint64_t total = statistics.value().total_entries;
+  // 教学型成本单位：顺序扫描每个索引覆盖行计 1；索引下降计 log2(N)，
+  // 每个候选 RID 的随机 Heap 访问计 4。高选择率键会自然回退 SeqScan。
+  const double seq_cost =
+      static_cast<double>(std::max<std::uint64_t>(1, total));
+  const double tree_cost = std::ceil(std::log2(static_cast<double>(
+      std::max<std::uint64_t>(2, total))));
+  const double index_cost = tree_cost + 4.0 * static_cast<double>(matching);
+  auto optimized = Optimizer().OptimizeWithCost(
+      plan, IndexScanCostEstimate{index_scan->index_name,
+                                  index_scan->key.AsInt(), total, matching,
+                                  seq_cost, index_cost});
+  return optimized.ok() ? std::move(optimized.value().plan) : plan;
+}
+
+void DatabaseEngine::InvalidateAccessPathStatistics() {
+  std::lock_guard<std::mutex> lock(access_path_statistics_mutex_);
+  access_path_statistics_.clear();
+}
+
 std::vector<FrameSnapshot> DatabaseEngine::GetBufferSnapshots() const {
   return buffer_pool_.GetFrameSnapshots();
 }
@@ -863,6 +968,7 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
       session->current_transaction.reset();
       session->table_lock_modes.clear();
       session->schema_lock_mode.reset();
+      InvalidateAccessPathStatistics();
       auto message = MakeTransactionMessage("Transaction committed");
       message.execution_time_ms = elapsed_ms();
       results.push_back(std::move(message));
@@ -888,6 +994,7 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
       session->current_transaction.reset();
       session->table_lock_modes.clear();
       session->schema_lock_mode.reset();
+      InvalidateAccessPathStatistics();
       auto message = MakeTransactionMessage("Transaction rolled back");
       message.execution_time_ms = elapsed_ms();
       results.push_back(std::move(message));
@@ -917,8 +1024,29 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
       return Result<std::vector<ExecutionResult>>(failure);
     }
 
-    auto result =
-        execution_engine_.Execute(compiled_plan, ExecutionContext{transaction.get()});
+    Plan executable_plan = OptimizeAccessPathByCost(compiled_plan);
+    if (FindIndexScanInPlan(compiled_plan) != nullptr &&
+        FindIndexScanInPlan(executable_plan) == nullptr) {
+      // 原索引路径的锁已经取得；成本模型回退到 SeqScan 时再升级到表 S 锁。
+      lock_status =
+          AcquireStatementLocks(session, executable_plan, transaction.get());
+      if (!lock_status.ok()) {
+        MarkFailedIfActive(transaction);
+        const Status failure = Contextualize("SQL cost lock", lock_status);
+        if (autocommit) {
+          auto abort = FinishSessionTransaction(session);
+          if (!abort.ok()) {
+            return Result<std::vector<ExecutionResult>>(
+                CombineFailure(failure,
+                               Contextualize("Transaction rollback", abort)));
+          }
+        }
+        return Result<std::vector<ExecutionResult>>(failure);
+      }
+    }
+
+    auto result = execution_engine_.Execute(
+        executable_plan, ExecutionContext{transaction.get()});
     if (!result.ok()) {
       MarkFailedIfActive(transaction);
       const Status failure = Contextualize("Execution", result.status());
@@ -931,6 +1059,9 @@ Result<std::vector<ExecutionResult>> DatabaseEngine::ExecuteSqlBatchLocked(
         }
       }
       return Result<std::vector<ExecutionResult>>(failure);
+    }
+    if (InvalidatesAccessPathStatistics(executable_plan)) {
+      InvalidateAccessPathStatistics();
     }
 
     if (!transaction->IsUsableForWork()) {

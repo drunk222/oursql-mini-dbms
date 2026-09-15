@@ -16,6 +16,7 @@ constexpr std::size_t kFieldHeaderSize = 5;
 
 // 所有整数都按小端序逐字节写入，避免把宿主机结构体布局直接落盘。
 void AppendU32(std::vector<std::byte> *record, std::uint32_t value) {
+  // 作用：向记录追加一个小端 32 位整数；调用者：Encode；返回：无，直接扩展 record。
   record->push_back(std::byte{static_cast<unsigned char>(value & 0xFFU)});
   record->push_back(std::byte{static_cast<unsigned char>((value >> 8U) & 0xFFU)});
   record->push_back(std::byte{static_cast<unsigned char>((value >> 16U) & 0xFFU)});
@@ -23,17 +24,20 @@ void AppendU32(std::vector<std::byte> *record, std::uint32_t value) {
 }
 
 void AppendU64(std::vector<std::byte> *record, std::uint64_t value) {
+  // 作用：向记录追加一个小端 64 位整数；调用者：Encode；返回：无。
   for (std::size_t i = 0; i < sizeof(value); ++i) {
     record->push_back(std::byte{static_cast<unsigned char>((value >> (i * 8U)) & 0xFFU)});
   }
 }
 
 bool CanRead(const std::vector<std::byte> &record, std::size_t offset, std::size_t length) {
+  // 作用：检查 [offset, offset+length) 是否仍在记录内；调用者：Decode；返回：是否安全可读。
   // 先比较 offset，再用减法校验 length，避免 offset + length 整数溢出。
   return offset <= record.size() && length <= record.size() - offset;
 }
 
 std::uint32_t ReadU32(const std::vector<std::byte> &record, std::size_t offset) {
+  // 作用：从记录读取小端 32 位整数；前提：调用者已通过 CanRead 检查边界。
   return static_cast<std::uint32_t>(record[offset]) |
          (static_cast<std::uint32_t>(record[offset + 1]) << 8U) |
          (static_cast<std::uint32_t>(record[offset + 2]) << 16U) |
@@ -41,6 +45,7 @@ std::uint32_t ReadU32(const std::vector<std::byte> &record, std::size_t offset) 
 }
 
 std::uint64_t ReadU64(const std::vector<std::byte> &record, std::size_t offset) {
+  // 作用：从记录读取小端 64 位整数；前提：调用者已通过 CanRead 检查边界。
   std::uint64_t value = 0;
   for (std::size_t i = 0; i < sizeof(value); ++i) {
     value |= static_cast<std::uint64_t>(record[offset + i]) << (i * 8U);
@@ -49,6 +54,7 @@ std::uint64_t ReadU64(const std::vector<std::byte> &record, std::size_t offset) 
 }
 
 std::uint8_t TypeTag(DataType type) {
+  // 作用：把公共 DataType 转成记录中的稳定类型标记；调用者：Encode。
   // 持久化标签不依赖 enum 的底层数值，调整 DataType 声明不会悄然破坏旧数据。
   return type == DataType::Int ? 1U : 2U;
 }
@@ -56,6 +62,7 @@ std::uint8_t TypeTag(DataType type) {
 }  // namespace
 
 Result<std::vector<std::byte>> RowCodec::Encode(const Schema &schema, const Row &row) {
+  // 调用者：HeapTable/Executor；作用：按 Schema 把一行 Values 编成可持久化字节；返回：记录或错误。
   if (row.size() != schema.size()) {
     return Result<std::vector<std::byte>>(Status::InvalidArgument(
         "Row 列数量与 Schema 不符: 期望 " + std::to_string(schema.size()) + "，实际 " +
@@ -104,6 +111,7 @@ Result<std::vector<std::byte>> RowCodec::Encode(const Schema &schema, const Row 
 }
 
 Result<Row> RowCodec::Decode(const Schema &schema, const std::vector<std::byte> &record) {
+  // 调用者：HeapTable 扫描/读取；作用：校验并还原记录中的 Values；返回：Row 或损坏数据错误。
   if (!CanRead(record, 0, kRowHeaderSize)) {
     return Result<Row>(Status::InvalidArgument("Row 记录头部不完整"));
   }

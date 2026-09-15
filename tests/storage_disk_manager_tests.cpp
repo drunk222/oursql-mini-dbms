@@ -1,3 +1,19 @@
+//缓存命中测试...
+// Arrange：
+// 创建磁盘Page 2，写入确定内容
+// 创建容量较小的BufferPool
+
+// Act：
+// 第一次FetchPage(2)
+// 释放Guard
+// 第二次FetchPage(2)
+
+// Assert：
+// 两次读到的内容一致
+// 第一次产生Miss和磁盘读取
+// 第二次产生Hit
+// 第二次磁盘读取数没有增加
+
 #include "oursql/common/types.h"
 #include "oursql/storage/storage.h"
 

@@ -13,6 +13,8 @@ namespace oursql {
 
 namespace {
 
+// 记录头采用固定偏移，不直接把 C++ 结构体 memcpy 到磁盘。
+// 所有整数通过下面的 Little-Endian 辅助函数读写，保证文件格式稳定。
 constexpr std::size_t kMagicOffset = 0;
 constexpr std::size_t kVersionOffset = 4;
 constexpr std::size_t kTypeOffset = 6;
@@ -25,28 +27,33 @@ constexpr std::size_t kPageIdOffset = 40;
 constexpr std::size_t kPayloadLengthOffset = 44;
 
 void StoreU16(std::byte *data, std::size_t offset, std::uint16_t value) {
+  // 低位字节先写入，WAL 文件统一使用小端序。
   data[offset] = std::byte{static_cast<unsigned char>(value & 0xffU)};
   data[offset + 1] = std::byte{static_cast<unsigned char>((value >> 8U) & 0xffU)};
 }
 
 void StoreU32(std::byte *data, std::size_t offset, std::uint32_t value) {
+  // 作用：按小端序写入 32 位字段；调用者：WAL Encode；返回：无。
   for (std::size_t i = 0; i < 4; ++i) {
     data[offset + i] = std::byte{static_cast<unsigned char>((value >> (8U * i)) & 0xffU)};
   }
 }
 
 void StoreU64(std::byte *data, std::size_t offset, std::uint64_t value) {
+  // 作用：按小端序写入 64 位字段；调用者：WAL Encode；返回：无。
   for (std::size_t i = 0; i < 8; ++i) {
     data[offset + i] = std::byte{static_cast<unsigned char>((value >> (8U * i)) & 0xffU)};
   }
 }
 
 std::uint16_t LoadU16(const std::byte *data, std::size_t offset) {
+  // 作用：按小端序读取 16 位字段；调用者：WAL Decode；返回：整数值。
   return static_cast<std::uint16_t>(std::to_integer<unsigned int>(data[offset])) |
          static_cast<std::uint16_t>(std::to_integer<unsigned int>(data[offset + 1]) << 8U);
 }
 
 std::uint32_t LoadU32(const std::byte *data, std::size_t offset) {
+  // 作用：按小端序读取 32 位字段；调用者：WAL Decode/Scan；返回：整数值。
   std::uint32_t value = 0;
   for (std::size_t i = 0; i < 4; ++i) {
     value |= static_cast<std::uint32_t>(std::to_integer<unsigned int>(data[offset + i]))
@@ -56,6 +63,7 @@ std::uint32_t LoadU32(const std::byte *data, std::size_t offset) {
 }
 
 std::uint64_t LoadU64(const std::byte *data, std::size_t offset) {
+  // 作用：按小端序读取 64 位字段；调用者：WAL Decode；返回：整数值。
   std::uint64_t value = 0;
   for (std::size_t i = 0; i < 8; ++i) {
     value |= static_cast<std::uint64_t>(std::to_integer<unsigned int>(data[offset + i]))
@@ -66,6 +74,8 @@ std::uint64_t LoadU64(const std::byte *data, std::size_t offset) {
 
 std::uint32_t Crc32(const std::byte *data, std::size_t length,
                     std::size_t skipped_offset, std::size_t skipped_length) {
+  // 作用：计算一条 WAL 的 CRC32；调用者：Encode/Decode；返回：校验值。
+  // checksum 字段计算时暂时跳过自身，避免校验值参与自己的计算。
   std::uint32_t crc = 0xffffffffU;
   for (std::size_t i = 0; i < length; ++i) {
     if (i >= skipped_offset && i < skipped_offset + skipped_length) continue;
@@ -78,11 +88,13 @@ std::uint32_t Crc32(const std::byte *data, std::size_t length,
 }
 
 bool IsKnownType(std::uint16_t raw) {
+  // 作用：检查磁盘中的类型编号是否属于当前 WAL 格式；返回：是否合法。
   return raw >= static_cast<std::uint16_t>(LogRecordType::Begin) &&
          raw <= static_cast<std::uint16_t>(LogRecordType::Compensation);
 }
 
 std::string PathText(const std::filesystem::path &path) {
+  // 作用：把平台路径转换成错误信息可用的文本；返回：路径字符串。
 #ifdef _WIN32
   return path.u8string();
 #else
@@ -92,21 +104,27 @@ std::string PathText(const std::filesystem::path &path) {
 
 }  // namespace
 
+// 调用者：对象析构；作用：刷盘并关闭 WAL 文件；返回：错误被析构阶段忽略。
 LogManager::~LogManager() { (void)Close(); }
 
 Status LogManager::EnsureOpenUnlocked() const {
+  // 调用者：已持有 mutex_ 的内部函数；作用：检查 WAL 是否打开；返回：可继续或错误。
   if (!open_) return Status::InvalidArgument("LogManager is not open");
   return Status::Ok();
 }
 
 Status LogManager::Open(const std::filesystem::path &database_path) {
+  // 调用者：DatabaseEngine 启动；作用：创建/打开 .wal 并校验已有日志；返回：打开状态。
   // Serialize lifecycle changes with Append. Flush intentionally does not
   // take this lock, so group commit can still run while records are appended.
+  // append_mutex_ 先保证 Open 不会和 Append/Close 交错；mutex_ 再保护 WAL 逻辑状态。
   std::lock_guard<std::mutex> append_lock(append_mutex_);
   std::unique_lock<std::mutex> lock(mutex_);
+  // 如果已有刷盘在进行，Open 等它结束后再切换文件。
   flush_cv_.wait(lock, [&] { return !flush_in_progress_; });
   if (open_) {
     {
+      // 关闭 fstream 时只需要 file_mutex_，不让其他线程同时操作文件对象。
       std::lock_guard<std::mutex> file_lock(file_mutex_);
       file_.flush();
       file_.close();
@@ -114,6 +132,7 @@ Status LogManager::Open(const std::filesystem::path &database_path) {
     open_ = false;
   }
 
+  // WAL 与主数据库同名但追加 .wal，恢复启动时从这里读取日志。
   path_ = database_path;
   path_ += ".wal";
   std::error_code ec;
@@ -122,10 +141,12 @@ Status LogManager::Open(const std::filesystem::path &database_path) {
     std::ofstream create(path_, std::ios::binary | std::ios::trunc);
     if (!create.is_open()) return Status::IOError("cannot create WAL: " + PathText(path_));
   }
+  // 物理打开动作使用独立的文件锁；逻辑状态锁仍由本函数持有。
   std::lock_guard<std::mutex> file_lock(file_mutex_);
   file_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
   if (!file_.is_open()) return Status::IOError("cannot open WAL: " + PathText(path_));
   open_ = true;
+  // 打开时允许修剪文件尾部的半条记录，模拟崩溃发生在追加中途的情况。
   auto records = ScanUnlocked(true);
   if (!records.ok()) {
     file_.close();
@@ -141,6 +162,8 @@ Status LogManager::Open(const std::filesystem::path &database_path) {
 }
 
 Status LogManager::Close() {
+  // 调用者：DatabaseEngine 关闭/析构；作用：刷入最后日志并关闭 WAL；返回：关闭状态。
+  // Close 先串行化生命周期，再等待最后一个目标 LSN 刷入磁盘。
   std::lock_guard<std::mutex> append_lock(append_mutex_);
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -160,6 +183,8 @@ Status LogManager::Close() {
 }
 
 Result<std::vector<std::byte>> LogManager::Encode(const LogRecord &record, lsn_t lsn) {
+  // 调用者：Append；作用：把结构化日志转换为固定头加 payload 的字节；返回：编码结果。
+  // 先校验不同日志类型允许的 payload，再组装固定头和可变 payload。
   const auto type = static_cast<std::uint16_t>(record.type);
   if (!IsKnownType(type)) return Result<std::vector<std::byte>>(Status::InvalidArgument("unknown WAL record type"));
   if (record.type == LogRecordType::PageUpdate &&
@@ -198,6 +223,7 @@ Result<std::vector<std::byte>> LogManager::Encode(const LogRecord &record, lsn_t
   std::vector<std::byte> payload;
   payload.reserve(record.before_image.size() + record.after_image.size() + 12);
   if (record.type == LogRecordType::Compensation) {
+    // CLR 头部保存 undo_next_lsn 和被补偿的原始日志类型。
     payload.resize(12, std::byte{0});
     StoreU64(payload.data(), 0, record.undo_next_lsn);
     StoreU16(payload.data(), 8, static_cast<std::uint16_t>(record.compensation_type));
@@ -208,6 +234,7 @@ Result<std::vector<std::byte>> LogManager::Encode(const LogRecord &record, lsn_t
     return Result<std::vector<std::byte>>(Status::RecordTooLarge("WAL record is too large"));
   }
   const auto total = LogManager::kHeaderSize + payload.size();
+  // 头部依次写入 magic、版本、类型、长度、校验和、LSN、事务链和页面号。
   std::vector<std::byte> bytes(total, std::byte{0});
   StoreU32(bytes.data(), kMagicOffset, LogManager::kMagic);
   StoreU16(bytes.data(), kVersionOffset, LogManager::kVersion);
@@ -220,12 +247,15 @@ Result<std::vector<std::byte>> LogManager::Encode(const LogRecord &record, lsn_t
   StoreU32(bytes.data(), kPageIdOffset, record.page_id);
   StoreU32(bytes.data(), kPayloadLengthOffset, static_cast<std::uint32_t>(payload.size()));
   std::copy(payload.begin(), payload.end(), bytes.begin() + LogManager::kHeaderSize);
+  // 最后计算完整记录校验和，此时 checksum 字段仍为 0。
   StoreU32(bytes.data(), kChecksumOffset,
            Crc32(bytes.data(), bytes.size(), kChecksumOffset, sizeof(std::uint32_t)));
   return Result<std::vector<std::byte>>(std::move(bytes));
 }
 
 Result<LogRecord> LogManager::Decode(const std::byte *data, std::size_t length) {
+  // 调用者：Scan；作用：校验一条原始 WAL 并还原 LogRecord；返回：记录或损坏错误。
+  // Decode 面对的是磁盘/崩溃后的不可信字节，所有长度和类型都先检查。
   if (data == nullptr || length < kHeaderSize) {
     return Result<LogRecord>(Status::IOError("WAL record header is truncated"));
   }
@@ -243,6 +273,7 @@ Result<LogRecord> LogManager::Decode(const std::byte *data, std::size_t length) 
   const auto actual = Crc32(data, length, kChecksumOffset, sizeof(std::uint32_t));
   if (expected != actual) return Result<LogRecord>(Status::IOError("WAL record checksum mismatch"));
 
+  // 头部合法后再把字段还原成结构化 LogRecord。
   LogRecord record;
   record.type = static_cast<LogRecordType>(type);
   record.lsn = LoadU64(data, kLsnOffset);
@@ -277,11 +308,14 @@ Result<LogRecord> LogManager::Decode(const std::byte *data, std::size_t length) 
 }
 
 Result<lsn_t> LogManager::Append(LogRecord record) {
+  // 调用者：事务管理器/恢复器；作用：分配 LSN 并追加日志；返回：新 LSN，未必已经持久化。
+  // append_mutex_ 保证 LSN 分配和物理追加顺序；mutex_ 保护 append_lsn_ 状态。
   std::lock_guard<std::mutex> append_lock(append_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   auto open_status = EnsureOpenUnlocked();
   if (!open_status.ok()) return Result<lsn_t>(open_status);
   const lsn_t lsn = append_lsn_ + 1;
+  // 先在内存中完整编码，编码失败时不会留下半条 WAL。
   auto encoded = Encode(record, lsn);
   if (!encoded.ok()) return Result<lsn_t>(encoded.status());
   {
@@ -289,6 +323,7 @@ Result<lsn_t> LogManager::Append(LogRecord record) {
     file_.clear();
     file_.seekp(0, std::ios::end);
     if (!file_) return Result<lsn_t>(Status::IOError("cannot seek WAL append position"));
+    // Append 只写入文件缓冲；是否真正持久化由 Flush 决定。
     file_.write(reinterpret_cast<const char *>(encoded.value().data()),
                 static_cast<std::streamsize>(encoded.value().size()));
     if (!file_) return Result<lsn_t>(Status::IOError("cannot append WAL record"));
@@ -298,6 +333,8 @@ Result<lsn_t> LogManager::Append(LogRecord record) {
 }
 
 Result<std::vector<LogRecord>> LogManager::ScanUnlocked(bool repair_tail) const {
+  // 调用者：Open/Scan；作用：读取、解码、校验整份 WAL；返回：有序记录或格式错误。
+  // Scan 一次读入当前 WAL，再按 total length 逐条 Decode。
   auto open_status = EnsureOpenUnlocked();
   if (!open_status.ok()) return Result<std::vector<LogRecord>>(open_status);
   file_.clear();
@@ -340,6 +377,7 @@ Result<std::vector<LogRecord>> LogManager::ScanUnlocked(bool repair_tail) const 
       break;
     }
     const auto &record = decoded.value();
+    // 全局 LSN 必须递增且不能重复；事务 prev_lsn 还要连接到该事务上一条日志。
     if (record.lsn == kInvalidLsn || record.lsn <= previous_lsn ||
         !seen_lsns.insert(record.lsn).second) {
       return Result<std::vector<LogRecord>>(Status::IOError("WAL LSN chain is invalid"));
@@ -368,6 +406,7 @@ Result<std::vector<LogRecord>> LogManager::ScanUnlocked(bool repair_tail) const 
     offset += total;
   }
   if (repair_tail && offset < bytes.size()) {
+    // 只有尾部损坏可以修剪；文件中部损坏必须报错，不能静默丢日志。
     file_.flush();
     file_.close();
     std::error_code ec;
@@ -380,12 +419,14 @@ Result<std::vector<LogRecord>> LogManager::ScanUnlocked(bool repair_tail) const 
 }
 
 Result<std::vector<LogRecord>> LogManager::Scan() const {
+  // 调用者：恢复器/事务 Undo；作用：在锁保护下扫描完整 WAL；返回：记录列表。
   std::lock_guard<std::mutex> lock(mutex_);
   std::lock_guard<std::mutex> file_lock(file_mutex_);
   return ScanUnlocked(false);
 }
 
 Result<txn_id_t> LogManager::GetNextTransactionIdSeed() const {
+  // 调用者：启动恢复流程；作用：扫描现有日志计算下一个事务编号；返回：编号或溢出错误。
   std::lock_guard<std::mutex> lock(mutex_);
   std::lock_guard<std::mutex> file_lock(file_mutex_);
   auto records = ScanUnlocked(false);
@@ -401,6 +442,8 @@ Result<txn_id_t> LogManager::GetNextTransactionIdSeed() const {
 }
 
 Status LogManager::Flush(lsn_t target_lsn) {
+  // 调用者：WAL-before-data、Commit、Abort；作用：把指定 LSN 前日志刷入文件流；返回：刷盘状态。
+  // unique_lock 允许 wait 暂时释放 mutex_，也允许下面在锁外调用 fstream.flush()。
   std::unique_lock<std::mutex> lock(mutex_);
   auto open_status = EnsureOpenUnlocked();
   if (!open_status.ok()) return open_status;
@@ -410,6 +453,7 @@ Status LogManager::Flush(lsn_t target_lsn) {
   if (durable_lsn_ >= target_lsn) return Status::Ok();
   flush_target_lsn_ = std::max(flush_target_lsn_, target_lsn);
   if (flush_in_progress_) {
+    // 已有线程负责物理刷盘；当前线程只等待结果，不重复 flush。
     const auto generation = flush_generation_;
     flush_cv_.wait(lock, [&] {
       return durable_lsn_ >= target_lsn ||
@@ -420,6 +464,7 @@ Status LogManager::Flush(lsn_t target_lsn) {
   }
 
   flush_in_progress_ = true;
+  // 进入锁外执行物理 I/O，避免持有逻辑状态锁阻塞 Append 和其他等待者。
   lock.unlock();
   while (true) {
     lock.lock();
@@ -432,11 +477,13 @@ Status LogManager::Flush(lsn_t target_lsn) {
     if (inject_failure) {
       status = Status::IOError("injected WAL flush failure");
     } else {
+      // fstream 的 flush 只受 file_mutex_ 保护；逻辑状态由外层 mutex_ 维护。
       std::lock_guard<std::mutex> file_lock(file_mutex_);
       file_.flush();
       if (!file_) status = Status::IOError("cannot flush WAL");
     }
 
+    // 物理 I/O 完成后重新拿逻辑锁，发布 durable_lsn_ 和等待通知。
     lock.lock();
     if (!status.ok()) {
       last_flush_status_ = status;
@@ -459,11 +506,13 @@ Status LogManager::Flush(lsn_t target_lsn) {
 }
 
 void LogManager::FailNextFlushForTesting() noexcept {
+  // 调用者：故障测试；作用：让下一次 Flush 主动失败；返回：无。
   std::lock_guard<std::mutex> lock(mutex_);
   fail_next_flush_for_testing_ = true;
 }
 
 Status LogManager::Truncate() {
+  // 调用者：完成静态 checkpoint 后；作用：清空旧 WAL 并重置 LSN 状态；返回：截断状态。
   std::lock_guard<std::mutex> append_lock(append_mutex_);
   std::unique_lock<std::mutex> lock(mutex_);
   flush_cv_.wait(lock, [&] { return !flush_in_progress_; });
@@ -485,11 +534,13 @@ Status LogManager::Truncate() {
 }
 
 lsn_t LogManager::GetAppendLsn() const {
+  // 调用者：事务/恢复协调器；作用：读取最新追加 LSN；返回：LSN 快照。
   std::lock_guard<std::mutex> lock(mutex_);
   return append_lsn_;
 }
 
 lsn_t LogManager::GetDurableLsn() const {
+  // 调用者：诊断和持久化检查；作用：读取已刷盘 LSN；返回：LSN 快照。
   std::lock_guard<std::mutex> lock(mutex_);
   return durable_lsn_;
 }

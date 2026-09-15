@@ -304,6 +304,49 @@ bool TestWebApi() {
   }
 
   {
+    const nlohmann::json setup = {
+        {"sql",
+         "CREATE TABLE tx_recovery(id INT);"
+         "CREATE UNIQUE INDEX idx_tx_recovery_id ON tx_recovery(id);"}};
+    auto response = client.Post("/api/query", setup.dump(), "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true,
+               "Transaction recovery setup should succeed") &&
+         ok;
+
+    const nlohmann::json failing = {
+        {"sql",
+         "BEGIN;"
+         "INSERT INTO tx_recovery VALUES(1);"
+         "INSERT INTO tx_recovery VALUES(1);"}};
+    response = client.Post("/api/query", failing.dump(), "application/json");
+    payload = nlohmann::json();
+    const bool failing_parsed = ParseJson(response, &payload);
+    ok = Check(failing_parsed && response->status >= 400 &&
+                   payload["ok"] == false,
+               "A failure inside an explicit transaction should be reported") &&
+         ok;
+
+    response = client.Post("/api/query",
+                           nlohmann::json{{"sql", "SELECT * FROM tx_recovery;"}}.dump(),
+                           "application/json");
+    payload = nlohmann::json();
+    const bool recovered = ParseJson(response, &payload);
+    ok = Check(recovered && response->status == 200 && payload["ok"] == true &&
+                   payload["data"]["results"][0]["rows"].empty(),
+               "A later Web request should recover from a failed transaction") &&
+         ok;
+
+    response = client.Post("/api/query",
+                           nlohmann::json{{"sql", "DROP TABLE tx_recovery;"}}.dump(),
+                           "application/json");
+    ok = Check(response && response->status == 200,
+               "Transaction recovery test table should be removed") &&
+         ok;
+  }
+
+  {
     auto response = client.Get("/api/tables");
     nlohmann::json payload;
     const bool parsed = ParseJson(response, &payload);

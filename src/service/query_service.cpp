@@ -142,7 +142,13 @@ Result<std::vector<ExecutionResult>> QueryService::ExecuteSql(std::string_view s
     return Result<std::vector<ExecutionResult>>(transaction_status);
   }
   auto results = engine_->ExecuteSqlBatch(sql);
-  if (!results.ok()) return results;
+  if (!results.ok()) {
+    // The Web session does not support transactions across requests. If a
+    // statement failed after BEGIN, abort it so the next request can start
+    // from a clean transaction state instead of remaining Failed forever.
+    (void)engine_->ExecuteSql("ROLLBACK;");
+    return results;
+  }
   if (results.value().size() != statements.value().size()) {
     return Result<std::vector<ExecutionResult>>(Status::InternalError(
         "SQL execution result count does not match parsed statement count"));

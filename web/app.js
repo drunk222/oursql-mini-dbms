@@ -239,6 +239,11 @@ function makeTreeNode(options) {
   }
 
   row.addEventListener("click", () => {
+    if (state.selectedNode === options.id && options.onClose) {
+      state.selectedNode = "";
+      options.onClose();
+      return;
+    }
     state.selectedNode = options.id;
     if (options.expandable) {
       if (state.expandedNodes.has(options.id)) state.expandedNodes.delete(options.id);
@@ -293,6 +298,7 @@ function renderNavigatorTree() {
       badge: columnNodes.length,
       children: columnNodes.map((node) => ({ ...node, level: 4 })),
       onSelect: () => openTableDetails(table),
+      onClose: closeTableDetails,
     };
   });
   if (filter && tables.length === 0) {
@@ -343,7 +349,7 @@ async function loadNavigator() {
   state.navigatorTables = data.tables || [];
   if (state.selectedTable &&
       !state.navigatorTables.some((table) => table.name === state.selectedTable)) {
-    closeTableDetails();
+    closeTableDetails(false);
   }
   renderNavigatorTree();
 }
@@ -560,16 +566,19 @@ async function openTableDetails(table) {
   elements.tableUmlPanel.replaceChildren(renderTableUml(table));
   if (window.lucide) window.lucide.createIcons();
   setTableDetailTab("data");
-  elements.tableDetailSection.scrollIntoView({ block: "nearest" });
   await loadTableData(table);
 }
 
-function closeTableDetails() {
+function closeTableDetails(clearSelection = true) {
   ++state.tableDetailRequestId;
   state.selectedTable = "";
   elements.tableDetailSection.hidden = true;
   elements.tableDataPanel.replaceChildren();
   elements.tableUmlPanel.replaceChildren();
+  if (clearSelection) {
+    state.selectedNode = "";
+    renderNavigatorTree();
+  }
 }
 
 async function refreshTableDetails() {
@@ -741,7 +750,7 @@ function bindEvents() {
   elements.tableDataTab.addEventListener("click", () => setTableDetailTab("data"));
   elements.tableUmlTab.addEventListener("click", () => setTableDetailTab("uml"));
   elements.refreshTableButton.addEventListener("click", refreshTableDetails);
-  elements.closeTableButton.addEventListener("click", closeTableDetails);
+  elements.closeTableButton.addEventListener("click", () => closeTableDetails());
   elements.navigatorFilter.addEventListener("input", renderNavigatorTree);
   elements.sqlEditor.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {

@@ -3,6 +3,7 @@
 #include "oursql/service/query_service.h"
 #include "oursql/web/api_types.h"
 #include "oursql/web/concurrency_demo.h"
+#include "oursql/web/performance_benchmark.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -41,6 +42,12 @@ class WebServer {
                             httplib::Response &response);
   void HandleConcurrencyDemo(const httplib::Request &request,
                              httplib::Response &response);
+  void HandlePerformanceIndex(const httplib::Request &request,
+                              httplib::Response &response);
+  void HandlePerformanceSelectivity(const httplib::Request &request,
+                                    httplib::Response &response);
+  void HandlePerformanceBuffer(const httplib::Request &request,
+                               httplib::Response &response);
 
   [[nodiscard]] bool ServeStaticFile(const std::filesystem::path &relative_path,
                                      const std::string &content_type,
@@ -52,6 +59,7 @@ class WebServer {
   WebServerOptions options_;
   QueryService *query_service_{nullptr};
   ConcurrencyDemoService concurrency_demo_;
+  PerformanceBenchmarkService performance_benchmark_;
   httplib::Server server_;
   std::atomic<bool> initialized_{false};
   mutable std::string last_error_;

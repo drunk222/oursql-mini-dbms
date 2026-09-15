@@ -61,6 +61,7 @@ add_library(oursql_web_lib
   src/service/query_service.cpp
   src/web/concurrency_demo.cpp
   src/web/json_codec.cpp
+  src/web/performance_benchmark.cpp
   src/web/web_server.cpp
 )
 target_include_directories(oursql_web_lib

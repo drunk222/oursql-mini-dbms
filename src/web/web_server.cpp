@@ -60,9 +60,12 @@ Status WebServer::Initialize() {
   const auto style_path = options_.web_root / "style.css";
   const auto concurrency_html_path = options_.web_root / "concurrency.html";
   const auto concurrency_js_path = options_.web_root / "concurrency.js";
+  const auto performance_html_path = options_.web_root / "performance.html";
+  const auto performance_js_path = options_.web_root / "performance.js";
   const auto lucide_path = options_.web_root / "assets" / "lucide" / "lucide.min.js";
   if (!FileExists(index_path) || !FileExists(app_path) || !FileExists(style_path) ||
       !FileExists(concurrency_html_path) || !FileExists(concurrency_js_path) ||
+      !FileExists(performance_html_path) || !FileExists(performance_js_path) ||
       !FileExists(lucide_path)) {
     return Status::NotFound("Web assets are incomplete under " + options_.web_root.string());
   }
@@ -143,6 +146,17 @@ void WebServer::RegisterRoutes() {
                                       "application/javascript; charset=utf-8",
                                       response);
               });
+  server_.Get("/performance.html",
+              [this](const httplib::Request &, httplib::Response &response) {
+                (void)ServeStaticFile("performance.html", "text/html; charset=utf-8",
+                                      response);
+              });
+  server_.Get("/performance.js",
+              [this](const httplib::Request &, httplib::Response &response) {
+                (void)ServeStaticFile("performance.js",
+                                      "application/javascript; charset=utf-8",
+                                      response);
+              });
   server_.Get("/assets/.*",
               [this](const httplib::Request &request, httplib::Response &response) {
                 const std::string relative = request.path.substr(1);
@@ -190,6 +204,18 @@ void WebServer::RegisterRoutes() {
   server_.Post("/api/concurrency/run",
                [this](const httplib::Request &request, httplib::Response &response) {
                  HandleConcurrencyRun(request, response);
+               });
+  server_.Post("/api/benchmark/index",
+               [this](const httplib::Request &request, httplib::Response &response) {
+                 HandlePerformanceIndex(request, response);
+               });
+  server_.Post("/api/benchmark/selectivity",
+               [this](const httplib::Request &request, httplib::Response &response) {
+                 HandlePerformanceSelectivity(request, response);
+               });
+  server_.Post("/api/benchmark/buffer",
+               [this](const httplib::Request &request, httplib::Response &response) {
+                 HandlePerformanceBuffer(request, response);
                });
 
   server_.set_error_handler([](const httplib::Request &request, httplib::Response &response) {
@@ -337,6 +363,70 @@ void WebServer::HandleConcurrencyDemo(const httplib::Request &,
     return;
   }
   SendJson(response, SuccessPayload(result.value()));
+}
+
+void WebServer::HandlePerformanceIndex(const httplib::Request &request,
+                                       httplib::Response &response) {
+  auto body = nlohmann::json::parse(request.body, nullptr, false);
+  if (body.is_discarded() || !body.is_object()) {
+    SendStatus(response, Status::InvalidArgument("Request body must be a JSON object"));
+    return;
+  }
+  if ((body.contains("row_count") && !body["row_count"].is_number_unsigned()) ||
+      (body.contains("repetitions") && !body["repetitions"].is_number_unsigned())) {
+    SendStatus(response, Status::InvalidArgument(
+        "row_count and repetitions must be positive integers"));
+    return;
+  }
+  const std::size_t row_count = body.value("row_count", std::size_t{5000});
+  const std::size_t repetitions = body.value("repetitions", std::size_t{3});
+  auto result = performance_benchmark_.RunIndexComparison(row_count, repetitions);
+  if (!result.ok()) {
+    SendStatus(response, result.status());
+    return;
+  }
+  SendJson(response, SuccessPayload(std::move(result.value())));
+}
+
+void WebServer::HandlePerformanceSelectivity(const httplib::Request &request,
+                                             httplib::Response &response) {
+  auto body = nlohmann::json::parse(request.body, nullptr, false);
+  if (body.is_discarded() || !body.is_object()) {
+    SendStatus(response, Status::InvalidArgument("Request body must be a JSON object"));
+    return;
+  }
+  if ((body.contains("row_count") && !body["row_count"].is_number_unsigned()) ||
+      (body.contains("repetitions") && !body["repetitions"].is_number_unsigned())) {
+    SendStatus(response, Status::InvalidArgument(
+        "row_count and repetitions must be positive integers"));
+    return;
+  }
+  const std::size_t row_count = body.value("row_count", std::size_t{1000});
+  const std::size_t repetitions = body.value("repetitions", std::size_t{3});
+  auto result = performance_benchmark_.RunSelectivityComparison(row_count, repetitions);
+  if (!result.ok()) {
+    SendStatus(response, result.status());
+    return;
+  }
+  SendJson(response, SuccessPayload(std::move(result.value())));
+}
+
+void WebServer::HandlePerformanceBuffer(const httplib::Request &request,
+                                        httplib::Response &response) {
+  auto body = nlohmann::json::parse(request.body, nullptr, false);
+  if (body.is_discarded() || !body.is_object() ||
+      (body.contains("access_pattern") && !body["access_pattern"].is_string())) {
+    SendStatus(response, Status::InvalidArgument(
+        "Request body must contain a string access_pattern"));
+    return;
+  }
+  const std::string pattern = body.value("access_pattern", std::string{"hotspot"});
+  auto result = performance_benchmark_.RunBufferComparison(pattern);
+  if (!result.ok()) {
+    SendStatus(response, result.status());
+    return;
+  }
+  SendJson(response, SuccessPayload(std::move(result.value())));
 }
 
 bool WebServer::ServeStaticFile(const std::filesystem::path &relative_path,

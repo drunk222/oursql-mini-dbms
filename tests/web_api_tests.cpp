@@ -110,6 +110,14 @@ bool TestWebApi() {
     ok = Check(response && response->status == 200,
                "GET /concurrency.html should serve the concurrency page") &&
          ok;
+    response = client.Get("/performance.html");
+    ok = Check(response && response->status == 200,
+               "GET /performance.html should serve the performance lab") &&
+         ok;
+    response = client.Get("/performance.js");
+    ok = Check(response && response->status == 200,
+               "GET /performance.js should serve the performance lab script") &&
+         ok;
   }
 
   const nlohmann::json query_body = {
@@ -389,6 +397,78 @@ bool TestWebApi() {
                    payload["data"]["scenarios"].size() == 4,
                "Concurrency demo should execute all scenarios") &&
          ok;
+  }
+
+  {
+    const nlohmann::json benchmark_body = {
+        {"row_count", 100}, {"repetitions", 1}};
+    auto response = client.Post("/api/benchmark/index", benchmark_body.dump(),
+                                "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true,
+               "POST /api/benchmark/index should run an isolated comparison") &&
+         ok;
+    if (parsed && payload.value("ok", false)) {
+      const auto &data = payload["data"];
+      ok = Check(data["scenarios"].is_array() && data["scenarios"].size() == 2 &&
+                     data["scenarios"][0]["plan"].get<std::string>().find(
+                         "SeqScanPlan") != std::string::npos &&
+                     data["scenarios"][1]["plan"].get<std::string>().find(
+                         "IndexScanPlan") != std::string::npos &&
+                     data["scenarios"][0]["rows"] == 1 &&
+                     data["scenarios"][1]["rows"] == 1,
+                 "Benchmark should prove both access paths return the same row") &&
+           ok;
+      ok = Check(data["comparisons"]["speedup"].is_number() &&
+                     data["scenarios"][0]["statistics"].contains("disk_reads"),
+                 "Benchmark should return speedup and storage metrics") &&
+           ok;
+      ok = Check(data["compiler"]["tokens"].is_array() &&
+                     !data["compiler"]["tokens"].empty() &&
+                     data["compiler"]["ast"].is_string() &&
+                     data["compiler"]["rules"].size() == 4,
+                 "Benchmark should expose the real compiler pipeline") &&
+           ok;
+    }
+  }
+
+  {
+    const nlohmann::json body = {{"row_count", 100}, {"repetitions", 1}};
+    auto response = client.Post("/api/benchmark/selectivity", body.dump(),
+                                "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true &&
+                   payload["data"]["scenarios"].size() == 2,
+               "Selectivity benchmark should return two cost decisions") && ok;
+    if (parsed && payload.value("ok", false)) {
+      const auto &scenarios = payload["data"]["scenarios"];
+      ok = Check(scenarios[0]["access_path"] == "SeqScan" &&
+                     scenarios[1]["access_path"] == "IndexScan" &&
+                     scenarios[0]["index_cost"] > scenarios[0]["seq_cost"] &&
+                     scenarios[1]["index_cost"] < scenarios[1]["seq_cost"],
+                 "Cost optimizer should choose plans from selectivity") && ok;
+    }
+  }
+
+  {
+    const nlohmann::json body = {{"access_pattern", "hotspot"}};
+    auto response = client.Post("/api/benchmark/buffer", body.dump(),
+                                "application/json");
+    nlohmann::json payload;
+    const bool parsed = ParseJson(response, &payload);
+    ok = Check(parsed && response->status == 200 && payload["ok"] == true &&
+                   payload["data"]["policies"].size() == 3,
+               "Buffer benchmark should compare three replacement policies") && ok;
+    if (parsed && payload.value("ok", false)) {
+      const auto &policies = payload["data"]["policies"];
+      ok = Check(policies[0]["policy"] == "FIFO" &&
+                     policies[1]["policy"] == "LRU" &&
+                     policies[2]["policy"] == "CLOCK" &&
+                     policies[0]["accesses"] == 128,
+                 "Buffer benchmark should return deterministic policy metrics") && ok;
+    }
   }
 
   running.server->Stop();

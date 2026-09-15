@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>OurSQL 性能实验室</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <i data-lucide="database" aria-hidden="true"></i>
+      <span>OurSQL</span>
+    </div>
+    <div class="topbar-actions">
+      <a class="button button-secondary" href="/">
+        <i data-lucide="arrow-left" aria-hidden="true"></i>
+        <span>返回工作台</span>
+      </a>
+      <a class="button button-secondary" href="/concurrency.html">
+        <i data-lucide="activity" aria-hidden="true"></i>
+        <span>并发演示</span>
+      </a>
+    </div>
+  </header>
+
+  <main class="performance-page">
+    <section class="performance-hero">
+      <div>
+        <p class="eyebrow">Performance Lab · Database × Compiler × OS</p>
+        <h1>从执行计划到存储，看见优化为什么更快</h1>
+        <p class="performance-intro">
+          现场运行访问路径、成本模型和页面替换实验。所有耗时与 I/O 均来自服务端，
+          同时展示 SQL 编译链路、执行计划和 Buffer Pool 内部行为。
+        </p>
+      </div>
+      <div class="course-map" aria-label="课程能力映射">
+        <span><i data-lucide="network" aria-hidden="true"></i> 数据库 · B+ 树与成本选择</span>
+        <span><i data-lucide="cpu" aria-hidden="true"></i> 编译原理 · 计划生成与改写</span>
+        <span><i data-lucide="layers-3" aria-hidden="true"></i> 操作系统 · 缓存与磁盘 I/O</span>
+      </div>
+    </section>
+
+    <nav class="experiment-tabs" role="tablist" aria-label="性能实验">
+      <button class="experiment-tab is-active" type="button" role="tab"
+              aria-selected="true" aria-controls="indexExperiment" data-experiment="index">
+        <i data-lucide="search-check" aria-hidden="true"></i>
+        <span>访问路径</span>
+      </button>
+      <button class="experiment-tab" type="button" role="tab"
+              aria-selected="false" aria-controls="selectivityExperiment" data-experiment="selectivity">
+        <i data-lucide="git-compare-arrows" aria-hidden="true"></i>
+        <span>成本优化</span>
+      </button>
+      <button class="experiment-tab" type="button" role="tab"
+              aria-selected="false" aria-controls="bufferExperiment" data-experiment="buffer">
+        <i data-lucide="layers-3" aria-hidden="true"></i>
+        <span>Buffer Pool</span>
+      </button>
+    </nav>
+
+    <section id="indexExperiment" class="experiment-panel" role="tabpanel">
+    <section class="benchmark-controls" aria-labelledby="benchmarkControlsTitle">
+      <div>
+        <p class="eyebrow">实验设置</p>
+        <h2 id="benchmarkControlsTitle">SeqScan vs IndexScan</h2>
+      </div>
+      <label>
+        <span>数据规模</span>
+        <select id="rowCount">
+          <option value="1000" selected>1,000 行</option>
+          <option value="5000">5,000 行</option>
+          <option value="10000">10,000 行</option>
+        </select>
+      </label>
+      <label>
+        <span>重复次数</span>
+        <select id="repetitions">
+          <option value="1">1 次</option>
+          <option value="3" selected>3 次（中位数）</option>
+          <option value="5">5 次（中位数）</option>
+        </select>
+      </label>
+      <button id="runBenchmark" class="button button-primary" type="button">
+        <i data-lucide="gauge" aria-hidden="true"></i>
+        <span>运行真实对比</span>
+      </button>
+    </section>
+
+    <div id="benchmarkMessage" class="message-area" role="status" aria-live="polite"></div>
+
+    <section id="benchmarkEmpty" class="benchmark-empty">
+      <i data-lucide="chart-no-axes-combined" aria-hidden="true"></i>
+      <h2>等待运行实验</h2>
+      <p>测试数据会在临时数据库中创建，不会修改工作台当前打开的数据库。</p>
+    </section>
+
+    <section id="benchmarkResults" class="benchmark-results" aria-live="polite" hidden>
+      <div class="benchmark-summary">
+        <article class="performance-stat performance-stat-primary">
+          <span>首次查询加速</span>
+          <strong id="speedup">—</strong>
+          <small>IndexScan 相对 SeqScan</small>
+        </article>
+        <article class="performance-stat">
+          <span>Buffer 访问减少</span>
+          <strong id="accessReduction">—</strong>
+          <small>每次查询平均值</small>
+        </article>
+      </div>
+
+      <section class="benchmark-section" aria-labelledby="latencyTitle">
+        <div class="benchmark-section-heading">
+          <div>
+            <p class="eyebrow">响应速度</p>
+            <h2 id="latencyTitle">服务端查询耗时</h2>
+          </div>
+          <code id="benchmarkQuery"></code>
+        </div>
+        <div id="latencyChart" class="latency-chart"
+             role="img" aria-label="两种首次查询访问路径的耗时对比"></div>
+      </section>
+
+      <section class="benchmark-section" aria-labelledby="compilerTitle">
+        <div class="benchmark-section-heading">
+          <div>
+            <p class="eyebrow">Compiler Pipeline</p>
+            <h2 id="compilerTitle">SQL 如何变成更快的执行计划</h2>
+          </div>
+          <span id="compilerSummary" class="muted"></span>
+        </div>
+        <div class="compiler-pipeline" aria-label="SQL 编译与优化阶段">
+          <article class="compiler-stage">
+            <span class="compiler-index">01</span>
+            <div>
+              <h3>Lexer</h3>
+              <p>将 SQL 转换为带种别的 Token 流</p>
+            </div>
+            <div id="compilerTokens" class="token-stream"></div>
+          </article>
+          <article class="compiler-stage">
+            <span class="compiler-index">02</span>
+            <div>
+              <h3>Parser / AST</h3>
+              <p>语法分析并构造查询抽象语法树</p>
+            </div>
+            <pre class="compiler-output"><code id="compilerAst"></code></pre>
+          </article>
+          <article class="compiler-stage compiler-stage-highlight">
+            <span class="compiler-index">03</span>
+            <div>
+              <h3>Expression Optimizer</h3>
+              <p>编译期计算常量表达式，不把重复运算留到执行期</p>
+            </div>
+            <div class="fold-expression">
+              <code id="expressionBefore"></code>
+              <i data-lucide="arrow-right" aria-hidden="true"></i>
+              <code id="expressionAfter"></code>
+            </div>
+          </article>
+          <article class="compiler-stage compiler-stage-highlight">
+            <span class="compiler-index">04</span>
+            <div>
+              <h3>Planner / Optimizer</h3>
+              <p>识别等值谓词，结合索引与成本模型改写访问路径</p>
+            </div>
+            <ol id="optimizerRules" class="optimizer-rules"></ol>
+          </article>
+        </div>
+      </section>
+
+      <section class="benchmark-section" aria-labelledby="pathTitle">
+        <div class="benchmark-section-heading">
+          <div>
+            <p class="eyebrow">内部路径</p>
+            <h2 id="pathTitle">同一结果，不同执行代价</h2>
+          </div>
+          <span id="correctnessCheck" class="correctness-check"></span>
+        </div>
+        <div id="pathComparison" class="path-comparison"></div>
+      </section>
+
+      <section class="benchmark-section" aria-labelledby="ioTitle">
+        <div class="benchmark-section-heading">
+          <div>
+            <p class="eyebrow">Buffer Pool / Disk</p>
+            <h2 id="ioTitle">系统代价对比</h2>
+          </div>
+          <span id="methodLabel" class="muted"></span>
+        </div>
+        <div class="benchmark-table-wrap">
+          <table class="benchmark-table">
+            <thead>
+              <tr>
+                <th scope="col">场景</th>
+                <th scope="col">中位耗时</th>
+                <th scope="col">Buffer 访问</th>
+                <th scope="col">命中率</th>
+                <th scope="col">淘汰</th>
+                <th scope="col">磁盘读</th>
+                <th scope="col">磁盘写</th>
+              </tr>
+            </thead>
+            <tbody id="metricsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <p class="benchmark-footnote">
+        两种访问路径的每次测量都会重新创建 DatabaseEngine，因此 Buffer Pool 均从空状态开始；
+        操作系统文件缓存不做强制清理。建表、插入和创建索引不计入查询耗时。
+      </p>
+    </section>
+    </section>
+
+    <section id="selectivityExperiment" class="experiment-panel" role="tabpanel" hidden>
+      <section class="benchmark-controls" aria-labelledby="selectivityControlsTitle">
+        <div>
+          <p class="eyebrow">实验设置</p>
+          <h2 id="selectivityControlsTitle">基于选择率的成本优化</h2>
+        </div>
+        <label>
+          <span>数据规模</span>
+          <select id="selectivityRowCount">
+            <option value="1000" selected>1,000 行</option>
+            <option value="5000">5,000 行</option>
+            <option value="10000">10,000 行</option>
+          </select>
+        </label>
+        <label>
+          <span>重复次数</span>
+          <select id="selectivityRepetitions">
+            <option value="1">1 次</option>
+            <option value="3" selected>3 次（中位数）</option>
+            <option value="5">5 次（中位数）</option>
+          </select>
+        </label>
+        <button id="runSelectivity" class="button button-primary" type="button">
+          <i data-lucide="scale" aria-hidden="true"></i>
+          <span>运行成本决策</span>
+        </button>
+      </section>
+      <div id="selectivityMessage" class="message-area" role="status" aria-live="polite"></div>
+      <section id="selectivityEmpty" class="benchmark-empty">
+        <i data-lucide="git-compare-arrows" aria-hidden="true"></i>
+        <h2>索引不是永远更快</h2>
+        <p>同一列、同一索引，优化器会根据预计返回行数选择不同执行计划。</p>
+      </section>
+      <section id="selectivityResults" class="benchmark-results" aria-live="polite" hidden>
+        <section class="benchmark-section" aria-labelledby="costDecisionTitle">
+          <div class="benchmark-section-heading">
+            <div>
+              <p class="eyebrow">Cost-based Optimizer</p>
+              <h2 id="costDecisionTitle">选择率决定访问路径</h2>
+            </div>
+            <code id="costFormula"></code>
+          </div>
+          <div id="costDecisionGrid" class="cost-decision-grid"></div>
+        </section>
+        <section class="benchmark-section" aria-labelledby="selectivityMetricsTitle">
+          <div class="benchmark-section-heading">
+            <div>
+              <p class="eyebrow">Measured Result</p>
+              <h2 id="selectivityMetricsTitle">计划与真实执行指标</h2>
+            </div>
+            <span id="selectivityMethod" class="muted"></span>
+          </div>
+          <div class="benchmark-table-wrap">
+            <table class="benchmark-table">
+              <thead><tr>
+                <th scope="col">谓词</th><th scope="col">选择率</th>
+                <th scope="col">选择计划</th><th scope="col">Seq Cost</th>
+                <th scope="col">Index Cost</th><th scope="col">中位耗时</th>
+                <th scope="col">返回行</th>
+              </tr></thead>
+              <tbody id="selectivityMetricsBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </section>
+
+    <section id="bufferExperiment" class="experiment-panel" role="tabpanel" hidden>
+      <section class="benchmark-controls buffer-controls" aria-labelledby="bufferControlsTitle">
+        <div>
+          <p class="eyebrow">实验设置</p>
+          <h2 id="bufferControlsTitle">页面替换策略</h2>
+        </div>
+        <label>
+          <span>访问模式</span>
+          <select id="accessPattern">
+            <option value="hotspot" selected>80/20 热点访问</option>
+            <option value="random">随机访问</option>
+            <option value="sequential">顺序访问</option>
+          </select>
+        </label>
+        <button id="runBuffer" class="button button-primary" type="button">
+          <i data-lucide="memory-stick" aria-hidden="true"></i>
+          <span>运行策略对比</span>
+        </button>
+      </section>
+      <div id="bufferMessage" class="message-area" role="status" aria-live="polite"></div>
+      <section id="bufferEmpty" class="benchmark-empty">
+        <i data-lucide="layers-3" aria-hidden="true"></i>
+        <h2>相同容量，不同淘汰策略</h2>
+        <p>固定 4 个 Frame、32 个页面和 128 次请求，对比 FIFO、LRU 与 CLOCK。</p>
+      </section>
+      <section id="bufferResults" class="benchmark-results" aria-live="polite" hidden>
+        <div class="benchmark-summary">
+          <article class="performance-stat performance-stat-primary">
+            <span>最高命中率</span>
+            <strong id="bestHitRate">—</strong>
+            <small id="bestPolicy">—</small>
+          </article>
+          <article class="performance-stat">
+            <span>最少磁盘读取</span>
+            <strong id="fewestReads">—</strong>
+            <small>128 次页面请求</small>
+          </article>
+        </div>
+        <section class="benchmark-section" aria-labelledby="bufferChartTitle">
+          <div class="benchmark-section-heading">
+            <div>
+              <p class="eyebrow">Replacement Policy</p>
+              <h2 id="bufferChartTitle">命中率与磁盘读取</h2>
+            </div>
+            <span id="bufferMethod" class="muted"></span>
+          </div>
+          <div id="bufferPolicyChart" class="buffer-policy-chart"></div>
+        </section>
+        <section class="benchmark-section" aria-labelledby="bufferMetricsTitle">
+          <div class="benchmark-section-heading">
+            <div>
+              <p class="eyebrow">OS / Storage</p>
+              <h2 id="bufferMetricsTitle">替换器真实统计</h2>
+            </div>
+          </div>
+          <div class="benchmark-table-wrap">
+            <table class="benchmark-table">
+              <thead><tr>
+                <th scope="col">策略</th><th scope="col">命中率</th>
+                <th scope="col">命中</th><th scope="col">未命中</th>
+                <th scope="col">淘汰</th><th scope="col">磁盘读</th>
+                <th scope="col">耗时</th>
+              </tr></thead>
+              <tbody id="bufferMetricsBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <script src="/assets/lucide/lucide.min.js"></script>
+  <script src="/performance.js"></script>
+</body>
+</html>

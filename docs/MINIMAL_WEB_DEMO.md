@@ -64,6 +64,9 @@ GET  /api/schema?table=student
 GET  /api/stats
 POST /api/flush
 POST /api/concurrency/demo
+POST /api/benchmark/index
+POST /api/benchmark/selectivity
+POST /api/benchmark/buffer
 ```
 
 `GET /api/tables` 返回每张表的名称和列定义，供 API 调用方使用。`POST /api/trace`
@@ -123,6 +126,25 @@ OurSQL 连接
 ```text
 http://127.0.0.1:8080/concurrency.html
 ```
+
+索引性能实验页面：
+
+```text
+http://127.0.0.1:8080/performance.html
+```
+
+`POST /api/benchmark/index` 接受 `row_count`（100～20,000）和
+`repetitions`（1～7），在隔离的临时数据库中首次运行 SeqScan/IndexScan，
+返回 Token、AST、常量折叠、优化规则及存储统计。查询计时使用服务端
+`steady_clock`，重复运行时展示中位数；建表、插入和建索引不计入查询耗时。
+
+`POST /api/benchmark/selectivity` 构造 90%/10% 数据分布，验证成本优化器对
+高频值选择 SeqScan、对低频值选择 IndexScan，并返回两条路径的估算成本、
+执行计划和真实耗时。
+
+`POST /api/benchmark/buffer` 接受 `access_pattern`（`sequential`、`random` 或
+`hotspot`），使用固定 4-frame Buffer Pool 和 128 次页面请求，现场对比 FIFO、
+LRU、CLOCK 的命中率、淘汰数、磁盘读取和耗时。
 
 页面支持选择 2–6 个并排 SQL 编辑区。点击底部的“并发运行”后，各会话使用独立
 Session 同时开始执行，并在每条 SQL 的结果旁显示从脚本开始到该语句完成的累计时间。

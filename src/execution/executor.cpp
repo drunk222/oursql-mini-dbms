@@ -947,49 +947,83 @@ Result<ExecutionResult> DeleteExecutor::Execute(const DeletePlan &plan,
   auto metadata = RequireMetadata(catalog_, plan.table_name);
   if (!metadata.ok()) return Result<ExecutionResult>(Contextualize("DeleteExecutor", metadata.status()));
   HeapTable table(buffer_pool_, *metadata.value());
-  auto cursor = table.BeginScan();
-  if (!cursor.ok()) return Result<ExecutionResult>(Contextualize("DeleteExecutor", cursor.status()));
 
-  std::optional<std::size_t> predicate_index;
+  std::optional<std::size_t> predicate_column;
+  std::optional<IndexMetadata> lookup_index;
   if (plan.where.has_value()) {
     auto index = metadata.value()->schema.FindColumnIndex(plan.where->column);
     if (!index.ok()) return Result<ExecutionResult>(Contextualize("DeleteExecutor", index.status()));
-    predicate_index = index.value();
+    predicate_column = index.value();
     if (metadata.value()->schema.At(index.value()).type != plan.where->value.type()) {
       return Result<ExecutionResult>(Status::TypeMismatch("Delete WHERE 列和值类型不匹配: " +
                                                            plan.where->column));
+    }
+    if (plan.where->kind == PredicateKind::Equal &&
+        plan.where->value.IsInt()) {
+      for (const auto &index_metadata :
+           catalog_->ListTableIndexes(plan.table_name)) {
+        if (index_metadata.column_name == plan.where->column) {
+          lookup_index = index_metadata;
+          break;
+        }
+      }
     }
   }
 
   ExecutionResult result;
   IndexManager index_manager(catalog_, buffer_pool_);
-  // 先扫描取得 RID，再删除。不能只拿 Row 值删除，因为相同内容的行可出现多次。
+  const auto delete_entry = [&](const RID &rid, const Row &row) -> Status {
+    const bool matches = !predicate_column.has_value() ||
+                         row[predicate_column.value()] == plan.where->value;
+    if (!matches) return Status::Ok();
+    auto index_status =
+        index_manager.OnDelete(plan.table_name, row, rid, transaction);
+    if (!index_status.ok()) return Contextualize("DeleteExecutor", index_status);
+    auto status = table.DeleteRow(rid, transaction);
+    if (!status.ok()) {
+      if (transaction != nullptr) {
+        transaction->MarkFailed();
+      } else {
+        (void)index_manager.OnInsert(plan.table_name, row, rid);
+      }
+      return Contextualize("DeleteExecutor", status);
+    }
+    result.rids.push_back(rid);
+    ++result.affected_rows;
+    return Status::Ok();
+  };
+
+  if (lookup_index.has_value()) {
+    // 索引先返回候选 RID；HeapTable::GetRow 复核真实行后再同步维护全部索引并
+    // 删除记录。这样数据定位不再执行 SeqScan，同时仍能抵御陈旧索引项。
+    auto rids = index_manager.Lookup(lookup_index->name,
+                                     plan.where->value.AsInt(), transaction);
+    if (!rids.ok()) {
+      return Result<ExecutionResult>(
+          Contextualize("DeleteExecutor", rids.status()));
+    }
+    for (const auto &rid : rids.value()) {
+      auto row = table.GetRow(rid);
+      if (!row.ok()) {
+        return Result<ExecutionResult>(
+            Contextualize("DeleteExecutor", row.status()));
+      }
+      auto status = delete_entry(rid, row.value());
+      if (!status.ok()) return Result<ExecutionResult>(status);
+    }
+    return Result<ExecutionResult>(std::move(result));
+  }
+
+  auto cursor = table.BeginScan();
+  if (!cursor.ok()) return Result<ExecutionResult>(Contextualize("DeleteExecutor", cursor.status()));
+  // 没有可用等值 INT 索引时保留完整扫描路径。
   while (true) {
     auto entry = cursor.value().Next();
     if (!entry.ok()) return Result<ExecutionResult>(Contextualize("DeleteExecutor", entry.status()));
     if (!entry.value().has_value()) break;
     auto row_entry = std::move(entry.value().value());
-    const bool matches = !predicate_index.has_value() ||
-                         row_entry.second[predicate_index.value()] == plan.where->value;
-    if (!matches) continue;
-    auto index_status =
-        index_manager.OnDelete(plan.table_name, row_entry.second,
-                               row_entry.first, transaction);
-    if (!index_status.ok()) {
-      return Result<ExecutionResult>(
-          Contextualize("DeleteExecutor", index_status));
-    }
-    auto status = table.DeleteRow(row_entry.first, transaction);
-    if (!status.ok()) {
-      if (transaction != nullptr) {
-        transaction->MarkFailed();
-      } else {
-        (void)index_manager.OnInsert(plan.table_name, row_entry.second,
-                                     row_entry.first);
-      }
-      return Result<ExecutionResult>(Contextualize("DeleteExecutor", status));
-    }
-    ++result.affected_rows;
+    auto status = delete_entry(row_entry.first, row_entry.second);
+    if (!status.ok()) return Result<ExecutionResult>(status);
   }
   return Result<ExecutionResult>(std::move(result));
 }

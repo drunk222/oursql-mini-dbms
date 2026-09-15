@@ -107,7 +107,8 @@ class DeleteExecutor {
   DeleteExecutor(Catalog *catalog, BufferPoolManager *buffer_pool) noexcept
       : catalog_(catalog), buffer_pool_(buffer_pool) {}
 
-  // 调用者：ExecutionEngine；作用：扫描并删除满足条件的行；返回：删除行数或错误。
+  // 调用者：ExecutionEngine；作用：优先按等值 INT 索引定位 RID，否则扫描并
+  // 删除满足条件的行；返回：删除行数或错误。
   [[nodiscard]] Result<ExecutionResult> Execute(const DeletePlan &plan,
                                                 Transaction *transaction = nullptr) const;
 

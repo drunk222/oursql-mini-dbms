@@ -5,6 +5,7 @@
 #include "oursql/plan/plan.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -27,6 +28,17 @@ struct OptimizationResult {
   // 优化后的新 Plan；原 Plan 按值传入，调用者仍保留自己的副本。
   Plan plan;
   OptimizationStats stats;
+};
+
+// 数据库编排层根据真实索引内容生成的点查成本估算。Optimizer 只负责比较
+// 两条访问路径并改写 Plan，不直接读取 HeapTable 或 B+ 树。
+struct IndexScanCostEstimate {
+  std::string index_name;
+  std::int64_t key{0};
+  std::uint64_t total_entries{0};
+  std::uint64_t matching_entries{0};
+  double seq_scan_cost{0.0};
+  double index_scan_cost{0.0};
 };
 
 // 调用者：Planner::Build（编译层计划后处理）与测试；作用：在冻结合同允许的
@@ -54,6 +66,10 @@ class Optimizer {
   [[nodiscard]] Result<OptimizationResult> OptimizeWithStats(Plan plan) const;
   [[nodiscard]] Result<OptimizationResult> OptimizeWithStats(
       Plan plan, const std::vector<IndexMetadata> &indexes) const;
+  // 调用者：DatabaseEngine；作用：用真实选择率在已生成的 IndexScan 与
+  // SeqScan 之间做成本选择。小表继续保留原索引规则，避免统计噪声主导计划。
+  [[nodiscard]] Result<OptimizationResult> OptimizeWithCost(
+      Plan plan, const IndexScanCostEstimate &estimate) const;
 };
 
 }  // namespace oursql

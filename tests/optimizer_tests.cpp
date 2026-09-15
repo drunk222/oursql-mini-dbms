@@ -214,6 +214,46 @@ bool TestIndexScanSelection() {
                "无匹配索引时必须保留 SeqScan");
 }
 
+bool TestCostBasedIndexSelection() {
+  oursql::Optimizer optimizer;
+  auto scan = std::make_shared<oursql::PlanNode>(
+      oursql::SeqScanPlan{"people"});
+  auto filter = std::make_shared<oursql::PlanNode>(oursql::FilterPlan{
+      scan, oursql::Predicate{"gender", oursql::Value(1)}});
+  auto root = std::make_shared<oursql::PlanNode>(
+      oursql::ProjectPlan{filter, {}, true});
+  oursql::Plan plan = oursql::SelectPlan{"people", root};
+  const std::vector<oursql::IndexMetadata> indexes{
+      {"idx_people_gender", "people", "gender",
+       oursql::INVALID_PAGE_ID, false}};
+  auto indexed = optimizer.Optimize(plan, indexes);
+  if (!Check(indexed.ok(), "成本测试应先生成候选 IndexScan")) return false;
+
+  auto common_value = optimizer.OptimizeWithCost(
+      indexed.value(), oursql::IndexScanCostEstimate{
+                           "idx_people_gender", 1, 100, 90, 100.0, 367.0});
+  if (!Check(common_value.ok(), "高频值成本优化应成功")) return false;
+  const auto common_text = oursql::ToString(common_value.value().plan);
+  if (!Check(common_text.find("SeqScanPlan") != std::string::npos &&
+                 common_text.find("IndexScanPlan") == std::string::npos,
+             "90%高频值应选择SeqScan")) {
+    return false;
+  }
+  if (!Check(common_value.value().stats.rule_hits.at(
+                 "R3:成本选择SeqScan") == 1,
+             "成本回退规则应记录一次命中")) {
+    return false;
+  }
+
+  auto rare_value = optimizer.OptimizeWithCost(
+      indexed.value(), oursql::IndexScanCostEstimate{
+                           "idx_people_gender", 1, 100, 10, 100.0, 47.0});
+  if (!Check(rare_value.ok(), "低频值成本优化应成功")) return false;
+  return Check(oursql::ToString(rare_value.value().plan)
+                       .find("IndexScanPlan") != std::string::npos,
+               "10%低频值应保留IndexScan");
+}
+
 bool TestJoinPlanPreserved() {
   oursql::Optimizer optimizer;
   auto left = std::make_shared<oursql::PlanNode>(
@@ -419,6 +459,7 @@ int main() {
   run("SELECT modifiers preserved", &TestSelectModifiersPreserved);
   run("Aggregate and HAVING preserved", &TestAggregateAndHavingPreserved);
   run("IndexScan selection", &TestIndexScanSelection);
+  run("Cost-based index selection", &TestCostBasedIndexSelection);
   run("JOIN plan preserved", &TestJoinPlanPreserved);
   run("Non-conforming plan rejected", &TestNonConformingPlanRejected);
   run("Optimize is idempotent", &TestOptimizeIsIdempotent);
